@@ -4,6 +4,13 @@ Working name for a music player, being rewritten in Zig from
 `audio-visualizer-cpp` as a real-world exercise for the
 [allegro5-zig](https://github.com/your-org/allegro5-zig) wrapper.
 
+> **Toolchain:** pinned to **Zig 0.16.0** (see `.zigversion`), matching the
+> allegro5-zig wrapper. The Zig std API churns a lot between versions (0.17-dev
+> removed/renamed things like `ArrayList`, `std.fs`, `std.time`, etc.), and
+> third-party Zig packages (e.g. `zig-sqlite`) target 0.16 — so pinning keeps
+> everything buildable. Use `zigt`/`zvm`/`zigup` (or the official tarball) to
+> install 0.16.0 if your `zig` isn't that version.
+
 Currently ported:
 - `core/allegro_init.zig` — Allegro/addon/input init (port of `allegro_init.cpp`)
 - `core/music_engine.zig` — audio engine, generic over a duck-typed driver (+ `FakeDriver` for headless tests)
