@@ -18,6 +18,10 @@ const schema = [_][]const u8{
     \\  track INTEGER,
     \\  comment TEXT,
     \\  duration INTEGER,
+    \\  disc_number INTEGER DEFAULT 1,
+    \\  play_count INTEGER DEFAULT 0,
+    \\  last_played INTEGER,
+    \\  favorite INTEGER DEFAULT 0,
     \\  file_size INTEGER,
     \\  file_mtime_ticks INTEGER,
     \\  FOREIGN KEY(album_id) REFERENCES albums(id) ON DELETE CASCADE);
@@ -38,7 +42,8 @@ const schema = [_][]const u8{
     \\  cover_art_block BLOB,
     \\  cover_art_mime TEXT,
     \\  artist_id INTEGER,
-    \\  FOREIGN KEY(artist_id) REFERENCES artists(id) ON DELETE CASCADE);
+    \\  FOREIGN KEY(artist_id) REFERENCES artists(id) ON DELETE CASCADE,
+    \\  UNIQUE(name, artist_id));
     ,
     \\CREATE TABLE IF NOT EXISTS genres (
     \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +54,15 @@ const schema = [_][]const u8{
     \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
     \\  name TEXT NOT NULL,
     \\  picture_path TEXT,
-    \\  desc TEXT);
+    \\  desc TEXT,
+    \\  created_at INTEGER);
+    ,
+    \\CREATE TABLE IF NOT EXISTS album_artists (
+    \\  album_id INTEGER NOT NULL,
+    \\  artist_id INTEGER NOT NULL,
+    \\  FOREIGN KEY(album_id) REFERENCES albums(id) ON DELETE CASCADE,
+    \\  FOREIGN KEY(artist_id) REFERENCES artists(id) ON DELETE CASCADE,
+    \\  PRIMARY KEY(album_id, artist_id));
     ,
     \\CREATE TABLE IF NOT EXISTS playlist_songs (
     \\  playlist_id INTEGER NOT NULL,
@@ -75,13 +88,28 @@ const schema = [_][]const u8{
     ,
 };
 
+/// CREATE INDEX IF NOT EXISTS for the FK columns (SQLite doesn't auto-index FKs).
+const indexes = [_][]const u8{
+    "CREATE INDEX IF NOT EXISTS idx_songs_album ON songs(album_id);",
+    "CREATE INDEX IF NOT EXISTS idx_sa_song ON song_artists(song_id);",
+    "CREATE INDEX IF NOT EXISTS idx_sa_artist ON song_artists(artist_id);",
+    "CREATE INDEX IF NOT EXISTS idx_sg_song ON song_genres(song_id);",
+    "CREATE INDEX IF NOT EXISTS idx_sg_genre ON song_genres(genre_id);",
+    "CREATE INDEX IF NOT EXISTS idx_ps_song ON playlist_songs(song_id);",
+    "CREATE INDEX IF NOT EXISTS idx_genre_parent ON genres(parent_id);",
+};
+
 const song_cols =
     \\SELECT id, song_path,
     \\       COALESCE(title, ''),
     \\       COALESCE(album_id, -1),
     \\       COALESCE(track, 0),
     \\       COALESCE(comment, ''),
-    \\       COALESCE(duration, 0)
+    \\       COALESCE(duration, 0),
+    \\       COALESCE(disc_number, 1),
+    \\       COALESCE(play_count, 0),
+    \\       COALESCE(last_played, -1),
+    \\       COALESCE(favorite, 0)
     \\FROM songs
 ;
 
@@ -104,8 +132,35 @@ pub const Database = struct {
         try raw.exec("PRAGMA foreign_keys = ON;", .{}, .{});
         // zig-sqlite's exec runs a single statement, so create each table separately.
         for (schema) |ddl| try raw.execDynamic(ddl, .{}, .{});
+        for (indexes) |idx| try raw.execDynamic(idx, .{}, .{});
 
-        return .{ .allocator = allocator, .raw = raw };
+        var db = Database{ .allocator = allocator, .raw = raw };
+        try db.migrate();
+        return db;
+    }
+
+    /// Best-effort migration for databases created with an older schema:
+    /// adds the columns that were introduced after the first release.
+    fn migrate(self: *Database) !void {
+        try self.ensureColumn("songs", "disc_number", "ALTER TABLE songs ADD COLUMN disc_number INTEGER DEFAULT 1;");
+        try self.ensureColumn("songs", "play_count", "ALTER TABLE songs ADD COLUMN play_count INTEGER DEFAULT 0;");
+        try self.ensureColumn("songs", "last_played", "ALTER TABLE songs ADD COLUMN last_played INTEGER;");
+        try self.ensureColumn("songs", "favorite", "ALTER TABLE songs ADD COLUMN favorite INTEGER DEFAULT 0;");
+        try self.ensureColumn("playlists", "created_at", "ALTER TABLE playlists ADD COLUMN created_at INTEGER;");
+    }
+
+    fn doesColumnExist(self: *Database, table: []const u8, column: []const u8) !bool {
+        const q = try std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM pragma_table_info('{s}') WHERE name='{s}';", .{ table, column });
+        defer self.allocator.free(q);
+        var stmt = try self.raw.prepareDynamic(q);
+        defer stmt.deinit();
+        const count = try stmt.one(i64, .{}, .{});
+        return (count orelse 0) > 0;
+    }
+
+    fn ensureColumn(self: *Database, table: []const u8, column: []const u8, ddl: []const u8) !void {
+        if (try self.doesColumnExist(table, column)) return;
+        try self.raw.execDynamic(ddl, .{}, .{});
     }
 
     pub fn deinit(self: *Database) void {
@@ -159,11 +214,12 @@ pub const Database = struct {
         album_id: i64,
         track: i64,
         duration: i64,
+        disc_number: i64,
     ) !i64 {
         try self.raw.exec(
-            "INSERT INTO songs(song_path, title, album_id, track, duration) VALUES(?, ?, ?, ?, ?);",
+            "INSERT INTO songs(song_path, title, album_id, track, duration, disc_number) VALUES(?, ?, ?, ?, ?, ?);",
             .{},
-            .{ path, title, album_id, track, duration },
+            .{ path, title, album_id, track, duration, disc_number },
         );
         return self.lastId();
     }
@@ -210,8 +266,8 @@ test "database: schema, insert, and query round-trip (in-memory)" {
 
     const artist_id = try db.addArtist("The Example Band");
     const album_id = try db.addAlbum("Test Record", artist_id, 2024);
-    const s1 = try db.addSong("/music/a.ogg", "Track A", album_id, 1, 120);
-    const s2 = try db.addSong("/music/b.ogg", "Track B", album_id, 2, 180);
+    const s1 = try db.addSong("/music/a.ogg", "Track A", album_id, 1, 120, 1);
+    const s2 = try db.addSong("/music/b.ogg", "Track B", album_id, 2, 180, 1);
     try std.testing.expect(s1 != s2);
 
     const by_id = try db.getSongById(s2);
@@ -219,9 +275,19 @@ test "database: schema, insert, and query round-trip (in-memory)" {
     try std.testing.expectEqualStrings("Track B", by_id.?.title);
     try std.testing.expectEqual(@as(i64, 2), by_id.?.track);
     try std.testing.expectEqual(@as(i64, album_id), by_id.?.album_id);
+    // new columns: defaults after insert
+    try std.testing.expectEqual(@as(i64, 1), by_id.?.disc_number);
+    try std.testing.expectEqual(@as(i64, 0), by_id.?.play_count);
+    try std.testing.expectEqual(@as(i64, -1), by_id.?.last_played);
+    try std.testing.expectEqual(@as(i64, 0), by_id.?.favorite);
+
+    // disc_number round-trips through the column
+    _ = try db.addSong("/music/d1.ogg", "Disc Track", album_id, 1, 150, 2);
+    const d = (try db.getSongById(s2 + 1));
+    try std.testing.expectEqual(@as(i64, 2), d.?.disc_number);
 
     const all = try db.getAllSongs();
-    try std.testing.expectEqual(@as(usize, 2), all.len);
+    try std.testing.expectEqual(@as(usize, 3), all.len);
     try std.testing.expectEqualStrings("/music/b.ogg", all[1].path);
 
     const path = try db.getSongPathById(s1);
@@ -239,7 +305,7 @@ test "database: rollback discards pending inserts" {
     try db.begin();
     const artist = try db.addArtist("R");
     const album = try db.addAlbum("Rollback", artist, 2000);
-    _ = try db.addSong("/x.ogg", "X", album, 1, 10);
+    _ = try db.addSong("/x.ogg", "X", album, 1, 10, 1);
     try db.rollback();
 
     const songs = try db.getAllSongs();

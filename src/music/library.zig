@@ -102,8 +102,8 @@ test "library: loads songs + path lookup" {
 
     const artist = try db.addArtist("Q");
     const album = try db.addAlbum("AQ", artist, 2020);
-    _ = try db.addSong("/m/one.ogg", "One", album, 1, 90);
-    _ = try db.addSong("/m/two.ogg", "Two", album, 2, 95);
+    _ = try db.addSong("/m/one.ogg", "One", album, 1, 90, 1);
+    _ = try db.addSong("/m/two.ogg", "Two", album, 2, 95, 1);
 
     try lib.load(&db);
 

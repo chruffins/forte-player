@@ -11,6 +11,10 @@ pub const Song = struct {
     track: i64,
     comment: []const u8,
     duration: i64,
+    disc_number: i64,
+    play_count: i64,
+    last_played: i64, // -1 = never played
+    favorite: i64, // 0/1
 };
 
 pub const Artist = struct {

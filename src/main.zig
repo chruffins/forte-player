@@ -138,7 +138,7 @@ pub fn main() !void {
             if (fileExists(f)) {
                 const title = std.fmt.allocPrint(allocator, "Demo Track {d}", .{n}) catch "Demo";
                 defer allocator.free(title);
-                _ = try db.addSong(f, title, album, n, 3);
+                _ = try db.addSong(f, title, album, n, 3, 1);
             }
             n += 1;
         }
