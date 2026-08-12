@@ -17,7 +17,7 @@ Currently ported:
 - `core/play_queue.zig` — queue / repeat / shuffle + end-of-song auto-advance
 - `core/config.zig` — persisted INI settings (Allegro config + standard paths)
 - `core/bootstrap.zig` — display + event loop scaffold (no UI yet)
-- `music/database.zig` — SQLite-backed stores (zig-sqlite, vendored in `external/`)
+- `music/database.zig` — SQLite-backed stores (zig-sqlite, pinned git dep in `build.zig.zon`)
 - `music/library.zig` — in-memory library loaded from the DB (backs `resolve_song`)
 - `ui/` — the redesigned UI layer (`ui/ui.zig` pure layout + `ui/render.zig` Allegro drawing; see `ui/DESIGN.md`)
 
@@ -51,7 +51,6 @@ src/
     database.zig            # SQLite-backed stores (zig-sqlite)
     library.zig             # in-memory Library loaded from the DB
 
-external/zig-sqlite/        # vendored zig-sqlite dep (path dependency)
 ```
 
 **Test placement:** Zig convention is to keep unit tests *co-located* with

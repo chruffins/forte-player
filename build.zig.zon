@@ -5,7 +5,10 @@
     .paths = .{ "" },
     .dependencies = .{
         .allegro = .{ .path = "../allegro5-zig" },
-        .sqlite = .{ .path = "external/zig-sqlite" },
+        .sqlite = .{
+            .url = "https://github.com/vrischmann/zig-sqlite/archive/946d77c526258760b52836187af32d1a192c5d36.tar.gz",
+            .hash = "sqlite-3.48.0-F2R_azCQDgBGaWDIX4g2vxKpuqzYEQOOfAeJGMNocPu0",
+        },
     },
     .fingerprint = 0x44284642471ff880,
 }
