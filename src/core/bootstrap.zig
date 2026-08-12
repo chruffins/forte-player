@@ -18,6 +18,8 @@ pub const Handlers = struct {
     on_init_display: ?*const fn (ctx: *anyopaque, display: *al.Display) void = null,
     /// Called every timer tick (approx `Options.tick_interval_secs`).
     on_tick: ?*const fn (ctx: *anyopaque) void = null,
+    /// Called every frame to draw; bootstrap flips the display afterwards.
+    on_render: ?*const fn (ctx: *anyopaque) void = null,
     /// Called when the audio stream finishes (e.g. to auto-advance the queue).
     on_audio_stream_finished: ?*const fn (ctx: *anyopaque) void = null,
     on_key_down: ?*const fn (ctx: *anyopaque, key: al.KeyCode) void = null,
@@ -78,6 +80,10 @@ pub fn run(queue: *al.EventQueue, options: Options, handlers: Handlers) !void {
             .timer => {
                 ticks += 1;
                 if (handlers.on_tick) |h| h(handlers.ctx);
+                if (handlers.on_render) |h| {
+                    h(handlers.ctx);
+                    if (display != null) al.Display.flip();
+                }
                 if (options.max_ticks) |m| {
                     if (ticks >= m) break;
                 }

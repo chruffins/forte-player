@@ -10,10 +10,16 @@ const al = @import("allegro");
 const allegro_init = @import("core/allegro_init.zig");
 const bootstrap = @import("core/bootstrap.zig");
 const RealEngine = @import("core/music_engine.zig").RealEngine;
+const config_mod = @import("core/config.zig");
+const ui = @import("ui/ui.zig");
+const render = @import("ui/render.zig");
 
 /// Per-callback context for the bootstrap loop.
 const Demo = struct {
     engine: *RealEngine,
+    title: [:0]const u8,
+    font: al.font.Font,
+    display: ?*al.Display = null,
     ticks: u64 = 0,
     allocator: std.mem.Allocator,
 };
@@ -27,6 +33,31 @@ fn onTick(ctx: *anyopaque) void {
             demo.ticks, demo.engine.getTime(), demo.engine.isPlaying(), demo.engine.bufferedCount(),
         });
     }
+}
+
+fn onRender(ctx: *anyopaque) void {
+    const demo: *Demo = @ptrCast(@alignCast(ctx));
+    const display = demo.display orelse return; // headless: nothing to draw
+
+    render.beginFrame(display);
+
+    // Now-playing panel
+    render.fillRect(ui.Rect{ .x = 0, .y = 0, .w = @floatFromInt((display.getWidth())), .h = @floatFromInt(display.getHeight()) }, render.panel());
+    render.fillRect(ui.Rect{ .x = 0, .y = 0, .w = 4, .h = @floatFromInt(display.getHeight()) }, render.accent());
+
+    render.drawText(demo.font, 24, 24, demo.title, render.textColor());
+
+    const dur = demo.engine.getDuration();
+    const now = demo.engine.getTime();
+    const frac: f32 = if (dur > 0) @floatCast(@min(now / dur, 1.0)) else 0.0;
+    render.bar(.{ .x = 24, .y = 90, .w = 640, .h = 8 }, frac, render.muted(), render.accent());
+
+    render.endFrame();
+}
+
+fn onInitDisplay(ctx: *anyopaque, display: *al.Display) void {
+    const demo: *Demo = @ptrCast(@alignCast(ctx));
+    demo.display = display;
 }
 
 fn onAudioStreamFinished(ctx: *anyopaque) void {
@@ -47,6 +78,20 @@ pub fn main() !void {
 
     // ---- Port of allegro_init.cpp ----
     try allegro_init.initialize();
+    config_mod.initAppIdentity();
+
+    // ---- Load persisted settings (defaults on first run) ----
+    const config_path = try config_mod.configFilePath(allocator);
+    defer allocator.free(config_path);
+    var config = config_mod.Config.create();
+    defer config.destroy();
+    try config.loadOrCreate(config_path);
+    std.debug.print("forte: config {s} volume={d}% window={d}x{d}\n", .{
+        config_path,
+        config.getVolumePercent(),
+        config.getDisplayWidth(),
+        config.getDisplayHeight(),
+    });
 
     // ---- Real engine (valid by construction) ----
     var engine = try RealEngine.create(allocator);
@@ -76,21 +121,30 @@ pub fn main() !void {
 
     std.debug.print("forte: opening {s}\n", .{media_path});
     try engine.playSound(media_path);
-    engine.setGain(0.8);
+    engine.setGain(@as(f32, @floatFromInt(config.getVolumePercent())) / 100.0);
     engine.setPan(0.0);
     engine.setSpeed(1.0);
     engine.enableCapture(true);
 
-    var demo = Demo{ .engine = engine, .allocator = allocator };
+    var demo = Demo{
+        .engine = engine,
+        .title = media_path,
+        .font = al.font.Font.loadBuiltin(),
+        .allocator = allocator,
+    };
     std.debug.print("forte: duration={d:.3}s entering event loop...\n", .{engine.getDuration()});
 
     // ---- Canonical Allegro loop (bootstrap; headless-safe) ----
     try bootstrap.run(&queue, .{
+        .width = config.getDisplayWidth(),
+        .height = config.getDisplayHeight(),
         .tick_interval_secs = 0.02, // ~50Hz
         .max_ticks = 100,           // ~2s demo
     }, .{
         .ctx = &demo,
         .on_tick = onTick,
+        .on_render = onRender,
+        .on_init_display = onInitDisplay,
         .on_audio_stream_finished = onAudioStreamFinished,
         .on_display_close = onDisplayClose,
     });

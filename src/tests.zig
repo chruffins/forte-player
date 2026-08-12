@@ -10,6 +10,10 @@ test {
 }
 
 test {
+    _ = @import("core/config.zig");
+}
+
+test {
     _ = @import("core/music_engine_test.zig");
 }
 
