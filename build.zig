@@ -19,14 +19,21 @@ pub fn build(b: *std.Build) void {
     const dep = b.dependency("allegro", .{ .target = target, .optimize = optimize });
     const allegro = dep.module("allegro");
 
+    // zig-sqlite (vendored in external/zig-sqlite).
+    const sdep = b.dependency("sqlite", .{ .target = target, .optimize = optimize });
+    const sqlite = sdep.module("sqlite");
+
+    const imports: []const std.Build.Module.Import = &.{
+        .{ .name = "allegro", .module = allegro },
+        .{ .name = "sqlite", .module = sqlite },
+    };
+
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{
-            .{ .name = "allegro", .module = allegro },
-        },
+        .imports = imports,
     });
 
     for (system_libs) |lib| root_mod.linkSystemLibrary(lib, .{});
@@ -45,9 +52,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{
-            .{ .name = "allegro", .module = allegro },
-        },
+        .imports = imports,
     });
     for (system_libs) |lib| unit_mod.linkSystemLibrary(lib, .{});
 

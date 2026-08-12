@@ -48,6 +48,9 @@ pub fn MusicEngine(comptime Drv: type) type {
         /// Optional external queue the current stream's event source registers onto.
         event_queue: ?*al.events.EventQueue = null,
 
+        /// Opaque context forwarded to the hook callbacks (e.g. the Library).
+        user_context: ?*anyopaque = null,
+
         time: f64 = 0.0,
         duration: f64 = 0.0,
         gain: f32 = 1.0,
@@ -60,8 +63,8 @@ pub fn MusicEngine(comptime Drv: type) type {
         /// Optional hook fired when the current song finishes (before auto-advance).
         on_song_finished: ?*const fn (engine: *anyopaque) void = null,
         /// Optional resolver mapping a song id -> file path (borrowed, sentinel-terminated).
-        /// Used by playNext/playPrevious/auto-advance.
-        resolve_song: ?*const fn (id: i32, engine: *anyopaque) ?[:0]const u8 = null,
+        /// Used by playNext/playPrevious/auto-advance. `ctx` is `user_context`.
+        resolve_song: ?*const fn (id: i32, ctx: *anyopaque) ?[:0]const u8 = null,
 
         pub fn create(allocator: std.mem.Allocator) !*Self {
             const drv = try allocator.create(Drv);
@@ -241,7 +244,7 @@ pub fn MusicEngine(comptime Drv: type) type {
 
         fn resolveSongPath(self: *Self, id: i32) ?[:0]const u8 {
             const cb = self.resolve_song orelse return null;
-            return cb(id, @ptrCast(self));
+            return cb(id, self.user_context orelse @ptrCast(self));
         }
 
         pub fn setRepeat(self: *Self, enabled: bool) void {

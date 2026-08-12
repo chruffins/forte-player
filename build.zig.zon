@@ -5,6 +5,7 @@
     .paths = .{ "" },
     .dependencies = .{
         .allegro = .{ .path = "../allegro5-zig" },
+        .sqlite = .{ .path = "external/zig-sqlite" },
     },
     .fingerprint = 0x44284642471ff880,
 }

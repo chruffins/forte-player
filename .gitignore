@@ -2,6 +2,9 @@
 .zig-cache/
 zig-out/
 
+# Fetched dependency caches (e.g. zig-sqlite's bundled SQLite amalgamation)
+zig-pkg/
+
 # Editor
 .vscode/
 *.swp

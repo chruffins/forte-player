@@ -11,6 +11,9 @@ const allegro_init = @import("core/allegro_init.zig");
 const bootstrap = @import("core/bootstrap.zig");
 const RealEngine = @import("core/music_engine.zig").RealEngine;
 const config_mod = @import("core/config.zig");
+const PlayQueue = @import("core/play_queue.zig").PlayQueue;
+const db_mod = @import("music/database.zig");
+const lib_mod = @import("music/library.zig");
 const ui = @import("ui/ui.zig");
 const render = @import("ui/render.zig");
 
@@ -73,6 +76,12 @@ fn onDisplayClose(_: *anyopaque) bool {
     return true;
 }
 
+/// Map a song id -> file path via the Library (engine's resolve_song hook).
+fn resolveSong(id: i32, ctx: *anyopaque) ?[:0]const u8 {
+    const lib: *lib_mod.Library = @ptrCast(@alignCast(ctx));
+    return lib.songPath(@intCast(id));
+}
+
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
@@ -102,25 +111,58 @@ pub fn main() !void {
     defer queue.destroy();
     engine.event_queue = &queue;
 
-    // ---- Pick a media file ----
-    const candidates = [_][:0]const u8{
-        "/usr/share/sounds/alsa/Front_Center.wav",
-        "/home/chris/projects/asteroids-cpp/res/audio/gauze.ogg",
-    };
-    var media_path: [:0]const u8 = candidates[0];
-    for (candidates) |cand| {
-        if (fileExists(cand)) {
-            media_path = cand;
-            break;
+    // ---- Music library (SQLite) ----
+    const db_path = try config_mod.databasePath(allocator);
+    defer allocator.free(db_path);
+    std.debug.print("forte: database {s}\n", .{db_path});
+
+    var lib = try lib_mod.Library.create(allocator);
+    defer lib.destroy();
+    var db = try db_mod.Database.open(lib.arena.allocator(), db_path);
+    defer db.deinit();
+
+    // Seed the (initially empty) library with a couple of known files. The real
+    // taglib-based scanner isn't ported yet, so this stands in for it.
+    try lib.load(&db);
+    if (lib.count() == 0) {
+        std.debug.print("forte: seeding empty library\n", .{});
+        try db.begin();
+        const artist = try db.addArtist("Demo Artist");
+        const album = try db.addAlbum("Demo", artist, 2024);
+        const demo_files = [_][:0]const u8{
+            "/usr/share/sounds/alsa/Front_Center.wav",
+            "/home/chris/projects/asteroids-cpp/res/audio/gauze.ogg",
+        };
+        var n: i64 = 1;
+        for (demo_files) |f| {
+            if (fileExists(f)) {
+                const title = std.fmt.allocPrint(allocator, "Demo Track {d}", .{n}) catch "Demo";
+                defer allocator.free(title);
+                _ = try db.addSong(f, title, album, n, 3);
+            }
+            n += 1;
         }
+        try db.commit();
+        try lib.load(&db);
     }
-    if (!fileExists(media_path)) {
-        std.debug.print("forte: no media file found\n", .{});
-        return error.NoMedia;
+    if (lib.count() == 0) {
+        std.debug.print("forte: no songs in library\n", .{});
+        return error.EmptyLibrary;
     }
 
-    std.debug.print("forte: opening {s}\n", .{media_path});
-    try engine.playSound(media_path);
+    // ---- Play queue + resolve_song over the library ----
+    var play_queue = PlayQueue.init(allocator);
+    defer play_queue.deinit();
+    var qi: usize = 0;
+    while (qi < lib.count()) : (qi += 1) try play_queue.enqueue(@intCast(lib.songIdAt(qi)));
+    engine.setPlayQueue(&play_queue);
+    engine.resolve_song = resolveSong;
+    engine.user_context = lib;
+
+    const first_id = lib.songIdAt(0);
+    const first_path = lib.songPath(first_id).?;
+    std.debug.print("forte: playing {s}\n", .{first_path});
+    try engine.playSound(first_path);
     engine.setGain(@as(f32, @floatFromInt(config.getVolumePercent())) / 100.0);
     engine.setPan(0.0);
     engine.setSpeed(1.0);
@@ -128,7 +170,7 @@ pub fn main() !void {
 
     var demo = Demo{
         .engine = engine,
-        .title = media_path,
+        .title = first_path,
         .font = al.font.Font.loadBuiltin(),
         .allocator = allocator,
     };

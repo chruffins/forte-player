@@ -26,3 +26,11 @@ test {
     // The UI layer's foundational pieces.
     _ = @import("ui/ui.zig");
 }
+
+test {
+    _ = @import("music/database.zig");
+}
+
+test {
+    _ = @import("music/library.zig");
+}
