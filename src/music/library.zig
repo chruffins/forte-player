@@ -19,6 +19,8 @@ pub const Library = struct {
     songs_by_id: std.AutoHashMap(i64, entity.Song),
     /// song id -> sentinel-terminated path (for resolve_song).
     paths_by_id: std.AutoHashMap(i64, [:0]const u8),
+    /// path -> song id (for playback tracking).
+    path_to_id: std.StringHashMap(i64),
     /// Ordered list of song ids (the natural playback order).
     order: std.ArrayList(i64),
 
@@ -32,11 +34,13 @@ pub const Library = struct {
             .arena = std.heap.ArenaAllocator.init(backing),
             .songs_by_id = undefined,
             .paths_by_id = undefined,
+            .path_to_id = undefined,
             .order = undefined,
         };
         const alloc = self.arena.allocator();
         self.songs_by_id = std.AutoHashMap(i64, entity.Song).init(alloc);
         self.paths_by_id = std.AutoHashMap(i64, [:0]const u8).init(alloc);
+        self.path_to_id = std.StringHashMap(i64).init(alloc);
         self.order = std.ArrayList(i64){ .items = &.{}, .capacity = 0 };
         return self;
     }
@@ -61,6 +65,7 @@ pub const Library = struct {
             try self.songs_by_id.put(s.id, s);
             const path_z = try alloc.dupeZ(u8, s.path);
             try self.paths_by_id.put(s.id, path_z);
+            try self.path_to_id.put(s.path, s.id);
             try self.order.append(self.arena.allocator(), s.id);
         }
     }
@@ -76,6 +81,11 @@ pub const Library = struct {
     /// Sentinel-terminated path for a song id, or null.
     pub fn songPath(self: *const Library, id: i64) ?[:0]const u8 {
         return self.paths_by_id.get(id);
+    }
+
+    /// The id for a song path, or null.
+    pub fn songIdByPath(self: *const Library, path: []const u8) ?i64 {
+        return self.path_to_id.get(path);
     }
 
     /// The song id at ordinal `i`, or -1.

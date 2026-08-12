@@ -16,6 +16,18 @@ const db_mod = @import("music/database.zig");
 const lib_mod = @import("music/library.zig");
 const ui = @import("ui/ui.zig");
 const render = @import("ui/render.zig");
+const ct = @cImport({ @cInclude("time.h"); });
+
+/// Engine-hook context: lets resolve_song reach the Library and lets
+/// on_song_changed reach both the Library and Database (for playback tracking).
+const PlaybackCtx = struct {
+    lib: *lib_mod.Library,
+    db: *db_mod.Database,
+};
+
+fn unixSeconds() i64 {
+    return @intCast(ct.time(null));
+}
 
 /// Per-callback context for the bootstrap loop.
 const Demo = struct {
@@ -78,8 +90,16 @@ fn onDisplayClose(_: *anyopaque) bool {
 
 /// Map a song id -> file path via the Library (engine's resolve_song hook).
 fn resolveSong(id: i32, ctx: *anyopaque) ?[:0]const u8 {
-    const lib: *lib_mod.Library = @ptrCast(@alignCast(ctx));
-    return lib.songPath(@intCast(id));
+    const p: *PlaybackCtx = @ptrCast(@alignCast(ctx));
+    return p.lib.songPath(@intCast(id));
+}
+
+/// Fired when a song begins: bump play_count / last_played in the DB.
+fn onSongChanged(path: [:0]const u8, ctx: *anyopaque) void {
+    const p: *PlaybackCtx = @ptrCast(@alignCast(ctx));
+    const id = p.lib.songIdByPath(path) orelse return;
+    p.db.markPlayed(@intCast(id), unixSeconds()) catch return;
+    std.debug.print("forte: recorded play for song id {d}\n", .{id});
 }
 
 pub fn main() !void {
@@ -150,14 +170,17 @@ pub fn main() !void {
         return error.EmptyLibrary;
     }
 
-    // ---- Play queue + resolve_song over the library ----
+    // ---- Play queue + resolve_song / playback-state over the library ----
+    var playback_ctx = PlaybackCtx{ .lib = lib, .db = &db };
+
     var play_queue = PlayQueue.init(allocator);
     defer play_queue.deinit();
     var qi: usize = 0;
     while (qi < lib.count()) : (qi += 1) try play_queue.enqueue(@intCast(lib.songIdAt(qi)));
     engine.setPlayQueue(&play_queue);
     engine.resolve_song = resolveSong;
-    engine.user_context = lib;
+    engine.on_song_changed = onSongChanged;
+    engine.user_context = &playback_ctx;
 
     const first_id = lib.songIdAt(0);
     const first_path = lib.songPath(first_id).?;

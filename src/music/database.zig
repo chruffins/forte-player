@@ -226,6 +226,20 @@ pub const Database = struct {
 
     // ---- reads ----
 
+    /// Record a playback: bump `play_count` and set `last_played` (epoch secs).
+    pub fn markPlayed(self: *Database, id: i64, now_secs: i64) !void {
+        try self.raw.exec(
+            "UPDATE songs SET play_count = play_count + 1, last_played = ? WHERE id = ?;",
+            .{},
+            .{ now_secs, id },
+        );
+    }
+
+    /// Set the favorite (0/1) flag for a song.
+    pub fn setFavorite(self: *Database, id: i64, favorite: i64) !void {
+        try self.raw.exec("UPDATE songs SET favorite = ? WHERE id = ?;", .{}, .{ favorite, id });
+    }
+
     /// All songs, ordered by id, allocated with `self.allocator` (strings too).
     /// Iterates manually: zig-sqlite's `.all` uses `std.ArrayList(Type) = .{}`
     /// which doesn't compile against 0.16's unmanaged ArrayList.
@@ -293,6 +307,27 @@ test "database: schema, insert, and query round-trip (in-memory)" {
     const path = try db.getSongPathById(s1);
     try std.testing.expect(path != null);
     try std.testing.expectEqualStrings("/music/a.ogg", path.?);
+}
+
+test "database: player-state updates (markPlayed, setFavorite)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var db = try Database.open(arena.allocator(), null);
+    defer db.deinit();
+
+    const artist = try db.addArtist("P");
+    const album = try db.addAlbum("PA", artist, 2021);
+    const s = try db.addSong("/p/x.ogg", "X", album, 1, 60, 1);
+
+    try db.markPlayed(s, 1000);
+    try db.markPlayed(s, 2000);
+    try db.setFavorite(s, 1);
+
+    const row = (try db.getSongById(s)).?;
+    try std.testing.expectEqual(@as(i64, 2), row.play_count);
+    try std.testing.expectEqual(@as(i64, 2000), row.last_played);
+    try std.testing.expectEqual(@as(i64, 1), row.favorite);
 }
 
 test "database: rollback discards pending inserts" {

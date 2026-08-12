@@ -59,7 +59,7 @@ pub fn MusicEngine(comptime Drv: type) type {
         queue: ?*PlayQueue = null,
 
         /// Optional hook fired when a new song begins (path + engine as ctx).
-        on_song_changed: ?*const fn (path: [:0]const u8, engine: *anyopaque) void = null,
+        on_song_changed: ?*const fn (path: [:0]const u8, ctx: *anyopaque) void = null,
         /// Optional hook fired when the current song finishes (before auto-advance).
         on_song_finished: ?*const fn (engine: *anyopaque) void = null,
         /// Optional resolver mapping a song id -> file path (borrowed, sentinel-terminated).
@@ -113,7 +113,7 @@ pub fn MusicEngine(comptime Drv: type) type {
             }
 
             self.stream = stream;
-            if (self.on_song_changed) |cb| cb(path, @ptrCast(self));
+            if (self.on_song_changed) |cb| cb(path, self.user_context orelse @ptrCast(self));
         }
 
         pub fn pause(self: *Self) void {
