@@ -6,8 +6,7 @@ Working name for a music player, being rewritten in Zig from
 
 Currently ported:
 - `core/allegro_init.zig` — Allegro/addon/input init (port of `allegro_init.cpp`)
-- `core/music_engine.zig` — audio engine, generic over a duck-typed driver
-- `core/driver.zig` — `AllegroDriver` (real) + `FakeDriver` (headless tests)
+- `core/music_engine.zig` — audio engine, generic over a duck-typed driver (+ `FakeDriver` for headless tests)
 - `core/bootstrap.zig` — display + event loop scaffold (no UI yet)
 - `ui/` — the redesigned UI layer (seed only; see `ui/DESIGN.md`)
 
@@ -31,7 +30,8 @@ src/
     bootstrap.zig           # event loop / display host
     driver.zig              # AllegroDriver / FakeDriver (duck-typed seam)
     music_engine.zig        # generic MusicEngine(Drv) + RealEngine
-    music_engine_test.zig   # transport tests via FakeDriver
+    music_engine_test.zig   # transport + auto-advance tests via FakeDriver
+    play_queue.zig          # queue / repeat / shuffle (pure, tested)
     sample_capture.zig      # FFT-free wave capture ring buffer
   ui/                       # redesigned UI layer (see ui/DESIGN.md)
 ```

@@ -18,6 +18,8 @@ pub const Handlers = struct {
     on_init_display: ?*const fn (ctx: *anyopaque, display: *al.Display) void = null,
     /// Called every timer tick (approx `Options.tick_interval_secs`).
     on_tick: ?*const fn (ctx: *anyopaque) void = null,
+    /// Called when the audio stream finishes (e.g. to auto-advance the queue).
+    on_audio_stream_finished: ?*const fn (ctx: *anyopaque) void = null,
     on_key_down: ?*const fn (ctx: *anyopaque, key: al.KeyCode) void = null,
     on_key_up: ?*const fn (ctx: *anyopaque, key: al.KeyCode) void = null,
     on_mouse_motion: ?*const fn (ctx: *anyopaque, x: f32, y: f32) void = null,
@@ -79,6 +81,9 @@ pub fn run(queue: *al.EventQueue, options: Options, handlers: Handlers) !void {
                 if (options.max_ticks) |m| {
                     if (ticks >= m) break;
                 }
+            },
+            .audio_stream_finished => {
+                if (handlers.on_audio_stream_finished) |h| h(handlers.ctx);
             },
             .display_close => {
                 const quit = if (handlers.on_display_close) |h| h(handlers.ctx) else true;

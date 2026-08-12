@@ -6,6 +6,10 @@ test {
 }
 
 test {
+    _ = @import("core/play_queue.zig");
+}
+
+test {
     _ = @import("core/music_engine_test.zig");
 }
 

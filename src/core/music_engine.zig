@@ -22,6 +22,9 @@
 const std = @import("std");
 const al = @import("allegro");
 const driver_mod = @import("driver.zig");
+const PlayQueue = @import("play_queue.zig").PlayQueue;
+const RepeatMode = @import("play_queue.zig").RepeatMode;
+const PlaybackContextType = @import("play_queue.zig").PlaybackContextType;
 
 pub const SampleCapture = @import("sample_capture.zig").SampleCapture;
 pub const AllegroDriver = driver_mod.AllegroDriver;
@@ -49,8 +52,16 @@ pub fn MusicEngine(comptime Drv: type) type {
         duration: f64 = 0.0,
         gain: f32 = 1.0,
 
+        /// Optional play queue (not owned) that drives next/previous/auto-advance.
+        queue: ?*PlayQueue = null,
+
         /// Optional hook fired when a new song begins (path + engine as ctx).
         on_song_changed: ?*const fn (path: [:0]const u8, engine: *anyopaque) void = null,
+        /// Optional hook fired when the current song finishes (before auto-advance).
+        on_song_finished: ?*const fn (engine: *anyopaque) void = null,
+        /// Optional resolver mapping a song id -> file path (borrowed, sentinel-terminated).
+        /// Used by playNext/playPrevious/auto-advance.
+        resolve_song: ?*const fn (id: i32, engine: *anyopaque) ?[:0]const u8 = null,
 
         pub fn create(allocator: std.mem.Allocator) !*Self {
             const drv = try allocator.create(Drv);
@@ -174,6 +185,101 @@ pub fn MusicEngine(comptime Drv: type) type {
         }
         pub fn clearCapture(self: *Self) void {
             self.drv.clearCapture();
+        }
+
+        // ---- Queue / repeat / auto-advance ----
+
+        pub fn setPlayQueue(self: *Self, queue: ?*PlayQueue) void {
+            self.queue = queue;
+        }
+
+        /// Advance to the next song in the queue and start it. Returns true if a
+        /// song was started, false if there was no next song in the queue.
+        pub fn playNext(self: *Self) !bool {
+            const q = self.queue orelse return false;
+            const id = (try q.next()) orelse return false;
+            const path = self.resolveSongPath(id) orelse return false;
+            try self.playSound(path);
+            return true;
+        }
+
+        /// Move to the previous song from play history and start it (no-op if none).
+        pub fn playPrevious(self: *Self) !void {
+            const q = self.queue orelse return;
+            const id = q.previous() orelse return;
+            if (self.resolveSongPath(id)) |path| try self.playSound(path);
+        }
+
+        /// End-of-song handling: fire the hook, then auto-advance according to the
+        /// repeat mode (One replays the current track; All wraps; None stops when
+        /// the queue runs out). The real app calls this when the audio stream
+        /// finishes; tests drive it directly.
+        pub fn handleAudioStreamFinished(self: *Self) !void {
+            if (self.on_song_finished) |cb| cb(@ptrCast(self));
+
+            const q = self.queue orelse {
+                self.stop();
+                return;
+            };
+
+            switch (q.getRepeatMode()) {
+                .One => {
+                    if (q.current()) |id| {
+                        if (self.resolveSongPath(id)) |path| {
+                            try self.playSound(path);
+                            return;
+                        }
+                    }
+                    self.stop();
+                },
+                .None, .All => {
+                    if (try self.playNext()) return;
+                    self.stop();
+                },
+            }
+        }
+
+        fn resolveSongPath(self: *Self, id: i32) ?[:0]const u8 {
+            const cb = self.resolve_song orelse return null;
+            return cb(id, @ptrCast(self));
+        }
+
+        pub fn setRepeat(self: *Self, enabled: bool) void {
+            if (self.queue) |q| q.setRepeatMode(if (enabled) .All else .None);
+        }
+        pub fn setRepeatMode(self: *Self, mode: RepeatMode) void {
+            if (self.queue) |q| q.setRepeatMode(mode);
+        }
+        pub fn getRepeatMode(self: *const Self) RepeatMode {
+            return if (self.queue) |q| q.getRepeatMode() else .None;
+        }
+        pub fn cycleRepeatMode(self: *Self) void {
+            self.setRepeatMode(switch (self.getRepeatMode()) {
+                .None => .All,
+                .All => .One,
+                .One => .None,
+            });
+        }
+        pub fn isRepeating(self: *const Self) bool {
+            return if (self.queue) |q| q.isRepeating() else false;
+        }
+        pub fn setShuffled(self: *Self, enabled: bool) !void {
+            if (self.queue) |q| try q.setShuffled(enabled);
+        }
+        pub fn isShuffled(self: *const Self) bool {
+            return if (self.queue) |q| q.isShuffled() else false;
+        }
+        pub fn setContext(self: *Self, context_type: PlaybackContextType, context_id: i32) void {
+            if (self.queue) |q| {
+                q.context_type = context_type;
+                q.context_id = context_id;
+            }
+        }
+        pub fn getContextType(self: *const Self) PlaybackContextType {
+            return if (self.queue) |q| q.context_type else .Individual;
+        }
+        pub fn getContextId(self: *const Self) i32 {
+            return if (self.queue) |q| q.context_id else -1;
         }
     };
 }

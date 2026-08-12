@@ -29,6 +29,14 @@ fn onTick(ctx: *anyopaque) void {
     }
 }
 
+fn onAudioStreamFinished(ctx: *anyopaque) void {
+    const demo: *Demo = @ptrCast(@alignCast(ctx));
+    std.debug.print("forte: stream finished -> auto-advance\n", .{});
+    demo.engine.handleAudioStreamFinished() catch {
+        std.debug.print("forte: auto-advance failed\n", .{});
+    };
+}
+
 fn onDisplayClose(_: *anyopaque) bool {
     std.debug.print("forte: display close requested\n", .{});
     return true;
@@ -83,6 +91,7 @@ pub fn main() !void {
     }, .{
         .ctx = &demo,
         .on_tick = onTick,
+        .on_audio_stream_finished = onAudioStreamFinished,
         .on_display_close = onDisplayClose,
     });
 
