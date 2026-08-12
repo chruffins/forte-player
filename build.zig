@@ -41,6 +41,23 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{ .name = "forte-player", .root_module = root_mod });
     b.installArtifact(exe);
 
+    // ---- TUI frontend (second executable sharing the same deps) ----
+    const tui_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = imports,
+    });
+    for (system_libs) |lib| tui_mod.linkSystemLibrary(lib, .{});
+    const tui_exe = b.addExecutable(.{ .name = "forte-tui", .root_module = tui_mod });
+    b.installArtifact(tui_exe);
+
+    const tui_run_cmd = b.addRunArtifact(tui_exe);
+    tui_run_cmd.step.dependOn(b.getInstallStep());
+    const tui_run_step = b.step("run-tui", "Run the TUI frontend");
+    tui_run_step.dependOn(&tui_run_cmd.step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run forte-player");

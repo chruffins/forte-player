@@ -24,8 +24,9 @@ Currently ported:
 ## Build / run / test
 
 ```sh
-zig build            # compile the app
-zig build run        # run it (audio + optional display; headless-safe)
+zig build            # compile both frontends
+zig build run        # GUI frontend (audio + optional display)
+zig build run-tui    # TUI frontend (terminal: space/n/p/s/r/+/-/q)
 zig build test       # run headless unit tests + compile-checks
 zig build test --summary all   # verbose
 ```
