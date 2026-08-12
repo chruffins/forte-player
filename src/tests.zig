@@ -34,3 +34,7 @@ test {
 test {
     _ = @import("music/library.zig");
 }
+
+test {
+    _ = @import("music/scanner.zig");
+}

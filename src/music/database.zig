@@ -269,6 +269,80 @@ pub const Database = struct {
         const row = try stmt.oneAlloc(PathRow, self.allocator, .{}, .{id});
         return if (row) |r| r.song_path else null;
     }
+
+    // ---- scanner helpers ----
+
+    pub const SongImportInfo = struct {
+        id: i64,
+        file_size: i64,
+        file_mtime_ticks: i64,
+    };
+
+    /// Existing row for a path (for change detection), or null.
+    pub fn getSongImportInfoByPath(self: *Database, path: []const u8) !?SongImportInfo {
+        var stmt = try self.raw.prepareDynamic(
+            "SELECT id, COALESCE(file_size, -1), COALESCE(file_mtime_ticks, -1) FROM songs WHERE song_path = ?;",
+        );
+        defer stmt.deinit();
+        const Row = struct { id: i64, file_size: i64, file_mtime_ticks: i64 };
+        const r = try stmt.one(Row, .{}, .{path});
+        return if (r) |row| .{ .id = row.id, .file_size = row.file_size, .file_mtime_ticks = row.file_mtime_ticks } else null;
+    }
+
+    pub fn getOrCreateArtist(self: *Database, name: []const u8) !i64 {
+        try self.raw.exec("INSERT OR IGNORE INTO artists(name) VALUES(?);", .{}, .{name});
+        const Row = struct { id: i64 };
+        var stmt = try self.raw.prepareDynamic("SELECT id FROM artists WHERE name = ?;");
+        defer stmt.deinit();
+        const row = (try stmt.one(Row, .{}, .{name})) orelse return error.ArtistNotFound;
+        return row.id;
+    }
+
+    pub fn getOrCreateAlbum(self: *Database, title: []const u8, artist_id: i64, year: ?i64) !i64 {
+        const y = year orelse -1;
+        try self.raw.exec(
+            "INSERT OR IGNORE INTO albums(name, artist_id, year) VALUES(?, ?, ?);",
+            .{},
+            .{ title, artist_id, y },
+        );
+        const Row = struct { id: i64 };
+        var stmt = try self.raw.prepareDynamic("SELECT id FROM albums WHERE name = ? AND artist_id = ?;");
+        defer stmt.deinit();
+        const row = (try stmt.one(Row, .{}, .{ title, artist_id })) orelse return error.AlbumNotFound;
+        return row.id;
+    }
+
+    /// Update an existing song's metadata + file fingerprint.
+    pub fn updateSong(
+        self: *Database,
+        id: i64,
+        title: []const u8,
+        album_id: i64,
+        track: i64,
+        disc_number: i64,
+        duration: i64,
+        file_size: i64,
+        file_mtime_ticks: i64,
+    ) !void {
+        try self.raw.exec(
+            "UPDATE songs SET title=?, album_id=?, track=?, disc_number=?, duration=?, file_size=?, file_mtime_ticks=? WHERE id=?;",
+            .{},
+            .{ title, album_id, track, disc_number, duration, file_size, file_mtime_ticks, id },
+        );
+    }
+
+    pub fn deleteSongById(self: *Database, id: i64) !void {
+        try self.raw.exec("DELETE FROM songs WHERE id=?;", .{}, .{id});
+    }
+
+    /// Record the on-disk fingerprint (size + mtime) for change detection.
+    pub fn setSongFileState(self: *Database, id: i64, file_size: i64, file_mtime_ticks: i64) !void {
+        try self.raw.exec(
+            "UPDATE songs SET file_size=?, file_mtime_ticks=? WHERE id=?;",
+            .{},
+            .{ file_size, file_mtime_ticks, id },
+        );
+    }
 };
 
 test "database: schema, insert, and query round-trip (in-memory)" {

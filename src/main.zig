@@ -14,6 +14,7 @@ const config_mod = @import("core/config.zig");
 const PlayQueue = @import("core/play_queue.zig").PlayQueue;
 const db_mod = @import("music/database.zig");
 const lib_mod = @import("music/library.zig");
+const scanner = @import("music/scanner.zig");
 const ui = @import("ui/ui.zig");
 const render = @import("ui/render.zig");
 const ct = @cImport({ @cInclude("time.h"); });
@@ -141,30 +142,17 @@ pub fn main() !void {
     var db = try db_mod.Database.open(lib.arena.allocator(), db_path);
     defer db.deinit();
 
-    // Seed the (initially empty) library with a couple of known files. The real
-    // taglib-based scanner isn't ported yet, so this stands in for it.
+    // Scan the configured music directory into the database.
+    const music_dir = config.getMusicDirectory();
+    std.debug.print("forte: scanning {s}\n", .{music_dir});
+    const scan = scanner.scanDirectory(&db, allocator, music_dir) catch |e| {
+        std.debug.print("forte: scan failed: {}\n", .{e});
+        return e;
+    };
+    std.debug.print("forte: scanned {d} files: +{d} imported, ~{d} updated, -{d} removed, {d} unchanged\n", .{
+        scan.scanned, scan.imported, scan.updated, scan.removed, scan.skipped,
+    });
     try lib.load(&db);
-    if (lib.count() == 0) {
-        std.debug.print("forte: seeding empty library\n", .{});
-        try db.begin();
-        const artist = try db.addArtist("Demo Artist");
-        const album = try db.addAlbum("Demo", artist, 2024);
-        const demo_files = [_][:0]const u8{
-            "/usr/share/sounds/alsa/Front_Center.wav",
-            "/home/chris/projects/asteroids-cpp/res/audio/gauze.ogg",
-        };
-        var n: i64 = 1;
-        for (demo_files) |f| {
-            if (fileExists(f)) {
-                const title = std.fmt.allocPrint(allocator, "Demo Track {d}", .{n}) catch "Demo";
-                defer allocator.free(title);
-                _ = try db.addSong(f, title, album, n, 3, 1);
-            }
-            n += 1;
-        }
-        try db.commit();
-        try lib.load(&db);
-    }
     if (lib.count() == 0) {
         std.debug.print("forte: no songs in library\n", .{});
         return error.EmptyLibrary;
@@ -182,10 +170,38 @@ pub fn main() !void {
     engine.on_song_changed = onSongChanged;
     engine.user_context = &playback_ctx;
 
-    const first_id = lib.songIdAt(0);
-    const first_path = lib.songPath(first_id).?;
-    std.debug.print("forte: playing {s}\n", .{first_path});
-    try engine.playSound(first_path);
+    // Find a playable song. Prefer non-MP3 first (this Allegro build may lack an
+    // MP3 codec) and cap attempts so a huge undecodable library can't stall startup.
+    var current_path: [:0]const u8 = undefined;
+    var started = false;
+
+    const try_play = struct {
+        fn go(eng: *RealEngine, libv: *lib_mod.Library, current: *[:0]const u8, startedv: *bool, extended: bool) usize {
+            var tries: usize = 0;
+            var i: usize = 0;
+            while (i < libv.count() and !startedv.* and tries < 60) : (i += 1) {
+                const id = libv.songIdAt(i);
+                const path = libv.songPath(id) orelse continue;
+                const is_mp3 = std.mem.endsWith(u8, path, ".mp3");
+                if (is_mp3 == extended) {
+                    tries += 1;
+                    if (eng.playSound(path)) |_| {
+                        current.* = path;
+                        startedv.* = true;
+                    } else |_| {}
+                }
+            }
+            return tries;
+        }
+    }.go;
+    _ = try_play(engine, lib, &current_path, &started, false); // non-mp3
+    _ = try_play(engine, lib, &current_path, &started, true); // mp3 fallback
+
+    if (!started) {
+        std.debug.print("forte: no playable songs found\n", .{});
+        return;
+    }
+    std.debug.print("forte: playing {s}\n", .{current_path});
     engine.setGain(@as(f32, @floatFromInt(config.getVolumePercent())) / 100.0);
     engine.setPan(0.0);
     engine.setSpeed(1.0);
@@ -193,7 +209,7 @@ pub fn main() !void {
 
     var demo = Demo{
         .engine = engine,
-        .title = first_path,
+        .title = current_path,
         .font = al.font.Font.loadBuiltin(),
         .allocator = allocator,
     };
