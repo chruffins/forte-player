@@ -29,10 +29,22 @@ pub const ScanResult = struct {
     skipped: usize = 0,
 };
 
+/// Pluggable metadata extraction (e.g. taglib vs filename fallback).
+pub const Extractor = struct {
+    extract: *const fn (std.mem.Allocator, []const u8) ?Metadata,
+};
+
+/// Filename-only extractor; used by tests and as the default.
+pub const fallback_extractor = Extractor{ .extract = fallbackExtract };
+
+fn fallbackExtract(a: std.mem.Allocator, path: []const u8) ?Metadata {
+    return extractFallback(a, path) catch null;
+}
+
 const audio_exts = [_][]const u8{ ".mp3", ".flac", ".ogg", ".wav", ".m4a", ".mp4", ".aac", ".opus" };
 
 /// Recursively scan `dir` and update `db` accordingly.
-pub fn scanDirectory(db: *database.Database, backing: std.mem.Allocator, dir: []const u8) !ScanResult {
+pub fn scanDirectory(db: *database.Database, backing: std.mem.Allocator, dir: []const u8, extractor: Extractor) !ScanResult {
     var arena = std.heap.ArenaAllocator.init(backing);
     defer arena.deinit();
     const a = arena.allocator();
@@ -41,7 +53,7 @@ pub fn scanDirectory(db: *database.Database, backing: std.mem.Allocator, dir: []
     var seen = std.StringHashMap(void).init(a);
     var result = ScanResult{};
 
-    try walk(db, a, dir, &seen, &result);
+    try walk(db, a, dir, extractor, &seen, &result);
 
     // Remove database rows for files that no longer exist under the tree.
     const db_songs = try db.getAllSongs();
@@ -54,7 +66,7 @@ pub fn scanDirectory(db: *database.Database, backing: std.mem.Allocator, dir: []
     return result;
 }
 
-fn walk(db: *database.Database, a: std.mem.Allocator, dir: []const u8, seen: *std.StringHashMap(void), result: *ScanResult) !void {
+fn walk(db: *database.Database, a: std.mem.Allocator, dir: []const u8, extractor: Extractor, seen: *std.StringHashMap(void), result: *ScanResult) !void {
     var dirbuf: [path_buf_size:0]u8 = undefined;
     const dirz = toSentinel(&dirbuf, dir) orelse return error.PathTooLong;
 
@@ -75,9 +87,9 @@ fn walk(db: *database.Database, a: std.mem.Allocator, dir: []const u8, seen: *st
         if (std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) continue;
 
         if (c.isDirectory()) {
-            try walk(db, a, cpath, seen, result);
+            try walk(db, a, cpath, extractor, seen, result);
         } else if (hasAudioExtension(base)) {
-            try processFile(db, a, cpath, c.size(), c.mtime(), seen, result);
+            try processFile(db, a, cpath, c.size(), c.mtime(), extractor, seen, result);
         }
     }
 }
@@ -88,6 +100,7 @@ fn processFile(
     path: []const u8,
     file_size: i64,
     mtime: i64,
+    extractor: Extractor,
     seen: *std.StringHashMap(void),
     result: *ScanResult,
 ) !void {
@@ -101,13 +114,13 @@ fn processFile(
             return;
         }
         // File changed on disk -> re-extract and update.
-        const meta = try extractFallback(a, path);
+        const meta = extractor.extract(a, path) orelse try extractFallback(a, path);
         const artist_id = try db.getOrCreateArtist(meta.artist);
         const album_id = try db.getOrCreateAlbum(meta.album, artist_id, meta.year);
         try db.updateSong(info.id, meta.title, album_id, meta.track, 1, meta.duration, file_size, mtime);
         result.updated += 1;
     } else {
-        const meta = try extractFallback(a, path);
+        const meta = extractor.extract(a, path) orelse try extractFallback(a, path);
         const artist_id = try db.getOrCreateArtist(meta.artist);
         const album_id = try db.getOrCreateAlbum(meta.album, artist_id, meta.year);
         const new_id = try db.addSong(path, meta.title, album_id, meta.track, meta.duration, 1);
@@ -172,18 +185,18 @@ test "scanner: imports files, skips unchanged, removes deleted" {
     defer db.deinit();
 
     // First scan imports 1.
-    var r = try scanDirectory(&db, std.testing.allocator, root);
+    var r = try scanDirectory(&db, std.testing.allocator, root, fallback_extractor);
     try std.testing.expectEqual(@as(usize, 1), r.imported);
     try std.testing.expectEqual(@as(usize, 1), (try db.getAllSongs()).len);
 
     // Second scan: unchanged -> skipped, nothing imported/updated.
-    r = try scanDirectory(&db, std.testing.allocator, root);
+    r = try scanDirectory(&db, std.testing.allocator, root, fallback_extractor);
     try std.testing.expectEqual(@as(usize, 1), r.skipped);
     try std.testing.expectEqual(@as(usize, 0), r.imported);
 
     // Delete the file -> removed.
     _ = al.filesystem.removeFilename(song);
-    r = try scanDirectory(&db, std.testing.allocator, root);
+    r = try scanDirectory(&db, std.testing.allocator, root, fallback_extractor);
     try std.testing.expectEqual(@as(usize, 1), r.removed);
     try std.testing.expectEqual(@as(usize, 0), (try db.getAllSongs()).len);
 }

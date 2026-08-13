@@ -37,7 +37,9 @@ pub fn build(b: *std.Build) void {
     });
 
     for (system_libs) |lib| root_mod.linkSystemLibrary(lib, .{});
-
+    // taglib C bindings (metadata extraction)
+    root_mod.addIncludePath(.{ .cwd_relative = "/usr/include/taglib" });
+    root_mod.linkSystemLibrary("tag_c", .{});
     const exe = b.addExecutable(.{ .name = "forte-player", .root_module = root_mod });
     b.installArtifact(exe);
 
@@ -50,6 +52,8 @@ pub fn build(b: *std.Build) void {
         .imports = imports,
     });
     for (system_libs) |lib| tui_mod.linkSystemLibrary(lib, .{});
+    tui_mod.addIncludePath(.{ .cwd_relative = "/usr/include/taglib" });
+    tui_mod.linkSystemLibrary("tag_c", .{});
     const tui_exe = b.addExecutable(.{ .name = "forte-tui", .root_module = tui_mod });
     b.installArtifact(tui_exe);
 

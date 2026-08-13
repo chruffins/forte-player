@@ -15,6 +15,7 @@ const PlayQueue = @import("core/play_queue.zig").PlayQueue;
 const db_mod = @import("music/database.zig");
 const lib_mod = @import("music/library.zig");
 const scanner = @import("music/scanner.zig");
+const taglib_meta = @import("music/taglib_meta.zig");
 const ui = @import("ui/ui.zig");
 const render = @import("ui/render.zig");
 const ct = @cImport({ @cInclude("time.h"); });
@@ -145,7 +146,7 @@ pub fn main() !void {
     // Scan the configured music directory into the database.
     const music_dir = config.getMusicDirectory();
     std.debug.print("forte: scanning {s}\n", .{music_dir});
-    const scan = scanner.scanDirectory(&db, allocator, music_dir) catch |e| {
+    const scan = scanner.scanDirectory(&db, allocator, music_dir, taglib_meta.extractor) catch |e| {
         std.debug.print("forte: scan failed: {}\n", .{e});
         return e;
     };

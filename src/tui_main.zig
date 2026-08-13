@@ -14,6 +14,7 @@ const PlayQueue = @import("core/play_queue.zig").PlayQueue;
 const db_mod = @import("music/database.zig");
 const lib_mod = @import("music/library.zig");
 const scanner = @import("music/scanner.zig");
+const taglib_meta = @import("music/taglib_meta.zig");
 
 const cterm = @cImport({
     @cInclude("termios.h");
@@ -152,7 +153,7 @@ pub fn main() !void {
     // Scan isn't needed every launch when nothing changed, but run it once so an
     // in-memory/empty DB still gets populated at first run.
     const music_dir = config.getMusicDirectory();
-    const scan: scanner.ScanResult = scanner.scanDirectory(&db, allocator, music_dir) catch .{};
+    const scan: scanner.ScanResult = scanner.scanDirectory(&db, allocator, music_dir, taglib_meta.extractor) catch .{};
     try lib.load(&db);
     if (lib.count() == 0) {
         termPrint("\x1b[1;31mno songs in library\x1b[0m\n", .{});
