@@ -38,3 +38,11 @@ test {
 test {
     _ = @import("music/scanner.zig");
 }
+
+test {
+    _ = @import("ui/ui_state.zig");
+}
+
+test {
+    _ = @import("ui/ui_view.zig");
+}
