@@ -19,6 +19,7 @@ const taglib_meta = @import("music/taglib_meta.zig");
 const U = @import("ui/ui_state.zig");
 const view = @import("ui/ui_view.zig");
 const render = @import("ui/tui_render.zig");
+const theme = @import("ui/theme.zig");
 
 const PlaybackCtx = struct { lib: *lib_mod.Library, db: *db_mod.Database };
 
@@ -38,11 +39,18 @@ fn onSongChanged(path: [:0]const u8, ctx: *anyopaque) void {
     p.db.markPlayed(@intCast(id), unixSeconds()) catch return;
 }
 
-fn runCmd(engine: *RealEngine, lib: *lib_mod.Library, cmd: U.Cmd, current_path: *[:0]const u8) void {
+fn runCmd(engine: *RealEngine, lib: *lib_mod.Library, db: *db_mod.Database, cmd: U.Cmd, current_path: *[:0]const u8) void {
     switch (cmd) {
         .none => {},
         .toggle_pause => {
             if (engine.isPlaying()) engine.pause() else engine.resumePlayback();
+        },
+        .toggle_favorite => {
+            const id = lib.songIdByPath(current_path.*) orelse return;
+            const cur = if (lib.getSongById(id)) |sg| sg.favorite != 0 else false;
+            const nv = !cur;
+            db.setFavorite(id, @intFromBool(nv)) catch return;
+            lib.setFavorite(id, nv);
         },
         .next => _ = engine.playNext() catch {},
         .prev => engine.playPrevious() catch {},
@@ -62,10 +70,22 @@ fn runCmd(engine: *RealEngine, lib: *lib_mod.Library, cmd: U.Cmd, current_path: 
 }
 
 /// Keep the UI's transient snapshot in sync with the engine + library.
-fn fillState(st: *U.State, engine: *RealEngine, lib: *lib_mod.Library, current_path: [:0]const u8) void {
+fn fillState(st: *U.State, engine: *RealEngine, lib: *lib_mod.Library, db: *db_mod.Database, current_path: [:0]const u8) void {
     st.title = current_path;
+    st.artist = "";
+    st.album = "";
+    st.favorite = false;
+    st.playing_index = null;
     if (lib.songIdByPath(current_path)) |id| {
-        if (lib.getSongById(id)) |song| st.title = song.title;
+        if (lib.getSongById(id)) |song| {
+            st.title = song.title;
+            st.favorite = song.favorite != 0;
+        }
+        if (db.getSongContext(id) catch null) |ctx| {
+            st.artist = ctx.artist;
+            st.album = ctx.album;
+        }
+        st.playing_index = lib.indexOfId(id);
     }
     st.path = current_path;
     st.position = engine.getTime();
@@ -150,6 +170,19 @@ pub fn main() !void {
     render.enableRaw();
     defer render.restoreRaw();
 
+    // theme: config override or auto-detect (dark vs light terminal)
+    const theme_setting = config.getStr("ui", "theme", "auto");
+    var scheme = theme.Scheme.dark;
+    var auto = true;
+    if (std.mem.eql(u8, theme_setting, "dark")) {
+        scheme = .dark;
+        auto = false;
+    } else if (std.mem.eql(u8, theme_setting, "light")) {
+        scheme = .light;
+        auto = false;
+    }
+    render.setPalette(render.detectScheme(scheme, auto));
+
     const win = render.size();
     const width: u16 = win.w;
     const height: u16 = win.h;
@@ -167,7 +200,7 @@ pub fn main() !void {
             if (U.keyToAction(k)) |a| {
                 const visible = view.libraryVisible(height);
                 const cmd = U.apply(&st, a, visible);
-                runCmd(engine, lib, cmd, &current_path);
+                runCmd(engine, lib, &db, cmd, &current_path);
             }
         }
 
@@ -177,7 +210,7 @@ pub fn main() !void {
             engine.handleAudioStreamFinished() catch {};
         }
 
-        fillState(&st, engine, lib, current_path);
+        fillState(&st, engine, lib, &db, current_path);
 
         var cl = view.CmdList{};
         view.emit(&st, &cl, width, height, titles.items);

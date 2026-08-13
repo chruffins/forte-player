@@ -261,6 +261,19 @@ pub const Database = struct {
         return try stmt.oneAlloc(entity.Song, self.allocator, .{}, .{id});
     }
 
+    pub const SongContext = struct { artist: []const u8, album: []const u8 };
+
+    /// Artist + album names for a song (null if it has no album/artist).
+    pub fn getSongContext(self: *Database, song_id: i64) !?SongContext {
+        var stmt = try self.raw.prepareDynamic(
+            "SELECT COALESCE(a.name,''), COALESCE(al.name,'') FROM songs s JOIN albums al ON al.id = s.album_id JOIN artists a ON a.id = al.artist_id WHERE s.id = ?;",
+        );
+        defer stmt.deinit();
+        const Row = struct { artist: []const u8, album: []const u8 };
+        const r = try stmt.oneAlloc(Row, self.allocator, .{}, .{ song_id });
+        return if (r) |row| .{ .artist = row.artist, .album = row.album } else null;
+    }
+
     /// The file path for a song id, or null if absent.
     pub fn getSongPathById(self: *Database, id: i64) !?[]const u8 {
         var stmt = try self.raw.prepareDynamic("SELECT song_path FROM songs WHERE id = ?;");

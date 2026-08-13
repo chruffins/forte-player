@@ -97,6 +97,19 @@ pub const Library = struct {
     pub fn count(self: *const Library) usize {
         return self.order.items.len;
     }
+
+    /// Index of a song id in playback order, or null.
+    pub fn indexOfId(self: *const Library, id: i64) ?usize {
+        for (self.order.items, 0..) |v, i| {
+            if (v == id) return i;
+        }
+        return null;
+    }
+
+    /// Flip the in-memory favorite flag (kept in sync with the DB by the caller).
+    pub fn setFavorite(self: *Library, id: i64, fav: bool) void {
+        if (self.songs_by_id.getPtr(id)) |s| s.favorite = @intFromBool(fav);
+    }
 };
 
 test "library: loads songs + path lookup" {

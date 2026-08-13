@@ -46,3 +46,7 @@ test {
 test {
     _ = @import("ui/ui_view.zig");
 }
+
+test {
+    _ = @import("ui/theme.zig");
+}

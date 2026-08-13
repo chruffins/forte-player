@@ -19,6 +19,7 @@ pub const Cmd = union(enum) {
     vol_down,
     toggle_shuffle,
     cycle_repeat,
+    toggle_favorite,
     /// Play the library song at this index.
     play_index: usize,
 };
@@ -34,6 +35,7 @@ pub const Action = enum {
     cycle_repeat,
     toggle_screen,
     select_up,
+    toggle_favorite,
     select_down,
     page_up,
     page_down,
@@ -62,6 +64,8 @@ pub const State = struct {
     // ---- library snapshot ----
     /// Number of selectable songs (index 0..row_count-1 valid).
     row_count: usize = 0,
+    /// Index (in the library) of the currently-playing song, if known.
+    playing_index: ?usize = null,
 };
 
 /// Pure reducer. `visible` is the number of library rows that fit in the main
@@ -75,6 +79,7 @@ pub fn apply(self: *State, action: Action, visible: usize) Cmd {
         .vol_down => return .vol_down,
         .toggle_shuffle => return .toggle_shuffle,
         .cycle_repeat => return .cycle_repeat,
+        .toggle_favorite => return .toggle_favorite,
         .enter => {
             if (self.screen == .library and self.row_count > 0) {
                 return .{ .play_index = self.selection };
@@ -121,6 +126,7 @@ pub fn keyToAction(key: u8) ?Action {
         '-' => .vol_down,
         's' => .toggle_shuffle,
         'r' => .cycle_repeat,
+        'f' => .toggle_favorite,
         '\t', '1' => .toggle_screen,
         '2' => .toggle_screen,
         'j' => .select_down,

@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const view = @import("ui_view.zig");
+const theme = @import("theme.zig");
 
 const cterm = @cImport({
     @cInclude("termios.h");
@@ -57,14 +58,47 @@ fn pos(x: u16, y: u16) void {
     termPrint("\x1b[{d};{d}H", .{ @as(c_int, y + 1), @as(c_int, x + 1) });
 }
 
+var g_palette: theme.Palette = theme.dark();
+
+pub fn setPalette(scheme: theme.Scheme) void {
+    g_palette = theme.palette(scheme);
+}
+
+/// Best-effort "is the terminal background light?" via the OSC 11 query.
+/// Falls back to dark if the terminal doesn't answer or we can't parse it.
+pub fn detectScheme(override: theme.Scheme, auto: bool) theme.Scheme {
+    if (!auto) return override;
+
+    // Ask the terminal for its background color.
+    termWrite("\x1b]11;?\x1b\\");
+
+    var resp: [256]u8 = undefined;
+    var n: usize = 0;
+    var tries: usize = 0;
+    // ~80ms budget so we never hang on terminals that don't support OSC 11.
+    while (tries < 80 and n < resp.len) : (tries += 1) {
+        var b: [1]u8 = undefined;
+        const got = cterm.read(0, &b, 1);
+        if (got == 1) {
+            resp[n] = b[0];
+            n += 1;
+            if (b[0] == 0x07) break; // BEL terminator
+            if (n >= 2 and b[0] == 0x5c and resp[n - 2] == 0x1b) break; // ESC \
+        }
+        _ = cterm.usleep(1000);
+    }
+    const rgb = theme.parseRgb(resp[0..n]) orelse return .dark;
+    return if (theme.luminanceIsLight(rgb.r, rgb.g, rgb.b)) .light else .dark;
+}
+
 fn style(s: view.Style) void {
     switch (s) {
-        .normal => termWrite("\x1b[0m"),
-        .dim => termWrite("\x1b[2;90m"),
-        .bold => termWrite("\x1b[1m"),
-        .title => termWrite("\x1b[1;36m"),
-        .accent => termWrite("\x1b[1;33m"),
-        .err => termWrite("\x1b[1;31m"),
+        .normal => termWrite(g_palette.normal),
+        .dim => termWrite(g_palette.dim),
+        .bold => termWrite(g_palette.bold),
+        .title => termWrite(g_palette.title),
+        .accent => termWrite(g_palette.accent),
+        .err => termWrite(g_palette.err),
     }
 }
 
@@ -77,12 +111,12 @@ fn writeBar(x: u16, y: u16, w: u16, frac: f32, _: usize) void {
     const full = @max(0.0, @min(frac, 1.0));
     const filled: usize = if (full <= 0) 0 else @min(@as(usize, @intFromFloat(full * @as(f32, @floatFromInt(w)))), w);
     termWrite("[");
-    style(.normal);
+    termWrite(g_palette.bar_fill);
     var i: usize = 0;
-    while (i < filled) : (i += 1) termWrite("+");
-    style(.dim);
+    while (i < filled) : (i += 1) termWrite("#");
+    termWrite(g_palette.bar_empty);
     while (i < w) : (i += 1) termWrite("-");
-    reset();
+    termWrite(g_palette.normal);
     termWrite("]");
 }
 
@@ -100,13 +134,17 @@ pub fn render(cmds: []const view.Cmd, width: usize) void {
         },
         .row => |r| {
             pos(0, r.y);
-            if (r.selected) style(.accent) else style(.normal);
-            termWrite("  ");
-            var s = std.mem.sliceTo(r.s, 0); // safety
+            if (r.selected) {
+                termWrite(g_palette.selected);
+                termWrite("  ");
+            } else {
+                termWrite(if (r.playing) g_palette.bar_fill else g_palette.normal);
+                termWrite(if (r.playing) "▶ " else "  ");
+            }
+            var s = std.mem.sliceTo(r.s, 0);
             if (s.len > width - 4) s = s[0 .. width - 4];
             termWrite(s);
-            reset();
-            // clear rest of the line
+            termWrite(g_palette.normal);
             termPrint("\x1b[K", .{});
         },
     };

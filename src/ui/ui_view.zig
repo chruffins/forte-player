@@ -14,7 +14,7 @@ pub const Cmd = union(enum) {
     text: struct { x: u16, y: u16, s: []const u8, style: Style },
     bar: struct { x: u16, y: u16, width: u16, frac: f32 },
     /// Full-width list row starting at column 1.
-    row: struct { y: u16, s: []const u8, selected: bool },
+    row: struct { y: u16, s: []const u8, selected: bool, playing: bool },
 };
 
 pub const CmdList = struct {
@@ -27,8 +27,8 @@ pub const CmdList = struct {
     pub fn bar(self: *CmdList, x: u16, y: u16, width: u16, f: f32) void {
         self.add(.{ .bar = .{ .x = x, .y = y, .width = width, .frac = f } });
     }
-    pub fn row(self: *CmdList, y: u16, s: []const u8, selected: bool) void {
-        self.add(.{ .row = .{ .y = y, .s = s, .selected = selected } });
+    pub fn row(self: *CmdList, y: u16, s: []const u8, selected: bool, playing: bool) void {
+        self.add(.{ .row = .{ .y = y, .s = s, .selected = selected, .playing = playing } });
     }
     fn add(self: *CmdList, c: Cmd) void {
         if (self.n < self.items.len) {
@@ -109,7 +109,8 @@ fn emitLibrary(s: *const U.State, cl: *CmdList, width: u16, height: u16, titles:
     while (i < visible) : (i += 1) {
         const idx = s.scroll + i;
         if (idx >= titles.len) break;
-        cl.row(top + @as(u16, @intCast(i)), titles[idx], idx == s.selection);
+        const playing = if (s.playing_index) |p| p == idx else false;
+        cl.row(top + @as(u16, @intCast(i)), titles[idx], idx == s.selection, playing);
     }
     if (titles.len == 0) cl.text(2, top, "(empty library)", .dim);
 }
