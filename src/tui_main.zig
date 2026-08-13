@@ -10,6 +10,7 @@ const al = @import("allegro");
 const allegro_init = @import("core/allegro_init.zig");
 const RealEngine = @import("core/music_engine.zig").RealEngine;
 const config_mod = @import("core/config.zig");
+const discord_rpc = @import("core/discord_rpc.zig");
 const PlayQueue = @import("core/play_queue.zig").PlayQueue;
 const db_mod = @import("music/database.zig");
 const lib_mod = @import("music/library.zig");
@@ -29,6 +30,11 @@ const PlaybackCtx = struct {
     /// `playSound`); the on_song_changed hook writes the new path through here
     /// so the UI's metadata snapshot never goes stale after a song change.
     current_path: *[:0]const u8,
+    /// Engine handle, so the hook can read the new stream's duration for the
+    /// Discord presence timestamps.
+    engine: *RealEngine,
+    /// Best-effort Discord rich presence (never blocks, fails silently).
+    discord: *discord_rpc.Client,
 };
 
 fn unixSeconds() i64 {
@@ -47,7 +53,14 @@ fn onSongChanged(path: [:0]const u8, ctx: *anyopaque) void {
     // the next frame's snapshot reflects the song that is actually playing.
     p.current_path.* = path;
     const id = p.lib.songIdByPath(path) orelse return;
-    p.db.markPlayed(@intCast(id), unixSeconds()) catch return;
+    p.db.markPlayed(@intCast(id), unixSeconds()) catch {};
+
+    // Discord rich presence (best-effort; skipped if Discord isn't running).
+    var title: []const u8 = "";
+    var artist: []const u8 = "";
+    if (p.lib.getSongById(id)) |song| title = song.title;
+    if (p.db.getSongContext(id) catch null) |cctx| artist = cctx.artist;
+    p.discord.setPresence(title, artist, p.engine.getDuration());
 }
 
 fn runCmd(engine: *RealEngine, lib: *lib_mod.Library, db: *db_mod.Database, cmd: U.Cmd, current_path: *[:0]const u8) void {
@@ -149,7 +162,16 @@ pub fn main() !void {
     var engine = try RealEngine.create(allocator);
     defer engine.destroy();
     var current_path: [:0]const u8 = undefined;
-    var playback_ctx = PlaybackCtx{ .lib = lib, .db = &db, .current_path = &current_path };
+    const cfg_app_id = config.getDiscordApplicationId();
+    var discord = discord_rpc.Client.init(if (cfg_app_id > 0) cfg_app_id else discord_rpc.default_app_id);
+    defer discord.deinit();
+    var playback_ctx = PlaybackCtx{
+        .lib = lib,
+        .db = &db,
+        .current_path = &current_path,
+        .engine = engine,
+        .discord = &discord,
+    };
     var play_queue = PlayQueue.init(allocator);
     defer play_queue.deinit();
     var qi: usize = 0;

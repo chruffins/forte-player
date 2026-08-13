@@ -14,6 +14,10 @@ test {
 }
 
 test {
+    _ = @import("core/discord_rpc.zig");
+}
+
+test {
     _ = @import("core/music_engine_test.zig");
 }
 
