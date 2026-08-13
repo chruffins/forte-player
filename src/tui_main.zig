@@ -214,7 +214,7 @@ pub fn main() !void {
 
         var cl = view.CmdList{};
         view.emit(&st, &cl, width, height, titles.items);
-        render.render(cl.slice(), width);
+        render.render(cl.slice(), width, height);
 
         al.system.rest(0.1);
     }

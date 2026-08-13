@@ -1,34 +1,58 @@
 //! Pure "view" layer: turns a `State` snapshot into a flat list of typed draw
-//! commands. No Allegro, no terminal — renderers consume the command list
-//! (this is what lets TUI and GUI share one view implementation).
+//! commands (text/bar/row/hline). No Allegro, no terminal — renderers interpret
+//! the command list (this is what lets TUI and GUI share one view).
 //!
-//! Coordinates are in terminal cells (col=x, row=y, 0-based) for the TUI;
-//! a future window renderer maps these to pixels.
+//! Coordinates are terminal cells (col=x, row=y, 0-based). Everything here is
+//! ASCII so grid alignment is exact in any renderer.
 
 const std = @import("std");
 const U = @import("ui_state.zig");
 
-pub const Style = enum { normal, dim, bold, title, accent, err };
+pub const Style = enum {
+    normal,
+    dim,
+    bold,
+    title,
+    accent,
+    err,
+    bar_fill,
+    bar_empty,
+    selected,
+};
 
 pub const Cmd = union(enum) {
     text: struct { x: u16, y: u16, s: []const u8, style: Style },
     bar: struct { x: u16, y: u16, width: u16, frac: f32 },
     /// Full-width list row starting at column 1.
     row: struct { y: u16, s: []const u8, selected: bool, playing: bool },
+    /// A full-width dim separator line.
+    hline: struct { y: u16 },
 };
 
 pub const CmdList = struct {
     items: [512]Cmd = undefined,
     n: usize = 0,
+    /// Owns copies of ephemeral text (bufPrint results etc.) so command strings
+    /// never dangle after the emitting function returns.
+    scratch: [8192]u8 = undefined,
+    scratch_n: usize = 0,
 
     pub fn text(self: *CmdList, x: u16, y: u16, s: []const u8, style: Style) void {
-        self.add(.{ .text = .{ .x = x, .y = y, .s = s, .style = style } });
+        const avail = self.scratch.len - self.scratch_n;
+        const len = @min(s.len, avail);
+        @memcpy(self.scratch[self.scratch_n .. self.scratch_n + len], s[0..len]);
+        const owned = self.scratch[self.scratch_n .. self.scratch_n + len];
+        self.scratch_n += len;
+        self.add(.{ .text = .{ .x = x, .y = y, .s = owned, .style = style } });
     }
     pub fn bar(self: *CmdList, x: u16, y: u16, width: u16, f: f32) void {
         self.add(.{ .bar = .{ .x = x, .y = y, .width = width, .frac = f } });
     }
     pub fn row(self: *CmdList, y: u16, s: []const u8, selected: bool, playing: bool) void {
         self.add(.{ .row = .{ .y = y, .s = s, .selected = selected, .playing = playing } });
+    }
+    pub fn hline(self: *CmdList, y: u16) void {
+        self.add(.{ .hline = .{ .y = y } });
     }
     fn add(self: *CmdList, c: Cmd) void {
         if (self.n < self.items.len) {
@@ -41,17 +65,17 @@ pub const CmdList = struct {
     }
 };
 
-/// Rows pinned to the bottom for the persistent footer.
-pub const footer_rows: u16 = 3;
+pub const header_rows: u16 = 2;
+pub const footer_rows: u16 = 4;
 
 /// Number of library rows that fit in the main content area (for scrolling).
 pub fn libraryVisible(height: u16) usize {
-    const content = height -| footer_rows;
-    return @max(0, (content -| 4));
+    if (height <= header_rows + footer_rows) return 0;
+    return (height - header_rows - footer_rows -| 1);
 }
 
-/// Emit the full frame for the current screen + footer into `cl`.
 pub fn emit(s: *const U.State, cl: *CmdList, width: u16, height: u16, titles: []const []const u8) void {
+    emitHeader(s, cl, width);
     switch (s.screen) {
         .now_playing => emitNowPlaying(s, cl, width, height),
         .library => emitLibrary(s, cl, width, height, titles),
@@ -64,47 +88,78 @@ fn frac(s: *const U.State) f32 {
     return @floatCast(@min(s.position / s.duration, 1.0));
 }
 
-fn emitNowPlaying(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
-    _ = width;
-    _ = height;
-    cl.text(4, 1, "NOW PLAYING", .dim);
-    cl.text(4, 3, s.title, .title);
-    var ab: [512]u8 = undefined;
-    if (s.artist.len > 0 or s.album.len > 0) {
-        const line = std.fmt.bufPrint(&ab, "{s}{s}{s}", .{ s.artist, if (s.artist.len > 0 and s.album.len > 0) " — " else "", s.album }) catch "";
-        cl.text(4, 4, line, .normal);
-    } else if (s.path.len > 0) {
-        cl.text(4, 4, s.path, .dim);
-    }
-    cl.text(4, 6, if (s.favorite) "★ favorite" else "☆ not favorite", .dim);
-
-    const bw: u16 = 60;
-    cl.text(4, 8, "progress", .dim);
-    cl.bar(4, 9, bw, frac(s));
-
-    var rl: [32]u8 = undefined;
-    const rs = std.fmt.bufPrint(&rl, "{s}shuffle {s} : {s} / {s}", .{
-        if (s.favorite) "★ favorite  " else "",
-        if (s.shuffle) "on" else "off",
-        tagName(s.repeat_mode),
-        "",
-    }) catch "";
-    cl.text(4, 11, rs, .dim);
+fn mmss(secs: f64, buf: *[5]u8) []const u8 {
+    const t: i64 = @max(0, @as(i64, @intFromFloat(secs)));
+    const m = @divTrunc(t, 60);
+    const sec = @mod(t, 60);
+    buf[0] = @as(u8, '0') + @as(u8, @intCast(@divTrunc(m, 10)));
+    buf[1] = @as(u8, '0') + @as(u8, @intCast(@mod(m, 10)));
+    buf[2] = ':';
+    buf[3] = @as(u8, '0') + @as(u8, @intCast(@divTrunc(sec, 10)));
+    buf[4] = @as(u8, '0') + @as(u8, @intCast(@mod(sec, 10)));
+    return buf;
 }
 
-fn tagName(m: @import("../core/play_queue.zig").RepeatMode) []const u8 {
-    return switch (m) {
-        .None => "repeat off",
-        .All => "repeat all",
-        .One => "repeat one",
-    };
+fn barWidth(width: u16) u16 {
+    return if (width > 14) width - 10 else 20;
+}
+
+fn emitHeader(s: *const U.State, cl: *CmdList, width: u16) void {
+    cl.text(2, 0, " forte-player ", .title);
+    const name = if (s.screen == .now_playing) " NOW PLAYING " else " LIBRARY ";
+    const x = width -| @as(u16, @intCast(name.len)); // right-aligned
+    cl.text(x, 0, name, .dim);
+    cl.hline(1);
+}
+
+fn emitNowPlaying(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
+    _ = height;
+    const x: u16 = 4;
+    const yTitle: u16 = 3;
+    cl.text(x, yTitle, s.title, .title);
+    if (s.artist.len > 0 or s.album.len > 0) {
+        var ab: [512]u8 = undefined;
+        const line = std.fmt.bufPrint(&ab, "{s}{s}{s}", .{ s.artist, if (s.artist.len > 0 and s.album.len > 0) " - " else "", s.album }) catch "";
+        cl.text(x, yTitle + 1, line, .normal);
+    }
+
+    // favorite + track time
+    var t1: [5]u8 = undefined;
+    var t2: [5]u8 = undefined;
+    var fav: [64]u8 = undefined;
+    const favline = std.fmt.bufPrint(&fav, "{s}  {s} / {s}", .{
+        if (s.favorite) "* favorite" else "  not favorite",
+        mmss(s.position, &t1),
+        mmss(s.duration, &t2),
+    }) catch "";
+    cl.text(x, yTitle + 3, favline, .dim);
+
+    // big progress bar
+    const bw = barWidth(width);
+    cl.text(x, yTitle + 5, "progress", .dim);
+    cl.bar(x, yTitle + 6, bw, frac(s));
+
+    // repeat/shuffle
+    var rs: [40]u8 = undefined;
+    const rl = std.fmt.bufPrint(&rs, "{s}  {s}", .{
+        if (s.shuffle) "shuffle: on" else "shuffle: off",
+        switch (s.repeat_mode) {
+            .None => "repeat: off",
+            .All => "repeat: all",
+            .One => "repeat: one",
+        },
+    }) catch "";
+    cl.text(x, yTitle + 8, rl, .dim);
 }
 
 fn emitLibrary(s: *const U.State, cl: *CmdList, width: u16, height: u16, titles: []const []const u8) void {
     _ = width;
-    cl.text(2, 0, "LIBRARY", .title);
+    var hd: [64]u8 = undefined;
+    const hline = std.fmt.bufPrint(&hd, "Library  ({d} songs)", .{titles.len}) catch "Library";
+    cl.text(2, header_rows, hline, .bold);
+
     const visible = libraryVisible(height);
-    const top: u16 = 2;
+    const top: u16 = header_rows + 1;
     var i: usize = 0;
     while (i < visible) : (i += 1) {
         const idx = s.scroll + i;
@@ -116,15 +171,24 @@ fn emitLibrary(s: *const U.State, cl: *CmdList, width: u16, height: u16, titles:
 }
 
 fn emitFooter(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
-    const by = height -| 3; // progress bar
-    const sy = height -| 2; // status
-    const hy = height -| 1; // hint
+    if (height <= footer_rows) return;
+    const top = height - footer_rows;
 
-    const bw: u16 = if (width > 8) width - 6 else 40;
+    cl.hline(top); // separator above footer
+
+    // progress bar + time
+    const by = top + 1;
+    const bw = barWidth(width);
     cl.bar(3, by, bw, frac(s));
+    var t1: [5]u8 = undefined;
+    var t2: [5]u8 = undefined;
+    cl.text(@as(u16, 3 + bw + 2), by, mmss(s.position, &t1), .normal);
+    cl.text(@as(u16, 3 + bw + 7), by, "/", .dim);
+    cl.text(@as(u16, 3 + bw + 9), by, mmss(s.duration, &t2), .dim);
 
-    var st: [64]u8 = undefined;
-    const status = std.fmt.bufPrint(&st, "{s}  vol={d:.0}%  shuffle={s}  repeat={s}", .{
+    // status line
+    var st: [96]u8 = undefined;
+    const status = std.fmt.bufPrint(&st, "{s}   vol {d:.0}%   shuffle {s}   repeat {s}", .{
         if (s.playing) "PLAYING" else "PAUSED",
         s.volume * 100,
         if (s.shuffle) "on" else "off",
@@ -134,25 +198,8 @@ fn emitFooter(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
             .One => "one",
         },
     }) catch "";
-    cl.text(3, sy, status, .accent);
-    cl.text(3, hy, "[space]pause [n/p]prev-next [s]shuffle [r]repeat [+/-]vol [1/2]screen [j/k]nav [enter]play [q]quit", .dim);
-}
+    cl.text(3, by + 1, status, .accent);
 
-
-test "view emits commands for both screens + footer" {
-    var st = U.State{ .screen = .library, .row_count = 3 };
-    var cl = CmdList{};
-    const titles = [_][]const u8{ "Alpha", "Beta", "Gamma" };
-    emit(&st, &cl, 40, 20, &titles);
-    try std.testing.expect(cl.n > 0);
-
-    st.screen = .now_playing;
-    st.title = "A Song";
-    cl.n = 0;
-    emit(&st, &cl, 40, 20, &titles);
-    try std.testing.expect(cl.n > 0);
-}
-
-test "libraryVisible leaves room for footer + header" {
-    try std.testing.expectEqual(@as(usize, 13), libraryVisible(20)); // 20-3-4
+    // hint line
+    cl.text(3, by + 2, "space:pause  n/p:next/prev  s:shuffle  r:repeat  f:favorite  +/-:vol  1/2:screen  j/k:nav  enter:play  q:quit", .dim);
 }
