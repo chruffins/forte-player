@@ -63,6 +63,7 @@ fn runCmd(engine: *RealEngine, lib: *lib_mod.Library, db: *db_mod.Database, cmd:
             db.setFavorite(id, @intFromBool(nv)) catch return;
             lib.setFavorite(id, nv);
         },
+        .seek => |target| engine.setProgress(target),
         .next => _ = engine.playNext() catch {},
         .prev => engine.playPrevious() catch {},
         .vol_up => engine.setGain(@min(engine.getGain() + 0.05, 1.0)),

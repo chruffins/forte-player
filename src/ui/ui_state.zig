@@ -20,6 +20,8 @@ pub const Cmd = union(enum) {
     toggle_shuffle,
     cycle_repeat,
     toggle_favorite,
+    /// Seek to this absolute position (seconds).
+    seek: f64,
     /// Play the library song at this index.
     play_index: usize,
 };
@@ -40,6 +42,9 @@ pub const Action = enum {
     page_up,
     page_down,
     enter,
+    /// Skip back/forward in the current track (reducer picks the step).
+    seek_back,
+    seek_forward,
 };
 
 pub const State = struct {
@@ -80,6 +85,15 @@ pub fn apply(self: *State, action: Action, visible: usize) Cmd {
         .toggle_shuffle => return .toggle_shuffle,
         .cycle_repeat => return .cycle_repeat,
         .toggle_favorite => return .toggle_favorite,
+        .seek_back => {
+            // Skip back 5s, clamped to the start of the track.
+            return .{ .seek = @max(0.0, self.position - seek_step) };
+        },
+        .seek_forward => {
+            // Skip forward 5s, clamped to the track length when known.
+            const target = self.position + seek_step;
+            return .{ .seek = if (self.duration > 0) @min(target, self.duration) else target };
+        },
         .enter => {
             if (self.screen == .library and self.row_count > 0) {
                 return .{ .play_index = self.selection };
@@ -115,6 +129,9 @@ pub fn apply(self: *State, action: Action, visible: usize) Cmd {
     return .none;
 }
 
+/// Step used by seek_back / seek_forward, in seconds.
+pub const seek_step: f64 = 5.0;
+
 /// Map a terminal key byte to an Action (TUI-specific mapping, kept here for
 /// convenience so the TUI glue stays tiny).
 pub fn keyToAction(key: u8) ?Action {
@@ -127,6 +144,8 @@ pub fn keyToAction(key: u8) ?Action {
         's' => .toggle_shuffle,
         'r' => .cycle_repeat,
         'f' => .toggle_favorite,
+        '[', ',' => .seek_back,
+        ']', '.' => .seek_forward,
         '\t', '1' => .toggle_screen,
         '2' => .toggle_screen,
         'j' => .select_down,
@@ -164,4 +183,32 @@ test "reducer: selection clamped by row_count and page" {
 
     _ = apply(&st, .page_up, 2);
     try std.testing.expectEqual(@as(usize, 1), st.selection);
+}
+
+test "reducer: seek clamps to track bounds" {
+    var st = State{ .position = 100, .duration = 120 };
+
+    // forward clamps to duration
+    const f = apply(&st, .seek_forward, 0);
+    try std.testing.expectEqual(@as(f64, 105.0), f.seek);
+    st.position = 118;
+    try std.testing.expectEqual(@as(f64, 120.0), (apply(&st, .seek_forward, 0)).seek);
+
+    // back clamps to 0
+    st.position = 3;
+    try std.testing.expectEqual(@as(f64, 0.0), (apply(&st, .seek_back, 0)).seek);
+    st.position = 30;
+    try std.testing.expectEqual(@as(f64, 25.0), (apply(&st, .seek_back, 0)).seek);
+
+    // unknown duration: forward just steps (no clamp)
+    st.position = 10;
+    st.duration = 0;
+    try std.testing.expectEqual(@as(f64, 15.0), (apply(&st, .seek_forward, 0)).seek);
+}
+
+test "keyToAction maps seek keys" {
+    try std.testing.expectEqual(Action.seek_back, keyToAction('[').?);
+    try std.testing.expectEqual(Action.seek_back, keyToAction(',').?);
+    try std.testing.expectEqual(Action.seek_forward, keyToAction(']').?);
+    try std.testing.expectEqual(Action.seek_forward, keyToAction('.').?);
 }

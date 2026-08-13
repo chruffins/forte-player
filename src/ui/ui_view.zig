@@ -206,5 +206,50 @@ fn emitFooter(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
     cl.text(3, by + 1, status, .accent);
 
     // hint line
-    cl.text(3, by + 2, "space:pause  n/p:next/prev  s:shuffle  r:repeat  f:favorite  +/-:vol  1/2:screen  j/k:nav  enter:play  q:quit", .dim);
+    cl.text(3, by + 2, "space:pause  n/p:next/prev  [ ]/.:seek +/-:vol  s:shuffle  r:repeat  f:favorite  1/2:screen  j/k:nav  enter:play  q:quit", .dim);
+}
+
+test "footer progress bar + readout never overflows the terminal width" {
+    // Regression: on very wide terminals the bar previously ran wall-to-wall and
+    // its "MM:SS / MM:SS" readout was pushed off-screen. The footer bar row
+    // (y == height-3) must always contain a bar and its readout wholly on-screen.
+    var st = U.State{};
+    st.title = "A Track";
+    st.artist = "Artist";
+    st.album = "Album";
+    st.position = 61.5;
+    st.duration = 250;
+    st.playing = true;
+    st.volume = 1.0;
+    st.shuffle = true;
+    st.repeat_mode = .All;
+    const titles: []const []const u8 = &.{};
+
+    // Wide enough that metadata lines clamp is not the point here; the footer
+    // readout must fit at a breadth of widths including very wide terminals.
+    for ([_]u16{ 40, 80, 120, 300, 1000 }) |width| {
+        const height: u16 = 14;
+        const footer_row = height - 3; // top(=height-4) + 1
+        for ([_]U.Screen{ .now_playing, .library }) |screen| {
+            st.screen = screen;
+            var cl = CmdList{};
+            emit(&st, &cl, width, height, titles);
+            for (cl.slice()) |cmd| switch (cmd) {
+                .bar => |b| try std.testing.expect(b.x + b.width <= width),
+                .text => |t| if (t.y == footer_row) {
+                    const end = t.x + @as(u16, @intCast(t.s.len));
+                    try std.testing.expect(end <= width);
+                },
+                else => {},
+            };
+        }
+    }
+}
+
+test "progress bar is capped and leaves room for the readout" {
+    // barWidth caps at a sane length and never exceeds what fits beside the
+    // "MM:SS / MM:SS" readout.
+    try std.testing.expectEqual(@as(u16, 60), barWidth(300));
+    try std.testing.expectEqual(@as(u16, 60), barWidth(80));
+    try std.testing.expectEqual(@as(u16, 22), barWidth(40)); // width-18 < cap
 }
