@@ -12,6 +12,7 @@ const RealEngine = @import("core/music_engine.zig").RealEngine;
 const config_mod = @import("core/config.zig");
 const cover_resolver = @import("core/cover_resolver.zig");
 const discord_rpc = @import("core/discord_rpc.zig");
+const spectrum = @import("core/spectrum.zig");
 const PlayQueue = @import("core/play_queue.zig").PlayQueue;
 const db_mod = @import("music/database.zig");
 const lib_mod = @import("music/library.zig");
@@ -219,6 +220,9 @@ pub fn main() !void {
     // Engine + queue + hooks (shared wiring with the GUI).
     var engine = try RealEngine.create(allocator);
     defer engine.destroy();
+    // Live audio capture for the TUI spectrum (ring fed by the mixer callback).
+    engine.setSampleBufferCapacity(8192) catch {};
+    engine.enableCapture(true);
     var current_path: [:0]const u8 = undefined;
     const cfg_app_id = config.getDiscordApplicationId();
     var discord = discord_rpc.Client.init(if (cfg_app_id > 0) cfg_app_id else discord_rpc.default_app_id);
@@ -285,6 +289,10 @@ pub fn main() !void {
     const width: u16 = win.w;
     const height: u16 = win.h;
     var st = U.State{};
+    // Spectrum scratch (persist across frames so the smoother keeps state).
+    var sample_buf: [spectrum.n_samples]f32 = undefined;
+    var raw_bands: [spectrum.n_bands]f32 = undefined;
+    var smoother = spectrum.Smoother{};
     _ = scan;
 
     var quitting = false;
@@ -309,6 +317,16 @@ pub fn main() !void {
         }
 
         fillState(&st, engine, lib, &db, current_path);
+
+        // Refresh the spectrum from the newest captured mono samples.
+        const got = engine.copyRecentMono(sample_buf.len, &sample_buf);
+        if (got > 0) {
+            spectrum.computeBands(sample_buf[0..got], &raw_bands);
+            smoother.update(&raw_bands);
+            st.spectrum = smoother.levels[0..];
+        } else {
+            st.spectrum = &.{};
+        }
 
         // Cover lookups run here (rate-limited, at most one per second), never
         // inside the song-change hook. When a cover resolves for the album that

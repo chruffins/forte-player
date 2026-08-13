@@ -22,6 +22,14 @@ test {
 }
 
 test {
+    _ = @import("core/fft.zig");
+}
+
+test {
+    _ = @import("core/spectrum.zig");
+}
+
+test {
     _ = @import("core/music_engine_test.zig");
 }
 

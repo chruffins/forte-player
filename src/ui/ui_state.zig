@@ -66,6 +66,10 @@ pub const State = struct {
     repeat_mode: RepeatMode = .None,
     favorite: bool = false,
 
+    // ---- audio visualizer snapshot ----
+    /// Per-band magnitudes in [0,1] for the TUI spectrum (empty = hidden).
+    spectrum: []const f32 = &.{},
+
     // ---- library snapshot ----
     /// Number of selectable songs (index 0..row_count-1 valid).
     row_count: usize = 0,

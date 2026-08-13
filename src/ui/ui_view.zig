@@ -118,7 +118,6 @@ fn emitHeader(s: *const U.State, cl: *CmdList, width: u16) void {
 }
 
 fn emitNowPlaying(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
-    _ = height;
     const x: u16 = 4;
     const yTitle: u16 = 3;
     cl.text(x, yTitle, s.title, .title);
@@ -155,6 +154,52 @@ fn emitNowPlaying(s: *const U.State, cl: *CmdList, width: u16, height: u16) void
         },
     }) catch "";
     cl.text(x, yTitle + 8, rl, .dim);
+
+    // live spectrum (bars fill the space above the footer)
+    if (s.spectrum.len > 0) {
+        emitSpectrum(cl, x, yTitle + 12, height, s.spectrum);
+    }
+}
+
+/// Terminal spectrum blocks, top row first. `███`-style bars via the 8-level
+/// unicode block set; each column is one band.
+const spectrum_chars = [_][]const u8{ " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
+
+fn emitSpectrum(cl: *CmdList, x: u16, top: u16, height: u16, bands: []const f32) void {
+    const avail = height -| footer_rows -| top;
+    const rows: u16 = @min(8, avail);
+    if (rows < 2) return;
+    const cols: u16 = @min(@as(u16, @intCast(bands.len)), 64);
+
+    // Precompute each band's cell height in eighth-steps (0..8*rows).
+    var levels: [64]u16 = undefined;
+    for (0..cols) |i| {
+        const v: f32 = if (i < bands.len) bands[i] else 0;
+        levels[i] = @intFromFloat(@min(v, 1.0) * @as(f32, @floatFromInt(rows)) * 8.0);
+    }
+
+    // Bottom-up: the fractional top block of each bar sits on its own row.
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        const row_from_bottom: usize = rows - 1 - r;
+        var buf: [192]u8 = undefined;
+        var n: usize = 0;
+        for (0..cols) |i| {
+            const lvl = levels[i];
+            const covered: usize = lvl / 8; // rows fully covered (bottom-up)
+            const rem: usize = lvl % 8; // eighths on the partial top row
+            const ch = if (row_from_bottom < covered)
+                spectrum_chars[8]
+            else if (row_from_bottom == covered and rem > 0)
+                spectrum_chars[rem]
+            else
+                spectrum_chars[0];
+            if (n + ch.len > buf.len) break;
+            @memcpy(buf[n .. n + ch.len], ch);
+            n += ch.len;
+        }
+        cl.text(x, top + @as(u16, @intCast(r)), buf[0..n], .bar_fill);
+    }
 }
 
 fn emitLibrary(s: *const U.State, cl: *CmdList, width: u16, height: u16, titles: []const []const u8) void {
@@ -252,4 +297,57 @@ test "progress bar is capped and leaves room for the readout" {
     try std.testing.expectEqual(@as(u16, 60), barWidth(300));
     try std.testing.expectEqual(@as(u16, 60), barWidth(80));
     try std.testing.expectEqual(@as(u16, 22), barWidth(40)); // width-18 < cap
+}
+
+test "now-playing renders spectrum bars as block glyphs" {
+    var st = U.State{};
+    st.title = "T";
+    st.position = 10;
+    st.duration = 100;
+    var spectrum_values = [_]f32{0} ** 48;
+    // full height on the left half, silence on the right half
+    for (0..24) |i| spectrum_values[i] = 1.0;
+    st.spectrum = &spectrum_values;
+    st.screen = .now_playing;
+
+    const width: u16 = 80;
+    const height: u16 = 24;
+    var cl = CmdList{};
+    emit(&st, &cl, width, height, &.{});
+
+    // Expect 8 rows of spectrum text, first 24 columns = full block (█),
+    // remaining columns = blank/space block.
+    var seen_rows: usize = 0;
+    for (cl.slice()) |cmd| switch (cmd) {
+        .text => |t| {
+            if (t.style == .bar_fill and t.y >= 15 and t.y < 20) {
+                seen_rows += 1;
+                try std.testing.expectEqual(@as(usize, 48), countColumns(t.s));
+                // left 24 columns must be the full block glyph
+                var pos: usize = 0;
+                for (0..24) |_| {
+                    pos += glyphLen(t.s, pos);
+                }
+                try std.testing.expectEqualStrings("█", t.s[0..glyphLen(t.s, 0)]);
+            }
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 5), seen_rows); // footer starts at row 20
+}
+
+/// Byte length of the UTF-8 glyph starting at s[i] (for cell-width counting).
+fn glyphLen(s: []const u8, i: usize) usize {
+    if (i >= s.len) return 1;
+    const b = s[i];
+    const n: usize = if (b < 0x80) 1 else if (b >= 0xF0) 4 else if (b >= 0xE0) 3 else if (b >= 0xC0) 2 else 1;
+    return @min(n, s.len - i);
+}
+
+/// Column count of a UTF-8 string (1 column per glyph).
+fn countColumns(s: []const u8) usize {
+    var cols: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) : (cols += 1) i += glyphLen(s, i);
+    return cols;
 }
