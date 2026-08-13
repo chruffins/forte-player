@@ -15,6 +15,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Optional prefix of a custom Allegro 5 build (e.g. one compiled with MP3
+    // and Opus support added to the acodec addon). When set, <prefix>/lib is
+    // added to the linker search path AND to the runtime search path of the
+    // produced binaries so they load that build instead of the distro's.
+    //   zig build -Dallegro_prefix=/home/chris/.local/forte-allegro
+    const allegro_prefix = b.option([]const u8, "allegro_prefix", "Prefix of a custom Allegro 5 install (adds <prefix>/lib to link + rpath)") orelse "";
+
     // Import the allegro5-zig wrapper as a dependency module.
     const dep = b.dependency("allegro", .{ .target = target, .optimize = optimize });
     const allegro = dep.module("allegro");
@@ -37,6 +44,7 @@ pub fn build(b: *std.Build) void {
     });
 
     for (system_libs) |lib| root_mod.linkSystemLibrary(lib, .{});
+    maybeUseAllegro(b, root_mod, allegro_prefix);
     // taglib C bindings (metadata extraction)
     root_mod.addIncludePath(.{ .cwd_relative = "/usr/include/taglib" });
     root_mod.linkSystemLibrary("tag_c", .{});
@@ -52,6 +60,7 @@ pub fn build(b: *std.Build) void {
         .imports = imports,
     });
     for (system_libs) |lib| tui_mod.linkSystemLibrary(lib, .{});
+    maybeUseAllegro(b, tui_mod, allegro_prefix);
     tui_mod.addIncludePath(.{ .cwd_relative = "/usr/include/taglib" });
     tui_mod.linkSystemLibrary("tag_c", .{});
     const tui_exe = b.addExecutable(.{ .name = "forte-tui", .root_module = tui_mod });
@@ -76,8 +85,19 @@ pub fn build(b: *std.Build) void {
         .imports = imports,
     });
     for (system_libs) |lib| unit_mod.linkSystemLibrary(lib, .{});
+    maybeUseAllegro(b, unit_mod, allegro_prefix);
 
     const unit_tests = b.addTest(.{ .root_module = unit_mod });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+}
+
+/// If a custom Allegro prefix was supplied, add <prefix>/lib to both the link
+/// search path and the produced binary's runtime path, so it loads that build
+/// (e.g. one with MP3/Opus in acodec) instead of the distro's Allegro.
+fn maybeUseAllegro(b: *std.Build, mod: *std.Build.Module, prefix: []const u8) void {
+    if (prefix.len == 0) return;
+    const lib = b.fmt("{s}/lib", .{prefix});
+    mod.addLibraryPath(.{ .cwd_relative = lib });
+    mod.addRPath(.{ .cwd_relative = lib });
 }

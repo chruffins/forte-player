@@ -100,8 +100,13 @@ fn mmss(secs: f64, buf: *[5]u8) []const u8 {
     return buf;
 }
 
+/// Progress-bar length in cells. Room is reserved for the "MM:SS / MM:SS"
+/// readout after the bar, and the bar is capped at a sane maximum so it
+/// never runs wall-to-wall. (The old `width - 10` drew a near-full-width bar
+/// on very wide terminals, which visually spilled into the status line below
+/// and pushed the `/ duration` readout off-screen.)
 fn barWidth(width: u16) u16 {
-    return if (width > 14) width - 10 else 20;
+    return @min(width -| 18, 60);
 }
 
 fn emitHeader(s: *const U.State, cl: *CmdList, width: u16) void {
@@ -183,8 +188,8 @@ fn emitFooter(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
     var t1: [5]u8 = undefined;
     var t2: [5]u8 = undefined;
     cl.text(@as(u16, 3 + bw + 2), by, mmss(s.position, &t1), .normal);
-    cl.text(@as(u16, 3 + bw + 7), by, "/", .dim);
-    cl.text(@as(u16, 3 + bw + 9), by, mmss(s.duration, &t2), .dim);
+    cl.text(@as(u16, 3 + bw + 8), by, "/", .dim);
+    cl.text(@as(u16, 3 + bw + 10), by, mmss(s.duration, &t2), .dim);
 
     // status line
     var st: [96]u8 = undefined;

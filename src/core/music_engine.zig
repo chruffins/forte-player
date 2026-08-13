@@ -93,15 +93,20 @@ pub fn MusicEngine(comptime Drv: type) type {
         }
 
         pub fn playSound(self: *Self, path: [:0]const u8) !void {
-            if (self.stream) |*old| old.destroy();
-            self.stream = null;
-
+            // Load + attach the new stream BEFORE tearing down the current one.
+            // If the load fails (e.g. a file this Allegro build can't decode),
+            // the currently-playing song keeps playing and the engine stays
+            // fully controllable — destroying the old stream first used to
+            // leave the engine silent with `stream == null`, making every
+            // later control (resume/next/prev) a no-op.
             var stream = try self.drv.load(path);
             errdefer stream.destroy();
 
+            if (self.stream) |*old| old.destroy();
+            self.stream = null;
+
             self.time = 0.0;
             self.duration = stream.lengthSecs();
-            std.debug.print("forte: loaded stream, duration={d:.3}s\n", .{self.duration});
 
             _ = stream.setPlaying(true);
 
@@ -198,12 +203,22 @@ pub fn MusicEngine(comptime Drv: type) type {
 
         /// Advance to the next song in the queue and start it. Returns true if a
         /// song was started, false if there was no next song in the queue.
+        ///
+        /// Songs whose stream can't be loaded are skipped (the queue advances
+        /// until a playable track starts) — the library can contain files this
+        /// Allegro build can't decode (e.g. MP3/Opus without a codec addon), and
+        /// a dead next entry used to kill the currently-playing stream too.
         pub fn playNext(self: *Self) !bool {
             const q = self.queue orelse return false;
-            const id = (try q.next()) orelse return false;
-            const path = self.resolveSongPath(id) orelse return false;
-            try self.playSound(path);
-            return true;
+            const total = q.size();
+            var attempts: usize = 0;
+            while (attempts < total) : (attempts += 1) {
+                const id = (try q.next()) orelse return false;
+                const path = self.resolveSongPath(id) orelse continue;
+                self.playSound(path) catch continue;
+                return true;
+            }
+            return false;
         }
 
         /// Move to the previous song from play history and start it (no-op if none).

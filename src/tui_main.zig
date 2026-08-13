@@ -21,7 +21,15 @@ const view = @import("ui/ui_view.zig");
 const render = @import("ui/tui_render.zig");
 const theme = @import("ui/theme.zig");
 
-const PlaybackCtx = struct { lib: *lib_mod.Library, db: *db_mod.Database };
+const PlaybackCtx = struct {
+    lib: *lib_mod.Library,
+    db: *db_mod.Database,
+    /// The TUI's notion of the currently-playing path. The engine owns the real
+    /// current song (playNext/playPrevious/auto-advance/repeat all load through
+    /// `playSound`); the on_song_changed hook writes the new path through here
+    /// so the UI's metadata snapshot never goes stale after a song change.
+    current_path: *[:0]const u8,
+};
 
 fn unixSeconds() i64 {
     const ct2 = @cImport(@cInclude("time.h"));
@@ -35,6 +43,9 @@ fn resolveSong(id: i32, ctx: *anyopaque) ?[:0]const u8 {
 
 fn onSongChanged(path: [:0]const u8, ctx: *anyopaque) void {
     const p: *PlaybackCtx = @ptrCast(@alignCast(ctx));
+    // Keep the UI's current-path in sync BEFORE the metadata lookup below, so
+    // the next frame's snapshot reflects the song that is actually playing.
+    p.current_path.* = path;
     const id = p.lib.songIdByPath(path) orelse return;
     p.db.markPlayed(@intCast(id), unixSeconds()) catch return;
 }
@@ -62,9 +73,8 @@ fn runCmd(engine: *RealEngine, lib: *lib_mod.Library, db: *db_mod.Database, cmd:
             const id = lib.songIdAt(i);
             if (id < 0) return;
             const p = lib.songPath(id) orelse return;
-            if (engine.playSound(p)) |_| {
-                current_path.* = p;
-            } else |_| {}
+            // on_song_changed (fired by playSound) keeps current_path in sync.
+            if (engine.playSound(p)) |_| {} else |_| {}
         },
     }
 }
@@ -137,7 +147,8 @@ pub fn main() !void {
     // Engine + queue + hooks (shared wiring with the GUI).
     var engine = try RealEngine.create(allocator);
     defer engine.destroy();
-    var playback_ctx = PlaybackCtx{ .lib = lib, .db = &db };
+    var current_path: [:0]const u8 = undefined;
+    var playback_ctx = PlaybackCtx{ .lib = lib, .db = &db, .current_path = &current_path };
     var play_queue = PlayQueue.init(allocator);
     defer play_queue.deinit();
     var qi: usize = 0;
@@ -149,7 +160,6 @@ pub fn main() !void {
     engine.setGain(@as(f32, @floatFromInt(config.getVolumePercent())) / 100.0);
 
     // Start the first playable song.
-    var current_path: [:0]const u8 = undefined;
     var started = false;
     var tries: usize = 0;
     var i: usize = 0;

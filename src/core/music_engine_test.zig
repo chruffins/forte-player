@@ -2,9 +2,44 @@
 //! so no audio device / real mixer is required.
 
 const std = @import("std");
+const al = @import("allegro");
 const music = @import("music_engine.zig");
 const PlayQueue = @import("play_queue.zig").PlayQueue;
 const FakeEngine = music.MusicEngine(music.FakeDriver);
+
+/// A driver identical to `FakeDriver` except that `load` fails for any path
+/// starting with "bad" — lets us exercise failed-load handling without a real
+/// audio device (mirrors a file this Allegro build can't decode, e.g. MP3).
+const FickleDriver = struct {
+    pub const Stream = music.FakeDriver.Stream;
+
+    pub fn init(_: std.mem.Allocator) !FickleDriver {
+        return .{};
+    }
+    pub fn deinit(_: *FickleDriver) void {}
+    pub fn hook(_: *FickleDriver) !void {}
+    pub fn load(_: *FickleDriver, path: [:0]const u8) !Stream {
+        if (std.mem.startsWith(u8, path, "bad")) return error.LoadFailed;
+        var fake: music.FakeDriver = .{};
+        return music.FakeDriver.load(&fake, path);
+    }
+    pub fn streamEventSource(_: *FickleDriver, _: *Stream) ?al.events.EventSource {
+        return null;
+    }
+    pub fn setGain(_: *FickleDriver, _: f32) void {}
+    pub fn setSampleBufferCapacity(_: *FickleDriver, _: usize) !void {}
+    pub fn enableCapture(_: *FickleDriver, _: bool) void {}
+    pub fn bufferedCount(_: *const FickleDriver) usize {
+        return 0;
+    }
+    pub fn copyRecentMono(_: *const FickleDriver, _: usize, out: []f32) usize {
+        @memset(out[0..0], 0);
+        return 0;
+    }
+    pub fn clearCapture(_: *FickleDriver) void {}
+};
+
+const FickleEngine = music.MusicEngine(FickleDriver);
 
 /// Map a song id to a distinct path whose length gives a distinct fake duration
 /// (len 1..5 -> duration 2..6), letting us assert which song is current.
@@ -190,4 +225,62 @@ test "playNext returns false when no song resolves / queue empty" {
     engine.setPlayQueue(&queue);
     queue.current_index = 1; // set past the end so there's no next
     try std.testing.expect(!try engine.playNext());
+}
+
+test "failed load keeps the current song playing and control intact" {
+    var engine = try FickleEngine.create(std.testing.allocator);
+    defer engine.destroy();
+
+    try engine.playSound("good1"); // len 5 -> duration 6
+    try std.testing.expect(engine.isPlaying());
+    const playing_duration = engine.getDuration();
+
+    // Loading an undecodable file must NOT stop the current song.
+    try std.testing.expectError(error.LoadFailed, engine.playSound("badfile"));
+    try std.testing.expect(engine.isPlaying());
+    try std.testing.expectEqual(playing_duration, engine.getDuration());
+
+    // Control still works (resume/next paths aren't dead no-ops).
+    engine.pause();
+    try std.testing.expect(!engine.isPlaying());
+    engine.resumePlayback();
+    try std.testing.expect(engine.isPlaying());
+}
+
+// id -> path map with an intentionally-undecodable middle entry (id 1).
+fn fickleResolve(id: i32, _: *anyopaque) ?[:0]const u8 {
+    const paths = [_][:0]const u8{ "ok0", "bad1", "ok2" };
+    if (id >= 0 and id < paths.len) return paths[@intCast(id)];
+    return null;
+}
+
+test "playNext skips songs that cannot be loaded" {
+    var engine = try FickleEngine.create(std.testing.allocator);
+    defer engine.destroy();
+    var queue = PlayQueue.init(std.testing.allocator);
+    defer queue.deinit();
+    try queue.enqueueMany(&.{ 0, 1, 2 });
+    engine.resolve_song = fickleResolve;
+    engine.setPlayQueue(&queue);
+
+    try engine.playSound("ok0"); // id 0
+    try std.testing.expect(try engine.playNext()); // skips "bad1", lands on "ok2"
+    try std.testing.expect(engine.isPlaying());
+    // len("ok2") = 3 -> duration 4
+    try std.testing.expectEqual(@as(f64, 4.0), engine.getDuration());
+}
+
+test "playNext with only unloadable songs left returns false, keeps current playing" {
+    var engine = try FickleEngine.create(std.testing.allocator);
+    defer engine.destroy();
+    var queue = PlayQueue.init(std.testing.allocator);
+    defer queue.deinit();
+    try queue.enqueueMany(&.{ 0, 1 }); // id 1 is "bad1" (undecodable)
+    engine.resolve_song = fickleResolve;
+    engine.setPlayQueue(&queue);
+
+    try engine.playSound("ok0"); // id 0
+    // playNext: next is "bad1" (skip) then end-of-queue (repeat off) -> false.
+    try std.testing.expect(!try engine.playNext());
+    try std.testing.expect(engine.isPlaying()); // current song still playing
 }
