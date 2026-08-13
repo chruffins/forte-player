@@ -138,24 +138,33 @@ pub const Client = struct {
 
     /// Publish the now-playing track. Best-effort and non-blocking: if Discord
     /// is absent or busy, the update is dropped silently and retried next call.
-    pub fn setPresence(self: *Client, title: []const u8, artist: []const u8, duration_secs: f64) void {
+    /// `cover_url` (when non-null) is sent as the activity's large image.
+    pub fn setPresence(self: *Client, details: []const u8, state: []const u8, duration_secs: f64, cover_url: ?[]const u8) void {
         if (self.app_id == 0) return;
         if (!self.connect()) return;
 
-        var tbuf: [160]u8 = undefined;
-        var abuf: [160]u8 = undefined;
-        const et = escapeInto(&tbuf, title);
-        const ea = escapeInto(&abuf, artist);
+        var dbuf: [160]u8 = undefined;
+        var sbuf: [160]u8 = undefined;
+        const ed = escapeInto(&dbuf, details);
+        const es = escapeInto(&sbuf, state);
+
+        // Optional comma-prefixed assets fragment for the album cover.
+        var assets_buf: [512]u8 = undefined;
+        const assets = if (cover_url) |url| blk: {
+            var ubuf: [256]u8 = undefined;
+            const eu = escapeInto(&ubuf, url);
+            break :blk std.fmt.bufPrint(&assets_buf, ",\"assets\":{{\"large_image\":\"{s}\",\"large_text\":\"{s}\"}}", .{ eu, es }) catch "";
+        } else "";
 
         const now: i64 = @intCast(c.time(null));
         var buf: [2048]u8 = undefined;
         const payload = (if (duration_secs > 0)
-            std.fmt.bufPrint(&buf, "{{\"cmd\":\"SET_ACTIVITY\",\"args\":{{\"pid\":{d},\"activity\":{{\"type\":2,\"details\":\"{s}\",\"state\":\"{s}\",\"timestamps\":{{\"start\":{d},\"end\":{d}}}}}}},\"nonce\":\"fp-{d}\"}}", .{
-                self.pid, et, ea, now, now + @as(i64, @intFromFloat(duration_secs)), self.pid,
+            std.fmt.bufPrint(&buf, "{{\"cmd\":\"SET_ACTIVITY\",\"args\":{{\"pid\":{d},\"activity\":{{\"type\":2,\"details\":\"{s}\",\"state\":\"{s}\",\"timestamps\":{{\"start\":{d},\"end\":{d}}}{s}}},\"nonce\":\"fp-{d}\"}}}}", .{
+                self.pid, ed, es, now, now + @as(i64, @intFromFloat(duration_secs)), assets, self.pid,
             })
         else
-            std.fmt.bufPrint(&buf, "{{\"cmd\":\"SET_ACTIVITY\",\"args\":{{\"pid\":{d},\"activity\":{{\"type\":2,\"details\":\"{s}\",\"state\":\"{s}\",\"timestamps\":{{\"start\":{d}}}}}}},\"nonce\":\"fp-{d}\"}}", .{
-                self.pid, et, ea, now, self.pid,
+            std.fmt.bufPrint(&buf, "{{\"cmd\":\"SET_ACTIVITY\",\"args\":{{\"pid\":{d},\"activity\":{{\"type\":2,\"details\":\"{s}\",\"state\":\"{s}\",\"timestamps\":{{\"start\":{d}}}{s}}},\"nonce\":\"fp-{d}\"}}}}", .{
+                self.pid, ed, es, now, assets, self.pid,
             }))
         catch {
             self.closeFd();
@@ -209,6 +218,6 @@ test "escapeInto escapes JSON specials and truncates" {
 test "setPresence is a no-op when disabled (app_id 0)" {
     var cl = Client.init(0);
     defer cl.deinit();
-    cl.setPresence("title", "artist", 100.0); // must not crash or touch the fd
+    cl.setPresence("title", "artist", 100.0, null); // must not crash or touch the fd
     try std.testing.expectEqual(@as(c_int, -1), cl.fd);
 }

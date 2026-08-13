@@ -18,6 +18,10 @@ test {
 }
 
 test {
+    _ = @import("core/cover_resolver.zig");
+}
+
+test {
     _ = @import("core/music_engine_test.zig");
 }
 

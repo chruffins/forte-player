@@ -201,6 +201,11 @@ pub const Config = struct {
         return std.fmt.parseInt(u64, v, 10) catch 0;
     }
 
+    /// Discord activity details format. Placeholders: {song} {artist} {album}.
+    pub fn getDiscordDetailsFormat(self: *const Config) []const u8 {
+        return self.getStr("discord", "details_format", "{song} - {artist}");
+    }
+
     pub fn getDisplayWidth(self: *const Config) i32 {
         return @intCast(clamp(self.getInt("display", "width", 800), 320, 8192));
     }

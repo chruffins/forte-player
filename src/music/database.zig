@@ -224,6 +224,33 @@ pub const Database = struct {
         return self.lastId();
     }
 
+    // ---- album cover helpers (MusicBrainz release group ids) ----
+
+    pub const AlbumMbid = struct {
+        album_id: i64,
+        mbid: []const u8,
+    };
+
+    /// album_id + musicbrainz_release_group_id for every album that has one.
+    pub fn getAllAlbumMbids(self: *Database) ![]AlbumMbid {
+        var stmt = try self.raw.prepareDynamic(
+            "SELECT id, COALESCE(musicbrainz_release_group_id, '') FROM albums WHERE musicbrainz_release_group_id IS NOT NULL AND musicbrainz_release_group_id != '';",
+        );
+        defer stmt.deinit();
+        var iter = try stmt.iteratorAlloc(AlbumMbid, self.allocator, .{});
+        var list = std.ArrayList(AlbumMbid){ .items = &.{}, .capacity = 0 };
+        defer list.deinit(self.allocator);
+        while (try iter.nextAlloc(self.allocator, .{})) |row| {
+            try list.append(self.allocator, row);
+        }
+        return list.toOwnedSlice(self.allocator);
+    }
+
+    /// Persist a resolved MusicBrainz release group id for an album.
+    pub fn setAlbumMbid(self: *Database, album_id: i64, mbid: []const u8) !void {
+        try self.raw.exec("UPDATE albums SET musicbrainz_release_group_id = ? WHERE id = ?;", .{}, .{ mbid, album_id });
+    }
+
     // ---- reads ----
 
     /// Record a playback: bump `play_count` and set `last_played` (epoch secs).

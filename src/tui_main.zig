@@ -10,6 +10,7 @@ const al = @import("allegro");
 const allegro_init = @import("core/allegro_init.zig");
 const RealEngine = @import("core/music_engine.zig").RealEngine;
 const config_mod = @import("core/config.zig");
+const cover_resolver = @import("core/cover_resolver.zig");
 const discord_rpc = @import("core/discord_rpc.zig");
 const PlayQueue = @import("core/play_queue.zig").PlayQueue;
 const db_mod = @import("music/database.zig");
@@ -35,6 +36,10 @@ const PlaybackCtx = struct {
     engine: *RealEngine,
     /// Best-effort Discord rich presence (never blocks, fails silently).
     discord: *discord_rpc.Client,
+    /// Rate-limited MusicBrainz cover resolution (ticked from the main loop).
+    resolver: *cover_resolver.CoverResolver,
+    /// Config-driven presence details format (placeholders: {song} {artist} {album}).
+    details_format: []const u8,
 };
 
 fn unixSeconds() i64 {
@@ -55,12 +60,65 @@ fn onSongChanged(path: [:0]const u8, ctx: *anyopaque) void {
     const id = p.lib.songIdByPath(path) orelse return;
     p.db.markPlayed(@intCast(id), unixSeconds()) catch {};
 
-    // Discord rich presence (best-effort; skipped if Discord isn't running).
     var title: []const u8 = "";
     var artist: []const u8 = "";
-    if (p.lib.getSongById(id)) |song| title = song.title;
-    if (p.db.getSongContext(id) catch null) |cctx| artist = cctx.artist;
-    p.discord.setPresence(title, artist, p.engine.getDuration());
+    var album: []const u8 = "";
+    var album_id: i64 = -1;
+    if (p.lib.getSongById(id)) |song| {
+        title = song.title;
+        album_id = song.album_id;
+    }
+    if (p.db.getSongContext(id) catch null) |cctx| {
+        artist = cctx.artist;
+        album = cctx.album;
+    }
+
+    // Queue a MusicBrainz cover lookup for this album (runs on resolver.tick()).
+    p.resolver.enqueue(album_id, album, artist);
+    pushPresence(p, title, artist, album, album_id, p.engine.getDuration());
+}
+
+/// Render the configured presence details format (default "{song} - {artist}").
+fn formatDetails(fmt: []const u8, song: []const u8, artist: []const u8, album: []const u8, buf: []u8) []const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < fmt.len) {
+        if (fmt[i] == '{') {
+            const close = std.mem.indexOfScalarPos(u8, fmt, i + 1, '}') orelse {
+                const rest = fmt[i..];
+                if (n + rest.len > buf.len) break;
+                @memcpy(buf[n .. n + rest.len], rest);
+                n += rest.len;
+                break;
+            };
+            const name = fmt[i + 1 .. close];
+            const val: ?[]const u8 = if (std.mem.eql(u8, name, "song")) song else if (std.mem.eql(u8, name, "artist")) artist else if (std.mem.eql(u8, name, "album")) album else null;
+            if (val) |v| {
+                if (n + v.len > buf.len) break;
+                @memcpy(buf[n .. n + v.len], v);
+                n += v.len;
+            } else {
+                const lit = fmt[i .. close + 1];
+                if (n + lit.len > buf.len) break;
+                @memcpy(buf[n .. n + lit.len], lit);
+                n += lit.len;
+            }
+            i = close + 1;
+        } else {
+            if (n + 1 > buf.len) break;
+            buf[n] = fmt[i];
+            n += 1;
+            i += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+/// Push the current song to Discord presence (best-effort).
+fn pushPresence(p: *PlaybackCtx, title: []const u8, artist: []const u8, album: []const u8, album_id: i64, duration: f64) void {
+    var buf: [512]u8 = undefined;
+    const details = formatDetails(p.details_format, title, artist, album, &buf);
+    p.discord.setPresence(details, album, duration, p.resolver.coverUrlFor(album_id));
 }
 
 fn runCmd(engine: *RealEngine, lib: *lib_mod.Library, db: *db_mod.Database, cmd: U.Cmd, current_path: *[:0]const u8) void {
@@ -165,12 +223,19 @@ pub fn main() !void {
     const cfg_app_id = config.getDiscordApplicationId();
     var discord = discord_rpc.Client.init(if (cfg_app_id > 0) cfg_app_id else discord_rpc.default_app_id);
     defer discord.deinit();
+    var resolver = cover_resolver.CoverResolver.init(allocator, &db) catch |e| {
+        std.debug.print("cover resolver init failed: {}\n", .{e});
+        return;
+    };
+    defer resolver.destroy();
     var playback_ctx = PlaybackCtx{
         .lib = lib,
         .db = &db,
         .current_path = &current_path,
         .engine = engine,
         .discord = &discord,
+        .resolver = resolver,
+        .details_format = config.getDiscordDetailsFormat(),
     };
     var play_queue = PlayQueue.init(allocator);
     defer play_queue.deinit();
@@ -244,6 +309,19 @@ pub fn main() !void {
         }
 
         fillState(&st, engine, lib, &db, current_path);
+
+        // Cover lookups run here (rate-limited, at most one per second), never
+        // inside the song-change hook. When a cover resolves for the album that
+        // is currently playing, refresh the presence so the art appears.
+        if (resolver.tick()) {
+            if (lib.songIdByPath(st.path)) |sid| {
+                if (lib.getSongById(sid)) |song| {
+                    if (resolver.coverUrlFor(song.album_id) != null) {
+                        pushPresence(&playback_ctx, st.title, st.artist, st.album, song.album_id, st.duration);
+                    }
+                }
+            }
+        }
 
         var cl = view.CmdList{};
         view.emit(&st, &cl, width, height, titles.items);
