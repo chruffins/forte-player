@@ -15,6 +15,7 @@ const cover_art = @import("ui/cover_art.zig");
 const discord_rpc = @import("integrations/discord_rpc.zig");
 const lastfm = @import("integrations/lastfm.zig");
 const spectrum = @import("dsp/spectrum.zig");
+const db_mod = @import("music/database.zig");
 
 const U = @import("ui/ui_state.zig");
 const view = @import("ui/ui_view.zig");
@@ -140,15 +141,15 @@ fn runCmd(app: *app_mod.App, cmd: U.Cmd) void {
             // App's shared on_song_changed hook keeps app.current_path in sync.
             if (engine.playSound(p)) |_| {} else |_| {}
         },
-        .play_album => |album_id| {
-            // Rebuilds the queue as an Album context and starts its first track.
-            _ = app.playAlbum(album_id);
-        },
+        // Album-detail commands are pre-handled in the main key loop (they need
+        // the album track list + state), so they are no-ops here to keep the
+        // switch exhaustive.
+        .open_album_detail, .play_track_in_album => {},
     }
 }
 
 /// Keep the UI's transient snapshot in sync with the engine + library.
-fn fillState(st: *U.State, app: *app_mod.App, albums: []const U.AlbumRow) void {
+fn fillState(st: *U.State, app: *app_mod.App, albums: []const U.AlbumRow, album_tracks: []const U.AlbumTrackRow, album_sort_label: []const u8) void {
     const engine = app.engine;
     const lib = app.lib;
     const db = &app.db;
@@ -159,6 +160,7 @@ fn fillState(st: *U.State, app: *app_mod.App, albums: []const U.AlbumRow) void {
     st.favorite = false;
     st.playing_index = null;
     st.playing_album_id = -1;
+    st.album_detail_playing = null;
     if (lib.songIdByPath(current_path)) |id| {
         if (lib.getSongById(id)) |song| {
             st.title = song.title;
@@ -170,6 +172,15 @@ fn fillState(st: *U.State, app: *app_mod.App, albums: []const U.AlbumRow) void {
             st.album = ctx.album;
         }
         st.playing_index = lib.indexOfId(id);
+        // Which track of the open album is playing (if it's this album).
+        if (st.album_detail_id >= 0) {
+            for (album_tracks, 0..) |t, idx| {
+                if (t.song_id == id) {
+                    st.album_detail_playing = idx;
+                    break;
+                }
+            }
+        }
     }
     st.path = current_path;
     st.position = engine.getTime();
@@ -181,6 +192,52 @@ fn fillState(st: *U.State, app: *app_mod.App, albums: []const U.AlbumRow) void {
     st.row_count = lib.count();
     st.albums = albums;
     st.album_count = albums.len;
+    st.album_sort_label = album_sort_label;
+    st.album_detail_tracks = album_tracks;
+    st.album_detail_count = album_tracks.len;
+}
+
+/// Reload the album browser rows from the DB under `sort`.
+fn rebuildAlbumRows(app: *app_mod.App, rows: *std.ArrayList(U.AlbumRow), allocator: std.mem.Allocator, sort: db_mod.Database.AlbumSort) void {
+    rows.clearRetainingCapacity();
+    const albums = app.db.getAlbums(sort) catch return;
+    for (albums) |a| {
+        rows.append(allocator, .{
+            .id = a.id,
+            .title = a.name,
+            .artist = a.artist,
+            .year = a.year,
+            .track_count = a.track_count,
+            .has_cover = a.has_cover,
+        }) catch break;
+    }
+}
+
+/// Load a chosen album's tracks into the detail list.
+fn loadAlbumTracks(app: *app_mod.App, out: *std.ArrayList(U.AlbumTrackRow), allocator: std.mem.Allocator, album_id: i64) void {
+    out.clearRetainingCapacity();
+    const songs = app.db.getSongsByAlbum(album_id) catch return;
+    for (songs) |s| {
+        out.append(allocator, .{ .title = s.title, .track = s.track, .song_id = s.id }) catch break;
+    }
+}
+
+const AlbumSort = db_mod.Database.AlbumSort;
+
+fn nextSort(s: AlbumSort) AlbumSort {
+    return switch (s) {
+        .by_name => .by_year,
+        .by_year => .by_artist,
+        .by_artist => .by_name,
+    };
+}
+
+fn sortLabel(s: AlbumSort) []const u8 {
+    return switch (s) {
+        .by_name => "name",
+        .by_year => "year",
+        .by_artist => "artist",
+    };
 }
 
 pub fn main() !void {
@@ -235,21 +292,14 @@ pub fn main() !void {
         if (app.lib.getSongById(id)) |s| try titles.append(allocator, s.title);
     }
 
-    // Album browser rows (parallel to the DB's album listing).
+    // Album browser rows (parallel to the DB's album listing) + sort state.
+    var album_sort: AlbumSort = .by_name;
     var album_rows = std.ArrayList(U.AlbumRow){ .items = &.{}, .capacity = 0 };
     defer album_rows.deinit(allocator);
-    if (app.db.getAlbums()) |albums| {
-        for (albums) |a| {
-            try album_rows.append(allocator, .{
-                .id = a.id,
-                .title = a.name,
-                .artist = a.artist,
-                .year = a.year,
-                .track_count = a.track_count,
-                .has_cover = a.has_cover,
-            });
-        }
-    } else |_| {}
+    rebuildAlbumRows(app, &album_rows, allocator, album_sort);
+    // Tracks of the album currently open in the detail view.
+    var album_tracks = std.ArrayList(U.AlbumTrackRow){ .items = &.{}, .capacity = 0 };
+    defer album_tracks.deinit(allocator);
 
     render.enableRaw();
     defer render.restoreRaw();
@@ -309,10 +359,23 @@ pub fn main() !void {
                 quitting = true;
                 continue;
             }
+            // 'a' on the album list cycles the sort and reloads the rows.
+            if (k == 'a' and st.screen == .albums) {
+                album_sort = nextSort(album_sort);
+                rebuildAlbumRows(app, &album_rows, allocator, album_sort);
+                st.selection = 0;
+                st.scroll = 0;
+                continue;
+            }
             if (U.keyToAction(k)) |a| {
                 const visible = view.libraryVisible(height);
                 const cmd = U.apply(&st, a, visible);
-                runCmd(app, cmd);
+                switch (cmd) {
+                    // Album-detail commands need the track list + state in scope.
+                    .open_album_detail => |album_id| loadAlbumTracks(app, &album_tracks, allocator, album_id),
+                    .play_track_in_album => |i| _ = app.playAlbumFromIndex(st.album_detail_id, i),
+                    else => runCmd(app, cmd),
+                }
             }
         }
 
@@ -328,7 +391,7 @@ pub fn main() !void {
                 app.engine.handleAudioStreamFinished() catch {};
             }
 
-            fillState(&st, app, album_rows.items);
+            fillState(&st, app, album_rows.items, album_tracks.items, sortLabel(album_sort));
 
             // Last.fm: submit the current track the moment it's played enough.
             if (scrobbler) |s| s.tick(st.playing, st.position, st.duration);

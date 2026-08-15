@@ -284,6 +284,9 @@ pub const Database = struct {
 
     // ---- album listing / playback -//-
 
+    /// Album browser sort order.
+    pub const AlbumSort = enum { by_name, by_year, by_artist };
+
     /// One row of the album browser: the album, its primary artist, the number
     /// of tracks (songs) in it, and whether we have stored cover art.
     pub const AlbumListing = struct {
@@ -296,17 +299,24 @@ pub const Database = struct {
     };
 
     /// Every album, joined with its primary artist and track count, ordered by
-    /// name. Allocated with `self.allocator` (strings too).
-    pub fn getAlbums(self: *Database) ![]AlbumListing {
-        var stmt = try self.raw.prepareDynamic(
+    /// `sort`. Allocated with `self.allocator` (strings too).
+    pub fn getAlbums(self: *Database, sort: AlbumSort) ![]AlbumListing {
+        const order = switch (sort) {
+            .by_name => "COALESCE(a.name,'') COLLATE NOCASE",
+            .by_year => "a.year DESC, COALESCE(a.name,'') COLLATE NOCASE",
+            .by_artist => "COALESCE(ar.name,'') COLLATE NOCASE, COALESCE(a.name,'') COLLATE NOCASE",
+        };
+        var sql_buf: [512]u8 = undefined;
+        const sql = try std.fmt.bufPrint(&sql_buf,
             \\SELECT a.id, COALESCE(a.name,''), COALESCE(ar.name,''), COALESCE(a.year,-1),
             \\       COUNT(s.id), (a.cover_art_block IS NOT NULL)
             \\FROM albums a
             \\JOIN artists ar ON ar.id = a.artist_id
             \\LEFT JOIN songs s ON s.album_id = a.id
             \\GROUP BY a.id
-            \\ORDER BY COALESCE(a.name,'') COLLATE NOCASE;
-        );
+            \\ORDER BY {s};
+        , .{order});
+        var stmt = try self.raw.prepareDynamic(sql);
         defer stmt.deinit();
         const Row = struct { id: i64, name: []const u8, artist: []const u8, year: i64, track_count: i64, has_cover: i64 };
         var iter = try stmt.iteratorAlloc(Row, self.allocator, .{});
@@ -571,7 +581,7 @@ test "database: album listing + songs by album" {
     try std.testing.expectEqualStrings("B", alb1_songs[1].title);
 
     // getAlbums: track counts + artist names, ordered by album name.
-    const listing = try db.getAlbums();
+    const listing = try db.getAlbums(.by_name);
     try std.testing.expectEqual(@as(usize, 2), listing.len);
     try std.testing.expectEqualStrings("Record One", listing[0].name);
     try std.testing.expectEqualStrings("Alpha", listing[0].artist);
@@ -579,4 +589,13 @@ test "database: album listing + songs by album" {
     try std.testing.expectEqualStrings("Zed", listing[1].name);
     try std.testing.expectEqual(@as(i64, 1), listing[1].track_count);
     try std.testing.expect(!listing[1].has_cover);
+
+    // Sort by year (desc): newer album first.
+    const by_year = try db.getAlbums(.by_year);
+    try std.testing.expectEqualStrings("Zed", by_year[0].name);
+    try std.testing.expectEqualStrings("Record One", by_year[1].name);
+    // Sort by artist.
+    const by_artist = try db.getAlbums(.by_artist);
+    try std.testing.expectEqualStrings("Alpha", by_artist[0].artist);
+    try std.testing.expectEqualStrings("Beta", by_artist[1].artist);
 }

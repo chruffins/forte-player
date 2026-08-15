@@ -7,7 +7,14 @@
 const std = @import("std");
 const RepeatMode = @import("../music/play_queue.zig").RepeatMode;
 
-pub const Screen = enum { now_playing, library, albums };
+pub const Screen = enum { now_playing, library, albums, album_detail };
+
+/// A row in the album-detail track list.
+pub const AlbumTrackRow = struct {
+    title: []const u8,
+    track: i64,
+    song_id: i64,
+};
 
 /// A playable album row for the album browser.
 pub const AlbumRow = struct {
@@ -34,8 +41,10 @@ pub const Cmd = union(enum) {
     seek: f64,
     /// Play the library song at this index.
     play_index: usize,
-    /// Play every song in this album (by album id).
-    play_album: i64,
+    /// Open the album detail screen for this album (load its tracks).
+    open_album_detail: i64,
+    /// Play the album-detail track at this index (seek into the album).
+    play_track_in_album: usize,
 };
 
 /// Semantic input (frontends map raw keys to these).
@@ -51,6 +60,7 @@ pub const Action = enum {
     goto_nowplaying,
     goto_library,
     goto_albums,
+    back,
     select_up,
     toggle_favorite,
     select_down,
@@ -102,6 +112,17 @@ pub const State = struct {
     album_count: usize = 0,
     /// Album id currently playing, or -1.
     playing_album_id: i64 = -1,
+    /// Label for the current album-list sort (e.g. "name"), for the header.
+    album_sort_label: []const u8 = "",
+
+    // ---- album detail snapshot ----
+    /// Album id whose tracks are shown on the album_detail screen.
+    album_detail_id: i64 = -1,
+    /// Track rows for the open album (borrowed from the caller).
+    album_detail_tracks: []const AlbumTrackRow = &.{},
+    album_detail_count: usize = 0,
+    /// Index (into album_detail_tracks) of the currently-playing track, if known.
+    album_detail_playing: ?usize = null,
 };
 
 /// One half-block art cell: upper pixel color (fg) + lower pixel color (bg),
@@ -140,11 +161,17 @@ pub fn apply(self: *State, action: Action, visible: usize) Cmd {
             return .{ .seek = if (self.duration > 0) @min(target, self.duration) else target };
         },
         .enter => {
+            if (self.screen == .albums and self.album_count > 0 and self.selection < self.albums.len) {
+                const id = self.albums[self.selection].id;
+                self.album_detail_id = id;
+                self.screen = .album_detail;
+                return .{ .open_album_detail = id };
+            }
+            if (self.screen == .album_detail and self.album_detail_count > 0) {
+                return .{ .play_track_in_album = self.selection };
+            }
             if (self.screen == .library and self.row_count > 0) {
                 return .{ .play_index = self.selection };
-            }
-            if (self.screen == .albums and self.album_count > 0 and self.selection < self.albums.len) {
-                return .{ .play_album = self.albums[self.selection].id };
             }
             return .none;
         },
@@ -152,8 +179,13 @@ pub fn apply(self: *State, action: Action, visible: usize) Cmd {
             self.screen = switch (self.screen) {
                 .now_playing => .library,
                 .library => .albums,
-                .albums => .now_playing,
+                // tab from the album detail returns to the album list
+                .albums, .album_detail => .now_playing,
             };
+            return .none;
+        },
+        .back => {
+            if (self.screen == .album_detail) self.screen = .albums;
             return .none;
         },
         .goto_nowplaying => {
@@ -197,6 +229,7 @@ pub fn apply(self: *State, action: Action, visible: usize) Cmd {
 fn rowCount(s: *const State) usize {
     return switch (s.screen) {
         .albums => s.album_count,
+        .album_detail => s.album_detail_count,
         else => s.row_count,
     };
 }
@@ -222,6 +255,7 @@ pub fn keyToAction(key: u8) ?Action {
         '1' => .goto_nowplaying,
         '2' => .goto_library,
         '3' => .goto_albums,
+        'b', '\x1b' => .back,
         'j' => .select_down,
         'k' => .select_up,
         'd' => .page_down,
@@ -287,7 +321,7 @@ test "keyToAction maps seek keys" {
     try std.testing.expectEqual(Action.seek_forward, keyToAction('.').?);
 }
 
-test "reducer: album screen selects albums and enter plays the album" {
+test "reducer: album screen enter opens detail; detail enter plays a track" {
     var st = State{
         .screen = .albums,
         .album_count = 2,
@@ -299,13 +333,28 @@ test "reducer: album screen selects albums and enter plays the album" {
 
     _ = apply(&st, .select_down, 10);
     try std.testing.expectEqual(@as(usize, 1), st.selection);
-    const c = apply(&st, .enter, 10);
-    try std.testing.expectEqual(@as(Cmd, .{ .play_album = 11 }), c);
+    // Enter on an album opens its detail screen and asks the frontend to load it.
+    const open = apply(&st, .enter, 10);
+    try std.testing.expectEqual(@as(Cmd, .{ .open_album_detail = 11 }), open);
+    try std.testing.expectEqual(Screen.album_detail, st.screen);
+    try std.testing.expectEqual(@as(i64, 11), st.album_detail_id);
 
-    // selection clamped to album count (not library row count)
-    st.row_count = 100; // library has 100 songs; must not affect albums screen
-    _ = apply(&st, .select_down, 10);
-    try std.testing.expectEqual(@as(usize, 1), st.selection); // stays clamped
+    // Back returns to the album list.
+    _ = apply(&st, .back, 10);
+    try std.testing.expectEqual(Screen.albums, st.screen);
+
+    // In the detail screen, enter plays the selected track of that album, and
+    // selection clamps to the album's track count (not the library's).
+    st.screen = .album_detail;
+    st.album_detail_id = 11;
+    st.album_detail_count = 5;
+    st.row_count = 100; // must NOT clamp against this
+    st.selection = 0;
+    st.scroll = 0;
+    for (0..6) |_| _ = apply(&st, .select_down, 10);
+    try std.testing.expectEqual(@as(usize, 4), st.selection); // clamped to 5 tracks
+    const play = apply(&st, .enter, 10);
+    try std.testing.expectEqual(@as(Cmd, .{ .play_track_in_album = 4 }), play);
 }
 
 test "reducer: toggle_screen cycles now_playing -> library -> albums -> now_playing" {

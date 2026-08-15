@@ -85,6 +85,7 @@ pub fn emit(s: *const U.State, cl: *CmdList, width: u16, height: u16, titles: []
         .now_playing => emitNowPlaying(s, cl, width, height),
         .library => emitLibrary(s, cl, width, height, titles),
         .albums => emitAlbums(s, cl, width, height),
+        .album_detail => emitAlbumDetail(s, cl, width, height),
     }
     emitFooter(s, cl, width, height);
 }
@@ -121,6 +122,7 @@ fn emitHeader(s: *const U.State, cl: *CmdList, width: u16) void {
         .now_playing => " NOW PLAYING ",
         .library => " LIBRARY ",
         .albums => " ALBUMS ",
+        .album_detail => " ALBUM ",
     };
     const x = width -| @as(u16, @intCast(name.len)); // right-aligned
     cl.text(x, 0, name, .dim);
@@ -255,8 +257,8 @@ fn emitLibrary(s: *const U.State, cl: *CmdList, width: u16, height: u16, titles:
 }
 
 fn emitAlbums(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
-    var hd: [64]u8 = undefined;
-    const hline = std.fmt.bufPrint(&hd, "Albums  ({d})", .{s.album_count}) catch "Albums";
+    var hd: [96]u8 = undefined;
+    const hline = std.fmt.bufPrint(&hd, "Albums  ({d})   sort: {s}", .{ s.album_count, if (s.album_sort_label.len > 0) s.album_sort_label else "name" }) catch "Albums";
     cl.text(2, header_rows, hline, .bold);
 
     const visible = libraryVisible(height);
@@ -281,6 +283,50 @@ fn emitAlbums(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
         cl.row(top + @as(u16, @intCast(i)), truncGlyphs(line, width -| 2), idx == s.selection, playing);
     }
     if (s.album_count == 0) cl.text(2, top, "(no albums)", .dim);
+}
+
+fn emitAlbumDetail(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
+    var title: []const u8 = "Album";
+    var artist: []const u8 = "";
+    var year: i64 = -1;
+    for (s.albums) |a| {
+        if (a.id == s.album_detail_id) {
+            title = a.title;
+            artist = a.artist;
+            year = a.year;
+            break;
+        }
+    }
+
+    var hd: [256]u8 = undefined;
+    const hline = std.fmt.bufPrint(&hd, "{s}{s}  {s}   ({d} tracks)", .{
+        title,
+        if (year > 0) blk: {
+            var yb: [16]u8 = undefined;
+            break :blk std.fmt.bufPrint(&yb, " ({d})", .{year}) catch "";
+        } else "",
+        artist,
+        s.album_detail_count,
+    }) catch "Album";
+    cl.text(2, header_rows, truncGlyphs(hline, width -| 2), .bold);
+
+    const visible = libraryVisible(height);
+    const top: u16 = header_rows + 1;
+    var i: usize = 0;
+    while (i < visible) : (i += 1) {
+        const idx = s.scroll + i;
+        if (idx >= s.album_detail_count) break;
+        const t = s.album_detail_tracks[idx];
+        const tnum: []const u8 = if (t.track > 0) blk: {
+            var tb: [8]u8 = undefined;
+            break :blk std.fmt.bufPrint(&tb, "{d:>2}. ", .{t.track}) catch "";
+        } else "";
+        var lb: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&lb, "{s}{s}", .{ tnum, t.title }) catch continue;
+        const playing = if (s.album_detail_playing) |p| p == idx else false;
+        cl.row(top + @as(u16, @intCast(i)), truncGlyphs(line, width -| 2), idx == s.selection, playing);
+    }
+    if (s.album_detail_count == 0) cl.text(2, top, "(no tracks)", .dim);
 }
 
 fn emitFooter(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
