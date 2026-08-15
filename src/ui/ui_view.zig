@@ -51,7 +51,15 @@ pub const CmdList = struct {
         self.add(.{ .bar = .{ .x = x, .y = y, .width = width, .frac = f } });
     }
     pub fn row(self: *CmdList, y: u16, s: []const u8, selected: bool, playing: bool) void {
-        self.add(.{ .row = .{ .y = y, .s = s, .selected = selected, .playing = playing } });
+        // Rows are commonly formatted into stack buffers by the emitter, so copy
+        // into the persistent scratch (like text()) — a borrowed slice would
+        // dangle by the time the renderer reads the command list.
+        const avail = self.scratch.len - self.scratch_n;
+        const len = @min(s.len, avail);
+        @memcpy(self.scratch[self.scratch_n .. self.scratch_n + len], s[0..len]);
+        const owned = self.scratch[self.scratch_n .. self.scratch_n + len];
+        self.scratch_n += len;
+        self.add(.{ .row = .{ .y = y, .s = owned, .selected = selected, .playing = playing } });
     }
     pub fn hline(self: *CmdList, y: u16) void {
         self.add(.{ .hline = .{ .y = y } });
@@ -263,18 +271,17 @@ fn emitAlbums(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
 
     const visible = libraryVisible(height);
     const top: u16 = header_rows + 1;
+    var yb: [16]u8 = undefined;
     var i: usize = 0;
     while (i < visible) : (i += 1) {
         const idx = s.scroll + i;
         if (idx >= s.album_count) break;
         const a = s.albums[idx];
+        const year_part: []const u8 = if (a.year > 0) std.fmt.bufPrint(&yb, "  ({d})", .{a.year}) catch "" else "";
         var line_buf: [256]u8 = undefined;
         const line = std.fmt.bufPrint(&line_buf, "{s}{s}  {s}  {d} tracks{s}", .{
             a.title,
-            if (a.year > 0) blk: {
-                var yb: [16]u8 = undefined;
-                break :blk std.fmt.bufPrint(&yb, "  ({d})", .{a.year}) catch "";
-            } else "",
+            year_part,
             a.artist,
             a.track_count,
             if (a.has_cover) "  [art]" else "",
@@ -298,13 +305,12 @@ fn emitAlbumDetail(s: *const U.State, cl: *CmdList, width: u16, height: u16) voi
         }
     }
 
+    var yb: [16]u8 = undefined;
+    const year_part: []const u8 = if (year > 0) std.fmt.bufPrint(&yb, " ({d})", .{year}) catch "" else "";
     var hd: [256]u8 = undefined;
     const hline = std.fmt.bufPrint(&hd, "{s}{s}  {s}   ({d} tracks)", .{
         title,
-        if (year > 0) blk: {
-            var yb: [16]u8 = undefined;
-            break :blk std.fmt.bufPrint(&yb, " ({d})", .{year}) catch "";
-        } else "",
+        year_part,
         artist,
         s.album_detail_count,
     }) catch "Album";
@@ -312,15 +318,13 @@ fn emitAlbumDetail(s: *const U.State, cl: *CmdList, width: u16, height: u16) voi
 
     const visible = libraryVisible(height);
     const top: u16 = header_rows + 1;
+    var tb: [8]u8 = undefined;
     var i: usize = 0;
     while (i < visible) : (i += 1) {
         const idx = s.scroll + i;
         if (idx >= s.album_detail_count) break;
         const t = s.album_detail_tracks[idx];
-        const tnum: []const u8 = if (t.track > 0) blk: {
-            var tb: [8]u8 = undefined;
-            break :blk std.fmt.bufPrint(&tb, "{d:>2}. ", .{t.track}) catch "";
-        } else "";
+        const tnum: []const u8 = if (t.track > 0) std.fmt.bufPrint(&tb, "{d:>2}. ", .{t.track}) catch "" else "";
         var lb: [256]u8 = undefined;
         const line = std.fmt.bufPrint(&lb, "{s}{s}", .{ tnum, t.title }) catch continue;
         const playing = if (s.album_detail_playing) |p| p == idx else false;
@@ -359,8 +363,14 @@ fn emitFooter(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
     }) catch "";
     cl.text(3, by + 1, status, .accent);
 
-    // hint line
-    cl.text(3, by + 2, "space:pause  n/p:next/prev  [ ]/.:seek +/-:vol  s:shuffle  r:repeat  f:favorite  1/2/3:view  j/k:nav  enter:play  q:quit", .dim);
+    // hint line (screen-specific controls; transport keys always work)
+    const hint = switch (s.screen) {
+        .now_playing => "space:pause  n/p:next/prev  [ ]/.:seek  +/-:vol  s:shuffle  r:repeat  f:fav  1/2/3:view  q:quit",
+        .library => "j/k:nav  d/u:page  enter:play  s:shuffle  r:repeat  f:fav  1/2/3:view  space:pause  q:quit",
+        .albums => "j/k:nav  d/u:page  a:sort  enter:open  b:back  1/2/3:view  q:quit",
+        .album_detail => "j/k:nav  d/u:page  enter:play  b/esc:back  n/p:next/prev  1/2/3:view  q:quit",
+    };
+    cl.text(3, by + 2, hint, .dim);
 }
 
 test "footer progress bar + readout never overflows the terminal width" {
@@ -443,6 +453,76 @@ test "now-playing renders spectrum bars as block glyphs" {
         else => {},
     };
     try std.testing.expectEqual(@as(usize, 5), seen_rows); // footer starts at row 20
+}
+
+test "album view renders rows + sort header without garbage" {
+    var st = U.State{ .screen = .albums, .album_count = 2 };
+    const rows = [_]U.AlbumRow{
+        .{ .id = 1, .title = "Kind of Blue", .artist = "Miles Davis", .year = 1959, .track_count = 5, .has_cover = true },
+        .{ .id = 2, .title = "Zed", .artist = "A. Artist", .year = 2005, .track_count = 1, .has_cover = false },
+    };
+    st.albums = &rows;
+    st.album_sort_label = "name";
+
+    var cl = CmdList{};
+    emit(&st, &cl, 80, 24, &.{});
+
+    var rows_seen: usize = 0;
+    var header_ok = false;
+    var hint_ok = false;
+    for (cl.slice()) |cmd| switch (cmd) {
+        .row => |r| {
+            rows_seen += 1;
+            if (rows_seen == 1) {
+                try std.testing.expect(std.mem.indexOf(u8, r.s, "Kind of Blue") != null);
+                try std.testing.expect(std.mem.indexOf(u8, r.s, "1959") != null);
+                try std.testing.expect(std.mem.indexOf(u8, r.s, "5 tracks") != null);
+            } else {
+                try std.testing.expect(std.mem.indexOf(u8, r.s, "Zed") != null);
+                try std.testing.expect(std.mem.indexOf(u8, r.s, "2005") != null);
+                try std.testing.expect(std.mem.indexOf(u8, r.s, "1 tracks") != null);
+            }
+        },
+        .text => |t| {
+            if (t.y == header_rows) header_ok = header_ok or std.mem.indexOf(u8, t.s, "sort: name") != null;
+            if (t.y == 23) hint_ok = hint_ok or std.mem.indexOf(u8, t.s, "a:sort") != null;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), rows_seen);
+    try std.testing.expect(header_ok);
+    try std.testing.expect(hint_ok);
+}
+
+test "album detail view lists numbered tracks + playing highlight" {
+    var st = U.State{
+        .screen = .album_detail,
+        .album_detail_id = 1,
+        .album_detail_count = 2,
+        .album_detail_playing = 1,
+        .albums = &.{.{ .id = 1, .title = "Zed", .artist = "X", .year = 2001, .track_count = 2, .has_cover = false }},
+    };
+    const tracks = [_]U.AlbumTrackRow{
+        .{ .title = "First", .track = 1, .song_id = 11 },
+        .{ .title = "Second", .track = 2, .song_id = 12 },
+    };
+    st.album_detail_tracks = &tracks;
+
+    var cl = CmdList{};
+    emit(&st, &cl, 80, 24, &.{});
+
+    var found = [_]bool{ false, false };
+    for (cl.slice()) |cmd| switch (cmd) {
+        .row => |r| {
+            if (std.mem.indexOf(u8, r.s, "1. First") != null) found[0] = true;
+            if (std.mem.indexOf(u8, r.s, "2. Second") != null) {
+                try std.testing.expect(r.playing); // playing track is highlighted
+                found[1] = true;
+            }
+        },
+        else => {},
+    };
+    try std.testing.expect(found[0] and found[1]);
 }
 
 /// Byte length of the UTF-8 glyph starting at s[i] (for cell-width counting).
