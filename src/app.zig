@@ -158,4 +158,27 @@ pub const App = struct {
         }
         return null;
     }
+
+    /// Play every song in an album: rebuilds the play queue as an Album context
+    /// (so next/prev/auto-advance stay within this album) and starts its first
+    /// track. Returns the started path, or null if the album is empty.
+    pub fn playAlbum(self: *App, album_id: i64) ?[:0]const u8 {
+        const songs = self.db.getSongsByAlbum(album_id) catch return null;
+        if (songs.len == 0) return null;
+
+        var ids = std.ArrayList(i32){ .items = &.{}, .capacity = 0 };
+        defer ids.deinit(self.allocator);
+        for (songs) |s| {
+            ids.append(self.allocator, @intCast(s.id)) catch return null;
+        }
+
+        self.play_queue.clear();
+        self.play_queue.context_type = .Album;
+        self.play_queue.context_id = @intCast(album_id);
+        self.play_queue.enqueueMany(ids.items) catch return null;
+
+        const path = self.lib.songPath(songs[0].id) orelse return null;
+        _ = self.engine.playSound(path) catch return null;
+        return path;
+    }
 };

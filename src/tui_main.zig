@@ -136,11 +136,15 @@ fn runCmd(app: *app_mod.App, cmd: U.Cmd) void {
             // App's shared on_song_changed hook keeps app.current_path in sync.
             if (engine.playSound(p)) |_| {} else |_| {}
         },
+        .play_album => |album_id| {
+            // Rebuilds the queue as an Album context and starts its first track.
+            _ = app.playAlbum(album_id);
+        },
     }
 }
 
 /// Keep the UI's transient snapshot in sync with the engine + library.
-fn fillState(st: *U.State, app: *app_mod.App) void {
+fn fillState(st: *U.State, app: *app_mod.App, albums: []const U.AlbumRow) void {
     const engine = app.engine;
     const lib = app.lib;
     const db = &app.db;
@@ -150,10 +154,12 @@ fn fillState(st: *U.State, app: *app_mod.App) void {
     st.album = "";
     st.favorite = false;
     st.playing_index = null;
+    st.playing_album_id = -1;
     if (lib.songIdByPath(current_path)) |id| {
         if (lib.getSongById(id)) |song| {
             st.title = song.title;
             st.favorite = song.favorite != 0;
+            st.playing_album_id = song.album_id;
         }
         if (db.getSongContext(id) catch null) |ctx| {
             st.artist = ctx.artist;
@@ -169,6 +175,8 @@ fn fillState(st: *U.State, app: *app_mod.App) void {
     st.shuffle = engine.isShuffled();
     st.repeat_mode = engine.getRepeatMode();
     st.row_count = lib.count();
+    st.albums = albums;
+    st.album_count = albums.len;
 }
 
 pub fn main() !void {
@@ -211,6 +219,22 @@ pub fn main() !void {
         const id = app.lib.songIdAt(ti);
         if (app.lib.getSongById(id)) |s| try titles.append(allocator, s.title);
     }
+
+    // Album browser rows (parallel to the DB's album listing).
+    var album_rows = std.ArrayList(U.AlbumRow){ .items = &.{}, .capacity = 0 };
+    defer album_rows.deinit(allocator);
+    if (app.db.getAlbums()) |albums| {
+        for (albums) |a| {
+            try album_rows.append(allocator, .{
+                .id = a.id,
+                .title = a.name,
+                .artist = a.artist,
+                .year = a.year,
+                .track_count = a.track_count,
+                .has_cover = a.has_cover,
+            });
+        }
+    } else |_| {}
 
     render.enableRaw();
     defer render.restoreRaw();
@@ -289,7 +313,7 @@ pub fn main() !void {
                 app.engine.handleAudioStreamFinished() catch {};
             }
 
-            fillState(&st, app);
+            fillState(&st, app, album_rows.items);
 
             // Refresh the spectrum from the newest captured mono samples.
             const got = app.engine.copyRecentMono(sample_buf.len, &sample_buf);

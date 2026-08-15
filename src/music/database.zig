@@ -282,6 +282,63 @@ pub const Database = struct {
             null;
     }
 
+    // ---- album listing / playback -//-
+
+    /// One row of the album browser: the album, its primary artist, the number
+    /// of tracks (songs) in it, and whether we have stored cover art.
+    pub const AlbumListing = struct {
+        id: i64,
+        name: []const u8,
+        artist: []const u8,
+        year: i64,
+        track_count: i64,
+        has_cover: bool,
+    };
+
+    /// Every album, joined with its primary artist and track count, ordered by
+    /// name. Allocated with `self.allocator` (strings too).
+    pub fn getAlbums(self: *Database) ![]AlbumListing {
+        var stmt = try self.raw.prepareDynamic(
+            \\SELECT a.id, COALESCE(a.name,''), COALESCE(ar.name,''), COALESCE(a.year,-1),
+            \\       COUNT(s.id), (a.cover_art_block IS NOT NULL)
+            \\FROM albums a
+            \\JOIN artists ar ON ar.id = a.artist_id
+            \\LEFT JOIN songs s ON s.album_id = a.id
+            \\GROUP BY a.id
+            \\ORDER BY COALESCE(a.name,'') COLLATE NOCASE;
+        );
+        defer stmt.deinit();
+        const Row = struct { id: i64, name: []const u8, artist: []const u8, year: i64, track_count: i64, has_cover: i64 };
+        var iter = try stmt.iteratorAlloc(Row, self.allocator, .{});
+        var list = std.ArrayList(AlbumListing){ .items = &.{}, .capacity = 0 };
+        defer list.deinit(self.allocator);
+        while (try iter.nextAlloc(self.allocator, .{})) |row| {
+            try list.append(self.allocator, .{
+                .id = row.id,
+                .name = row.name,
+                .artist = row.artist,
+                .year = row.year,
+                .track_count = row.track_count,
+                .has_cover = row.has_cover != 0,
+            });
+        }
+        return list.toOwnedSlice(self.allocator);
+    }
+
+    /// All songs in an album, ordered by disc then track (then id). Rows are
+    /// allocated with `self.allocator`.
+    pub fn getSongsByAlbum(self: *Database, album_id: i64) ![]entity.Song {
+        var stmt = try self.raw.prepareDynamic(song_cols ++ " WHERE album_id = ? ORDER BY disc_number, track, id;");
+        defer stmt.deinit();
+        var iter = try stmt.iteratorAlloc(entity.Song, self.allocator, .{ album_id });
+        var list = std.ArrayList(entity.Song){ .items = &.{}, .capacity = 0 };
+        defer list.deinit(self.allocator);
+        while (try iter.nextAlloc(self.allocator, .{})) |row| {
+            try list.append(self.allocator, row);
+        }
+        return list.toOwnedSlice(self.allocator);
+    }
+
     // ---- reads ----
 
     /// Record a playback: bump `play_count` and set `last_played` (epoch secs).
@@ -490,4 +547,36 @@ test "database: rollback discards pending inserts" {
 
     const songs = try db.getAllSongs();
     try std.testing.expectEqual(@as(usize, 0), songs.len);
+}
+
+test "database: album listing + songs by album" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var db = try Database.open(arena.allocator(), null);
+    defer db.deinit();
+
+    const a1 = try db.addArtist("Alpha");
+    const a2 = try db.addArtist("Beta");
+    const alb1 = try db.addAlbum("Record One", a1, 1999);
+    const alb2 = try db.addAlbum("Zed", a2, 2005);
+    _ = try db.addSong("/one/b.ogg", "B", alb1, 2, 60, 1);
+    _ = try db.addSong("/one/a.ogg", "A", alb1, 1, 50, 1);
+    _ = try db.addSong("/two/c.ogg", "C", alb2, 1, 40, 1);
+
+    // getSongsByAlbum orders by disc, then track (so A before B).
+    const alb1_songs = try db.getSongsByAlbum(alb1);
+    try std.testing.expectEqual(@as(usize, 2), alb1_songs.len);
+    try std.testing.expectEqualStrings("A", alb1_songs[0].title);
+    try std.testing.expectEqualStrings("B", alb1_songs[1].title);
+
+    // getAlbums: track counts + artist names, ordered by album name.
+    const listing = try db.getAlbums();
+    try std.testing.expectEqual(@as(usize, 2), listing.len);
+    try std.testing.expectEqualStrings("Record One", listing[0].name);
+    try std.testing.expectEqualStrings("Alpha", listing[0].artist);
+    try std.testing.expectEqual(@as(i64, 2), listing[0].track_count);
+    try std.testing.expectEqualStrings("Zed", listing[1].name);
+    try std.testing.expectEqual(@as(i64, 1), listing[1].track_count);
+    try std.testing.expect(!listing[1].has_cover);
 }

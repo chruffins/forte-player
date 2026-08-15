@@ -84,6 +84,7 @@ pub fn emit(s: *const U.State, cl: *CmdList, width: u16, height: u16, titles: []
     switch (s.screen) {
         .now_playing => emitNowPlaying(s, cl, width, height),
         .library => emitLibrary(s, cl, width, height, titles),
+        .albums => emitAlbums(s, cl, width, height),
     }
     emitFooter(s, cl, width, height);
 }
@@ -116,7 +117,11 @@ fn barWidth(width: u16) u16 {
 
 fn emitHeader(s: *const U.State, cl: *CmdList, width: u16) void {
     cl.text(2, 0, " forte-player ", .title);
-    const name = if (s.screen == .now_playing) " NOW PLAYING " else " LIBRARY ";
+    const name = switch (s.screen) {
+        .now_playing => " NOW PLAYING ",
+        .library => " LIBRARY ",
+        .albums => " ALBUMS ",
+    };
     const x = width -| @as(u16, @intCast(name.len)); // right-aligned
     cl.text(x, 0, name, .dim);
     cl.hline(1);
@@ -249,6 +254,35 @@ fn emitLibrary(s: *const U.State, cl: *CmdList, width: u16, height: u16, titles:
     if (titles.len == 0) cl.text(2, top, "(empty library)", .dim);
 }
 
+fn emitAlbums(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
+    var hd: [64]u8 = undefined;
+    const hline = std.fmt.bufPrint(&hd, "Albums  ({d})", .{s.album_count}) catch "Albums";
+    cl.text(2, header_rows, hline, .bold);
+
+    const visible = libraryVisible(height);
+    const top: u16 = header_rows + 1;
+    var i: usize = 0;
+    while (i < visible) : (i += 1) {
+        const idx = s.scroll + i;
+        if (idx >= s.album_count) break;
+        const a = s.albums[idx];
+        var line_buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "{s}{s}  {s}  {d} tracks{s}", .{
+            a.title,
+            if (a.year > 0) blk: {
+                var yb: [16]u8 = undefined;
+                break :blk std.fmt.bufPrint(&yb, "  ({d})", .{a.year}) catch "";
+            } else "",
+            a.artist,
+            a.track_count,
+            if (a.has_cover) "  [art]" else "",
+        }) catch continue;
+        const playing = s.playing_album_id >= 0 and a.id == s.playing_album_id;
+        cl.row(top + @as(u16, @intCast(i)), truncGlyphs(line, width -| 2), idx == s.selection, playing);
+    }
+    if (s.album_count == 0) cl.text(2, top, "(no albums)", .dim);
+}
+
 fn emitFooter(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
     if (height <= footer_rows) return;
     const top = height - footer_rows;
@@ -280,7 +314,7 @@ fn emitFooter(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
     cl.text(3, by + 1, status, .accent);
 
     // hint line
-    cl.text(3, by + 2, "space:pause  n/p:next/prev  [ ]/.:seek +/-:vol  s:shuffle  r:repeat  f:favorite  1/2:screen  j/k:nav  enter:play  q:quit", .dim);
+    cl.text(3, by + 2, "space:pause  n/p:next/prev  [ ]/.:seek +/-:vol  s:shuffle  r:repeat  f:favorite  1/2/3:view  j/k:nav  enter:play  q:quit", .dim);
 }
 
 test "footer progress bar + readout never overflows the terminal width" {

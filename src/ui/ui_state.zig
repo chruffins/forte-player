@@ -7,7 +7,17 @@
 const std = @import("std");
 const RepeatMode = @import("../music/play_queue.zig").RepeatMode;
 
-pub const Screen = enum { now_playing, library };
+pub const Screen = enum { now_playing, library, albums };
+
+/// A playable album row for the album browser.
+pub const AlbumRow = struct {
+    id: i64,
+    title: []const u8,
+    artist: []const u8,
+    year: i64,
+    track_count: i64,
+    has_cover: bool,
+};
 
 /// A player operation the UI glue must run against the engine.
 pub const Cmd = union(enum) {
@@ -24,6 +34,8 @@ pub const Cmd = union(enum) {
     seek: f64,
     /// Play the library song at this index.
     play_index: usize,
+    /// Play every song in this album (by album id).
+    play_album: i64,
 };
 
 /// Semantic input (frontends map raw keys to these).
@@ -36,6 +48,9 @@ pub const Action = enum {
     toggle_shuffle,
     cycle_repeat,
     toggle_screen,
+    goto_nowplaying,
+    goto_library,
+    goto_albums,
     select_up,
     toggle_favorite,
     select_down,
@@ -75,10 +90,18 @@ pub const State = struct {
     art: Art = .{},
 
     // ---- library snapshot ----
-    /// Number of selectable songs (index 0..row_count-1 valid).
+    /// Number of selectable library songs (index 0..row_count-1 valid).
     row_count: usize = 0,
     /// Index (in the library) of the currently-playing song, if known.
     playing_index: ?usize = null,
+
+    // ---- album browser snapshot ----
+    /// Album rows for the album screen (borrowed from the caller).
+    albums: []const AlbumRow = &.{},
+    /// Number of albums (same as albums.len; kept explicit for the reducer).
+    album_count: usize = 0,
+    /// Album id currently playing, or -1.
+    playing_album_id: i64 = -1,
 };
 
 /// One half-block art cell: upper pixel color (fg) + lower pixel color (bg),
@@ -120,17 +143,36 @@ pub fn apply(self: *State, action: Action, visible: usize) Cmd {
             if (self.screen == .library and self.row_count > 0) {
                 return .{ .play_index = self.selection };
             }
+            if (self.screen == .albums and self.album_count > 0 and self.selection < self.albums.len) {
+                return .{ .play_album = self.albums[self.selection].id };
+            }
             return .none;
         },
         .toggle_screen => {
-            self.screen = if (self.screen == .now_playing) .library else .now_playing;
+            self.screen = switch (self.screen) {
+                .now_playing => .library,
+                .library => .albums,
+                .albums => .now_playing,
+            };
+            return .none;
+        },
+        .goto_nowplaying => {
+            self.screen = .now_playing;
+            return .none;
+        },
+        .goto_library => {
+            self.screen = .library;
+            return .none;
+        },
+        .goto_albums => {
+            self.screen = .albums;
             return .none;
         },
         .select_up => {
             if (self.selection > 0) self.selection -= 1;
         },
         .select_down => {
-            if (self.row_count > 0 and self.selection + 1 < self.row_count) self.selection += 1;
+            if (rowCount(self) > 0 and self.selection + 1 < rowCount(self)) self.selection += 1;
         },
         .page_up => {
             const p = @max(@as(usize, 1), visible);
@@ -138,17 +180,25 @@ pub fn apply(self: *State, action: Action, visible: usize) Cmd {
         },
         .page_down => {
             const p = @max(@as(usize, 1), visible);
-            self.selection = @min(self.selection + p, self.row_count -| 1);
+            self.selection = @min(self.selection + p, rowCount(self) -| 1);
         },
     }
     // keep the selection visible after any movement
     const v = @max(@as(usize, 1), visible);
     if (self.selection < self.scroll) self.scroll = self.selection;
     if (self.selection >= self.scroll + v) self.scroll = self.selection - (v - 1);
-    if (self.row_count > 0 and self.scroll > 0 and self.scroll + v > self.row_count) {
-        self.scroll = self.row_count -| v;
+    if (rowCount(self) > 0 and self.scroll > 0 and self.scroll + v > rowCount(self)) {
+        self.scroll = rowCount(self) -| v;
     }
     return .none;
+}
+
+/// Number of selectable rows for the current screen.
+fn rowCount(s: *const State) usize {
+    return switch (s.screen) {
+        .albums => s.album_count,
+        else => s.row_count,
+    };
 }
 
 /// Step used by seek_back / seek_forward, in seconds.
@@ -168,8 +218,10 @@ pub fn keyToAction(key: u8) ?Action {
         'f' => .toggle_favorite,
         '[', ',' => .seek_back,
         ']', '.' => .seek_forward,
-        '\t', '1' => .toggle_screen,
-        '2' => .toggle_screen,
+        '\t' => .toggle_screen,
+        '1' => .goto_nowplaying,
+        '2' => .goto_library,
+        '3' => .goto_albums,
         'j' => .select_down,
         'k' => .select_up,
         'd' => .page_down,
@@ -233,4 +285,45 @@ test "keyToAction maps seek keys" {
     try std.testing.expectEqual(Action.seek_back, keyToAction(',').?);
     try std.testing.expectEqual(Action.seek_forward, keyToAction(']').?);
     try std.testing.expectEqual(Action.seek_forward, keyToAction('.').?);
+}
+
+test "reducer: album screen selects albums and enter plays the album" {
+    var st = State{
+        .screen = .albums,
+        .album_count = 2,
+        .albums = &.{
+            .{ .id = 10, .title = "First", .artist = "A", .year = 2000, .track_count = 3, .has_cover = false },
+            .{ .id = 11, .title = "Second", .artist = "B", .year = 2001, .track_count = 5, .has_cover = true },
+        },
+    };
+
+    _ = apply(&st, .select_down, 10);
+    try std.testing.expectEqual(@as(usize, 1), st.selection);
+    const c = apply(&st, .enter, 10);
+    try std.testing.expectEqual(@as(Cmd, .{ .play_album = 11 }), c);
+
+    // selection clamped to album count (not library row count)
+    st.row_count = 100; // library has 100 songs; must not affect albums screen
+    _ = apply(&st, .select_down, 10);
+    try std.testing.expectEqual(@as(usize, 1), st.selection); // stays clamped
+}
+
+test "reducer: toggle_screen cycles now_playing -> library -> albums -> now_playing" {
+    var st = State{};
+    _ = apply(&st, .toggle_screen, 10);
+    try std.testing.expectEqual(Screen.library, st.screen);
+    _ = apply(&st, .toggle_screen, 10);
+    try std.testing.expectEqual(Screen.albums, st.screen);
+    _ = apply(&st, .toggle_screen, 10);
+    try std.testing.expectEqual(Screen.now_playing, st.screen);
+}
+
+test "reducer: goto_* set the screen directly" {
+    var st = State{};
+    _ = apply(&st, .goto_albums, 10);
+    try std.testing.expectEqual(Screen.albums, st.screen);
+    _ = apply(&st, .goto_library, 10);
+    try std.testing.expectEqual(Screen.library, st.screen);
+    _ = apply(&st, .goto_nowplaying, 10);
+    try std.testing.expectEqual(Screen.now_playing, st.screen);
 }
