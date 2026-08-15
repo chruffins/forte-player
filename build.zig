@@ -21,7 +21,14 @@ pub fn build(b: *std.Build) void {
     // added to the linker search path AND to the runtime search path of the
     // produced binaries so they load that build instead of the distro's.
     //   zig build -Dallegro_prefix=/home/chris/.local/forte-allegro
-    const allegro_prefix = b.option([]const u8, "allegro_prefix", "Prefix of a custom Allegro 5 install (adds <prefix>/lib to link + rpath)") orelse "";
+    // Default to the locally-built Allegro (compiled with MP3/Opus in its acodec)
+    // so MP3 libraries play out of the box — the distro Allegro's acodec can't
+    // decode MP3. Override with `-Dallegro_prefix=<path>`, or pass
+    // `-Dallegro_prefix=` (empty) to use the distro build. Adding the lib/rpath
+    // of a missing dir is harmless: the loader falls back to the system libs
+    // if it isn't found here.
+    const default_allegro_prefix = "/home/chris/.local/forte-allegro";
+    const allegro_prefix = b.option([]const u8, "allegro_prefix", "Prefix of a custom Allegro 5 install (adds <prefix>/lib to link + rpath)") orelse default_allegro_prefix;
 
     // Import the allegro5-zig wrapper as a dependency module.
     const dep = b.dependency("allegro", .{ .target = target, .optimize = optimize });
