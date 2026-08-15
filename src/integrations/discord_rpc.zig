@@ -4,12 +4,16 @@
 //! (`$XDG_RUNTIME_DIR/discord-ipc-0`, falling back to `/tmp/discord-ipc-0`).
 //! The RPC protocol is a length-prefixed frame stream: an 8-byte header
 //! (opcode u32 LE, payload length u32 LE) followed by a JSON payload. We do a
-//! HANDSHAKE with our application id, then send SET_ACTIVITY frames (opcode 1)
-//! whenever the current song changes.
+//! HANDSHAKE with our application id, confirm the READY ack, then send
+//! SET_ACTIVITY frames (opcode 1) whenever the current song changes.
 //!
 //! Everything here is best-effort and non-blocking: if Discord isn't running,
 //! or the socket is momentarily busy, the update is dropped silently and the
 //! connection is retried on the next call. The TUI never blocks on Discord.
+//!
+//! Diagnostics: set `DISCORD_IPC_DEBUG=1` to print connect / READY / activity
+//! traffic to stderr, which shows whether the socket handshake is actually
+//! acknowledged.
 
 const std = @import("std");
 
@@ -22,9 +26,18 @@ const c = @cImport({
     @cInclude("time.h");
 });
 
-/// Application id used by the C++ original. Used when config.ini's
-/// `[discord] application_id` is unset/0; override with your own app there.
+/// Application id used by the C++ original
+/// (`include/core/discord_integration.hpp`: `APPLICATION_ID = 1362371550275174512`).
+/// It is a Discord application's Client ID; override with your own in
+/// `config.ini` under `[discord] application_id=` if/when you create a new one.
 pub const default_app_id: u64 = 1362371550275174512;
+
+/// Print IPC traffic + handshake results when `DISCORD_IPC_DEBUG` is set.
+fn dbg(comptime fmt: []const u8, args: anytype) void {
+    if (c.getenv("DISCORD_IPC_DEBUG")) |_| {
+        std.debug.print("discord: " ++ fmt ++ "\n", args);
+    }
+}
 
 const Opcode = enum(u32) {
     handshake = 0,
@@ -34,10 +47,38 @@ const Opcode = enum(u32) {
     pong = 4,
 };
 
+/// The 8-byte IPC frame header (opcode u32 LE, payload len u32 LE).
+pub const FrameHeader = struct {
+    op: u32,
+    len: u32,
+};
+
+pub fn decodeHeader(bytes: [8]u8) FrameHeader {
+    return .{
+        .op = bytes[0] | (@as(u32, bytes[1]) << 8) | (@as(u32, bytes[2]) << 16) | (@as(u32, bytes[3]) << 24),
+        .len = bytes[4] | (@as(u32, bytes[5]) << 8) | (@as(u32, bytes[6]) << 16) | (@as(u32, bytes[7]) << 24),
+    };
+}
+
+pub fn encodeHeader(op: u32, len: u32) [8]u8 {
+    var h: [8]u8 = undefined;
+    h[0] = @truncate(op);
+    h[1] = @truncate(op >> 8);
+    h[2] = @truncate(op >> 16);
+    h[3] = @truncate(op >> 24);
+    h[4] = @truncate(len);
+    h[5] = @truncate(len >> 8);
+    h[6] = @truncate(len >> 16);
+    h[7] = @truncate(len >> 24);
+    return h;
+}
+
 pub const Client = struct {
     app_id: u64 = 0,
     pid: c_int = 0,
     fd: c_int = -1,
+    /// True once the socket handshake has been acknowledged with a READY frame.
+    ready: bool = false,
 
     pub fn init(app_id: u64) Client {
         return .{ .app_id = app_id, .pid = @intCast(c.getpid()) };
@@ -50,6 +91,7 @@ pub const Client = struct {
     fn closeFd(self: *Client) void {
         if (self.fd >= 0) _ = c.close(self.fd);
         self.fd = -1;
+        self.ready = false;
     }
 
     /// `$XDG_RUNTIME_DIR/discord-ipc-0`, or `/tmp/discord-ipc-0` as fallback.
@@ -72,9 +114,10 @@ pub const Client = struct {
         return "/tmp/discord-ipc-0";
     }
 
-    /// Best-effort connect + handshake. Returns true if `fd` is usable.
+    /// Best-effort connect + handshake. Returns true if the socket is usable
+    /// and the handshake was acknowledged with a READY frame.
     fn connect(self: *Client) bool {
-        if (self.fd >= 0) return true;
+        if (self.fd >= 0) return self.ready;
 
         var pathbuf: [512]u8 = undefined;
         const path = socketPath(&pathbuf) orelse return false;
@@ -94,10 +137,12 @@ pub const Client = struct {
         @memcpy(addr.sun_path[0..path.len], path);
         const addr_len: c.socklen_t = @intCast(@offsetOf(c.struct_sockaddr_un, "sun_path") + path.len + 1);
         if (c.connect(fd, @ptrCast(&addr), addr_len) != 0) {
+            dbg("connect to {s} failed", .{path});
             _ = c.close(fd);
             return false;
         }
         self.fd = fd;
+        dbg("connected to {s}", .{path});
 
         var hb: [128]u8 = undefined;
         const handshake = std.fmt.bufPrint(&hb, "{{\"v\":1,\"client_id\":\"{d}\"}}", .{self.app_id}) catch {
@@ -105,34 +150,70 @@ pub const Client = struct {
             return false;
         };
         if (!self.writeFrame(.handshake, handshake)) {
+            dbg("handshake write failed", .{});
             self.closeFd();
             return false;
         }
-        // Drain whatever Discord replies (READY). Non-blocking: a missing or
-        // not-yet-arrived reply is fine.
-        var drain: [256]u8 = undefined;
-        _ = c.read(self.fd, &drain, drain.len);
+
+        // Wait briefly (bounded) for the READY ack so we know the handshake
+        // actually connected. Best-effort: a timeout logs but does not tear the
+        // connection down (classic presence clients still send on the socket).
+        var ready_buf: [1024]u8 = undefined;
+        if (self.readFrame(1500, &ready_buf)) |len| {
+            self.ready = true;
+            dbg("READY (opcode 0, {d} bytes): {s}", .{ len, ready_buf[0..@min(len, 160)] });
+        } else {
+            dbg("no READY within 1500ms -- handshake unacknowledged", .{});
+        }
         return true;
     }
 
-    /// Encode + write one RPC frame (8-byte LE header + JSON payload).
-    fn writeFrame(self: *Client, op: Opcode, payload: []const u8) bool {
-        const op32: u32 = @intFromEnum(op);
-        const len32: u32 = @intCast(payload.len);
-        var hdr: [8]u8 = undefined;
-        hdr[0] = @intCast(op32 & 0xff);
-        hdr[1] = @intCast((op32 >> 8) & 0xff);
-        hdr[2] = @intCast((op32 >> 16) & 0xff);
-        hdr[3] = @intCast((op32 >> 24) & 0xff);
-        hdr[4] = @intCast(len32 & 0xff);
-        hdr[5] = @intCast((len32 >> 8) & 0xff);
-        hdr[6] = @intCast((len32 >> 16) & 0xff);
-        hdr[7] = @intCast((len32 >> 24) & 0xff);
+    // ---- frame I/O (non-blocking; poll-bounded so reads can't stall) ----
 
-        const hw = c.write(self.fd, &hdr, hdr.len);
-        if (hw < 0 or @as(usize, @intCast(hw)) != hdr.len) return false;
-        const pw = c.write(self.fd, payload.ptr, payload.len);
-        if (pw < 0 or @as(usize, @intCast(pw)) != payload.len) return false;
+    fn waitReadable(self: *Client, timeout_ms: i32) bool {
+        if (self.fd < 0) return false;
+        var pfd = [_]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const n = std.posix.poll(&pfd, timeout_ms) catch return false;
+        if (n == 0) return false;
+        return (pfd[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR)) != 0;
+    }
+
+    /// Read exactly `buf.len` bytes, looping over partial / EAGAIN reads.
+    fn readExact(self: *Client, buf: []u8, timeout_repeat_ms: i32) bool {
+        var got: usize = 0;
+        while (got < buf.len) {
+            if (!self.waitReadable(timeout_repeat_ms)) return false;
+            const n = std.posix.read(self.fd, buf[got..]) catch |e| switch (e) {
+                error.WouldBlock => continue, // std.posix retries EINTR internally
+                else => return false,
+            };
+            if (n == 0) return false; // peer closed
+            got += n;
+        }
+        return true;
+    }
+
+    /// Read a single IPC frame into `out`, returning the payload length (or
+    /// null on timeout/error).
+    fn readFrame(self: *Client, timeout_ms: i32, out: []u8) ?usize {
+        var hdr: [8]u8 = undefined;
+        if (!self.readExact(&hdr, timeout_ms)) return null;
+        const h = decodeHeader(hdr);
+        if (h.len > out.len) return null;
+        if (!self.readExact(out[0..h.len], timeout_ms)) return null;
+        return h.len;
+    }
+
+    /// Encode + write one RPC frame as a single coalesced write (header + JSON
+    /// payload in one buffer) so a stream socket can never see a partial frame.
+    fn writeFrame(self: *Client, op: Opcode, payload: []const u8) bool {
+        if (payload.len > 4096) return false;
+        var frame: [8 + 4096]u8 = undefined;
+        frame[0..8].* = encodeHeader(@intFromEnum(op), @intCast(payload.len));
+        @memcpy(frame[8 .. 8 + payload.len], payload);
+        const total = 8 + payload.len;
+        const n = c.write(self.fd, &frame, total);
+        if (n < 0 or @as(usize, @intCast(n)) != total) return false;
         return true;
     }
 
@@ -165,13 +246,16 @@ pub const Client = struct {
         else
             std.fmt.bufPrint(&buf, "{{\"cmd\":\"SET_ACTIVITY\",\"args\":{{\"pid\":{d},\"activity\":{{\"type\":2,\"details\":\"{s}\",\"state\":\"{s}\",\"timestamps\":{{\"start\":{d}}}{s}}},\"nonce\":\"fp-{d}\"}}}}", .{
                 self.pid, ed, es, now, assets, self.pid,
-            }))
-        catch {
+            })) catch {
             self.closeFd();
             return;
         };
 
-        if (!self.writeFrame(.frame, payload)) self.closeFd();
+        dbg("SET_ACTIVITY: {s}", .{payload[0..@min(payload.len, 220)]});
+        if (!self.writeFrame(.frame, payload)) {
+            dbg("SET_ACTIVITY write failed", .{});
+            self.closeFd();
+        }
     }
 };
 
@@ -220,4 +304,19 @@ test "setPresence is a no-op when disabled (app_id 0)" {
     defer cl.deinit();
     cl.setPresence("title", "artist", 100.0, null); // must not crash or touch the fd
     try std.testing.expectEqual(@as(c_int, -1), cl.fd);
+}
+
+test "frame header encodes and decodes (little-endian round trip)" {
+    const op: u32 = 1;
+    const len: u32 = 0x01020304;
+    const bytes = encodeHeader(op, len);
+    const h = decodeHeader(bytes);
+    try std.testing.expectEqual(op, h.op);
+    try std.testing.expectEqual(len, h.len);
+
+    // Spot-check byte layout: opcode 1 (SET_ACTIVITY) => [1,0,0,0, ...].
+    const op1 = encodeHeader(1, 4);
+    try std.testing.expectEqual(@as(u8, 1), op1[0]);
+    try std.testing.expectEqual(@as(u8, 0), op1[1]);
+    try std.testing.expectEqual(@as(u8, 4), op1[4]);
 }
