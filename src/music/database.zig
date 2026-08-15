@@ -251,6 +251,37 @@ pub const Database = struct {
         try self.raw.exec("UPDATE albums SET musicbrainz_release_group_id = ? WHERE id = ?;", .{}, .{ mbid, album_id });
     }
 
+    /// Store embedded/folder album art for an album (BLOB + mime).
+    pub fn setAlbumCover(self: *Database, album_id: i64, mime: []const u8, bytes: []const u8) !void {
+        try self.raw.exec(
+            "UPDATE albums SET cover_art_mime = ?, cover_art_block = ? WHERE id = ?;",
+            .{},
+            .{ mime, sqlite.Blob{ .data = bytes }, album_id },
+        );
+    }
+
+    pub const AlbumCover = struct {
+        mime: []const u8,
+        bytes: []const u8,
+    };
+
+    /// Album art for an album, or null if none is stored.
+    pub fn getAlbumCover(self: *Database, album_id: i64) !?AlbumCover {
+        var stmt = try self.raw.prepareDynamic(
+            "SELECT COALESCE(cover_art_mime, ''), cover_art_block FROM albums WHERE id = ?;",
+        );
+        defer stmt.deinit();
+        const Row = struct { mime: []const u8, bytes: ?[]const u8 };
+        const row = try stmt.oneAlloc(Row, self.allocator, .{}, .{ album_id });
+        return if (row) |r|
+            if (r.bytes) |b|
+                if (b.len > 0) .{ .mime = r.mime, .bytes = b } else null
+            else
+                null
+        else
+            null;
+    }
+
     // ---- reads ----
 
     /// Record a playback: bump `play_count` and set `last_played` (epoch secs).

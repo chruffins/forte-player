@@ -27,6 +27,8 @@ pub const Cmd = union(enum) {
     row: struct { y: u16, s: []const u8, selected: bool, playing: bool },
     /// A full-width dim separator line.
     hline: struct { y: u16 },
+    /// Half-block color art grid; `cells` is borrowed (owned by the caller).
+    art: struct { x: u16, y: u16, w: u16, h: u16, cells: []const U.ArtCell },
 };
 
 pub const CmdList = struct {
@@ -53,6 +55,9 @@ pub const CmdList = struct {
     }
     pub fn hline(self: *CmdList, y: u16) void {
         self.add(.{ .hline = .{ .y = y } });
+    }
+    pub fn art(self: *CmdList, x: u16, y: u16, w: u16, h: u16, cells: []const U.ArtCell) void {
+        self.add(.{ .art = .{ .x = x, .y = y, .w = w, .h = h, .cells = cells } });
     }
     fn add(self: *CmdList, c: Cmd) void {
         if (self.n < self.items.len) {
@@ -120,11 +125,18 @@ fn emitHeader(s: *const U.State, cl: *CmdList, width: u16) void {
 fn emitNowPlaying(s: *const U.State, cl: *CmdList, width: u16, height: u16) void {
     const x: u16 = 4;
     const yTitle: u16 = 3;
-    cl.text(x, yTitle, s.title, .title);
+
+    // Album art occupies the right side; the left column of text and the
+    // spectrum are clipped so they never run underneath it.
+    const has_art = s.art.w > 0 and s.art.h > 0 and s.art.cells.len > 0;
+    const art_x: u16 = if (has_art) width -| s.art.w -| 4 else width;
+    const text_max: u16 = art_x -| x -| 2; // max glyphs for a left line
+
+    cl.text(x, yTitle, truncGlyphs(s.title, text_max), .title);
     if (s.artist.len > 0 or s.album.len > 0) {
         var ab: [512]u8 = undefined;
         const line = std.fmt.bufPrint(&ab, "{s}{s}{s}", .{ s.artist, if (s.artist.len > 0 and s.album.len > 0) " - " else "", s.album }) catch "";
-        cl.text(x, yTitle + 1, line, .normal);
+        cl.text(x, yTitle + 1, truncGlyphs(line, text_max), .normal);
     }
 
     // favorite + track time
@@ -136,10 +148,10 @@ fn emitNowPlaying(s: *const U.State, cl: *CmdList, width: u16, height: u16) void
         mmss(s.position, &t1),
         mmss(s.duration, &t2),
     }) catch "";
-    cl.text(x, yTitle + 3, favline, .dim);
+    cl.text(x, yTitle + 3, truncGlyphs(favline, text_max), .dim);
 
     // big progress bar
-    const bw = barWidth(width);
+    const bw = @min(barWidth(width), text_max);
     cl.text(x, yTitle + 5, "progress", .dim);
     cl.bar(x, yTitle + 6, bw, frac(s));
 
@@ -153,23 +165,40 @@ fn emitNowPlaying(s: *const U.State, cl: *CmdList, width: u16, height: u16) void
             .One => "repeat: one",
         },
     }) catch "";
-    cl.text(x, yTitle + 8, rl, .dim);
+    cl.text(x, yTitle + 8, truncGlyphs(rl, text_max), .dim);
 
-    // live spectrum (bars fill the space above the footer)
-    if (s.spectrum.len > 0) {
-        emitSpectrum(cl, x, yTitle + 12, height, s.spectrum);
+    // album art block (right side, above the footer)
+    if (has_art) {
+        const max_rows = height -| footer_rows -| yTitle;
+        if (s.art.h <= max_rows) {
+            cl.art(art_x, yTitle, s.art.w, s.art.h, s.art.cells);
+        }
     }
+
+    // live spectrum (bars fill the space above the footer, left of the art)
+    if (s.spectrum.len > 0) {
+        emitSpectrum(cl, x, yTitle + 12, height, s.spectrum, art_x -| x);
+    }
+}
+
+/// Truncate `s` to at most `max_glyphs` whole UTF-8 glyphs.
+fn truncGlyphs(s: []const u8, max_glyphs: u16) []const u8 {
+    if (s.len == 0 or max_glyphs == 0) return "";
+    var cols: u16 = 0;
+    var i: usize = 0;
+    while (i < s.len and cols < max_glyphs) : (cols += 1) i += glyphLen(s, i);
+    return s[0..i];
 }
 
 /// Terminal spectrum blocks, top row first. `███`-style bars via the 8-level
 /// unicode block set; each column is one band.
 const spectrum_chars = [_][]const u8{ " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
 
-fn emitSpectrum(cl: *CmdList, x: u16, top: u16, height: u16, bands: []const f32) void {
+fn emitSpectrum(cl: *CmdList, x: u16, top: u16, height: u16, bands: []const f32, max_cols: u16) void {
     const avail = height -| footer_rows -| top;
     const rows: u16 = @min(8, avail);
     if (rows < 2) return;
-    const cols: u16 = @min(@as(u16, @intCast(bands.len)), 64);
+    const cols: u16 = @min(@as(u16, @intCast(bands.len)), @min(64, max_cols));
 
     // Precompute each band's cell height in eighth-steps (0..8*rows).
     var levels: [64]u16 = undefined;

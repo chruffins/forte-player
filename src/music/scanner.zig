@@ -9,6 +9,7 @@
 const std = @import("std");
 const al = @import("allegro");
 const database = @import("database.zig");
+const taglib_art = @import("taglib_art.zig");
 
 pub const path_buf_size = std.Io.Dir.max_path_bytes;
 
@@ -63,7 +64,51 @@ pub fn scanDirectory(db: *database.Database, backing: std.mem.Allocator, dir: []
             result.removed += 1;
         }
     }
+
+    // Post-pass: make sure every album that still lacks a cover gets one.
+    // Runs on every scan (not just imports) so covers added to a folder after
+    // an earlier import are picked up, and tries every song of an album (not
+    // just the first) until one yields art.
+    try recoverMissingCovers(db, a);
+
     return result;
+}
+
+/// For each album with no stored cover, try extracting embedded art (or a
+/// folder cover) from its songs until one succeeds. Cheap: only extracts for
+/// albums that still lack a cover, and stops at the first song that yields one.
+/// Album art may live in a later track, or be added to a folder after the
+/// initial import, so this runs on every scan rather than once at import.
+fn recoverMissingCovers(db: *database.Database, a: std.mem.Allocator) !void {
+    const songs = try db.getAllSongs();
+
+    // Sort (album, path) by album id so each album's songs are contiguous.
+    const P = struct { album: i64, path: []const u8 };
+    var list = std.ArrayList(P){ .items = &.{}, .capacity = 0 };
+    defer list.deinit(a);
+    for (songs) |s| try list.append(a, .{ .album = s.album_id, .path = s.path });
+    std.mem.sort(P, list.items, {}, struct {
+        fn lt(_: void, x: P, y: P) bool {
+            return x.album < y.album;
+        }
+    }.lt);
+
+    var i: usize = 0;
+    while (i < list.items.len) {
+        const album = list.items[i].album;
+        var j = i;
+        while (j < list.items.len and list.items[j].album == album) j += 1;
+
+        if (try db.getAlbumCover(album) == null) {
+            for (list.items[i..j]) |p| {
+                if (taglib_art.extract(a, p.path)) |cover| {
+                    try db.setAlbumCover(album, cover.mime, cover.bytes);
+                    break;
+                }
+            }
+        }
+        i = j;
+    }
 }
 
 fn walk(db: *database.Database, a: std.mem.Allocator, dir: []const u8, extractor: Extractor, seen: *std.StringHashMap(void), result: *ScanResult) !void {
@@ -199,4 +244,52 @@ test "scanner: imports files, skips unchanged, removes deleted" {
     r = try scanDirectory(&db, std.testing.allocator, root, fallback_extractor);
     try std.testing.expectEqual(@as(usize, 1), r.removed);
     try std.testing.expectEqual(@as(usize, 0), (try db.getAllSongs()).len);
+}
+
+test "scanner: folder cover extracted on import and recovered on later rescan" {
+    _ = al.init() catch return error.SkipZigTest;
+    const root = "/tmp/forte_cover_test";
+    const album_dir = "/tmp/forte_cover_test/Album";
+    const song = "/tmp/forte_cover_test/Album/track1.ogg";
+    const cover_path = "/tmp/forte_cover_test/Album/cover.jpg";
+
+    // Clean slate. removeFilename is non-recursive, so remove files before the
+    // dirs they live in, or a stale cover from a previous run survives inside
+    // the recreated Album/ dir and this test's "no cover yet" step breaks.
+    _ = al.filesystem.removeFilename(cover_path);
+    _ = al.filesystem.removeFilename(song);
+    _ = al.filesystem.removeFilename(album_dir);
+    _ = al.filesystem.removeFilename(root);
+    _ = al.filesystem.makeDirectory(root);
+    _ = al.filesystem.makeDirectory(album_dir);
+    {
+        var f = al.file.File.open(song, "w") catch return error.Failed;
+        _ = f.close();
+    }
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var db = try database.Database.open(arena.allocator(), null);
+    defer db.deinit();
+
+    // No cover file yet -> first scan imports the song but stores no art.
+    const r = try scanDirectory(&db, std.testing.allocator, root, fallback_extractor);
+    try std.testing.expectEqual(@as(usize, 1), r.imported);
+    const songs = try db.getAllSongs();
+    try std.testing.expectEqual(@as(usize, 1), songs.len);
+    try std.testing.expect(try db.getAlbumCover(songs[0].album_id) == null);
+
+    // User drops a cover.jpg into the folder. The song is unchanged on the
+    // rescan (so it is skipped), but the post-pass must still recover the art.
+    {
+        var f = al.file.File.open(cover_path, "w") catch return error.Failed;
+        _ = f.write("fake-jpeg-bytes");
+        _ = f.close();
+    }
+    const r2 = try scanDirectory(&db, std.testing.allocator, root, fallback_extractor);
+    try std.testing.expectEqual(@as(usize, 1), r2.skipped);
+
+    const cover = (try db.getAlbumCover(songs[0].album_id)) orelse return error.ExpectedCover;
+    try std.testing.expectEqualStrings("image/jpeg", cover.mime);
+    try std.testing.expectEqualStrings("fake-jpeg-bytes", cover.bytes);
 }

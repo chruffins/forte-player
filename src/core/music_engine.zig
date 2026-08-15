@@ -22,9 +22,9 @@
 const std = @import("std");
 const al = @import("allegro");
 const driver_mod = @import("driver.zig");
-const PlayQueue = @import("play_queue.zig").PlayQueue;
-const RepeatMode = @import("play_queue.zig").RepeatMode;
-const PlaybackContextType = @import("play_queue.zig").PlaybackContextType;
+const PlayQueue = @import("../music/play_queue.zig").PlayQueue;
+const RepeatMode = @import("../music/play_queue.zig").RepeatMode;
+const PlaybackContextType = @import("../music/play_queue.zig").PlaybackContextType;
 
 pub const SampleCapture = @import("sample_capture.zig").SampleCapture;
 pub const AllegroDriver = driver_mod.AllegroDriver;

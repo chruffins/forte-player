@@ -9,6 +9,7 @@ const system_libs = [_][]const u8{
     "allegro_audio",
     "allegro_acodec",
     "allegro_dialog",
+    "allegro_memfile",
 };
 
 pub fn build(b: *std.Build) void {
@@ -35,6 +36,18 @@ pub fn build(b: *std.Build) void {
         .{ .name = "sqlite", .module = sqlite },
     };
 
+    // C++ shim exposing TagLib embedded-art extraction. Compiled with the
+    // system g++ (not Zig's clang) because libtag is built against libstdc++
+    // and the std::string ABI must match at the symbol level.
+    const shim_cmd = b.addSystemCommand(&.{ "g++", "-std=c++17", "-c", "src/music/taglib_art.cpp", "-I/usr/include", "-o" });
+    const taglib_art_obj = shim_cmd.addOutputFileArg("taglib_art.o");
+
+    // libtag.so is built with libstdc++; the shim object needs it at link
+    // time too (no libstdc++.so dev symlink on this system, so link the
+    // runtime soname directly).
+    const libstdcpp: std.Build.LazyPath = .{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libstdc++.so.6" };
+    const libgcc_s: std.Build.LazyPath = .{ .cwd_relative = "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1" };
+
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -42,10 +55,15 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = imports,
     });
+    root_mod.addObjectFile(taglib_art_obj);
+    root_mod.addObjectFile(libstdcpp);
+    root_mod.addObjectFile(libgcc_s);
+    root_mod.addIncludePath(.{ .cwd_relative = "src/music" });
+    root_mod.addIncludePath(.{ .cwd_relative = "/usr/include/taglib" });
+    root_mod.linkSystemLibrary("tag", .{});
 
     for (system_libs) |lib| root_mod.linkSystemLibrary(lib, .{});
     maybeUseAllegro(b, root_mod, allegro_prefix);
-    // taglib C bindings (metadata extraction)
     root_mod.addIncludePath(.{ .cwd_relative = "/usr/include/taglib" });
     root_mod.linkSystemLibrary("tag_c", .{});
     const exe = b.addExecutable(.{ .name = "forte-player", .root_module = root_mod });
@@ -59,6 +77,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = imports,
     });
+    tui_mod.addObjectFile(taglib_art_obj);
+    tui_mod.addObjectFile(libstdcpp);
+    tui_mod.addObjectFile(libgcc_s);
+    tui_mod.addIncludePath(.{ .cwd_relative = "src/music" });
+    tui_mod.addIncludePath(.{ .cwd_relative = "/usr/include/taglib" });
+    tui_mod.linkSystemLibrary("tag", .{});
     for (system_libs) |lib| tui_mod.linkSystemLibrary(lib, .{});
     maybeUseAllegro(b, tui_mod, allegro_prefix);
     tui_mod.addIncludePath(.{ .cwd_relative = "/usr/include/taglib" });
@@ -84,6 +108,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = imports,
     });
+    unit_mod.addObjectFile(taglib_art_obj);
+    unit_mod.addObjectFile(libstdcpp);
+    unit_mod.addObjectFile(libgcc_s);
+    unit_mod.addIncludePath(.{ .cwd_relative = "src/music" });
+    unit_mod.addIncludePath(.{ .cwd_relative = "/usr/include/taglib" });
+    unit_mod.linkSystemLibrary("tag", .{});
     for (system_libs) |lib| unit_mod.linkSystemLibrary(lib, .{});
     maybeUseAllegro(b, unit_mod, allegro_prefix);
 

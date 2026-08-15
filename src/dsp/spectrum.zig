@@ -13,6 +13,15 @@ const fft_mod = @import("fft.zig");
 pub const n_samples: usize = 1024;
 /// Number of rendered bars.
 pub const n_bands: usize = 48;
+/// Audio sample rate the FFT assumes (matches the engine's voice/mixer rate).
+pub const default_sample_rate: u32 = 44100;
+
+/// Optional perceptual frequency weighting applied per band, before the final
+/// scale/clamp. `a_weight` is the standard SSPL "A" curve: heavy low bass and
+/// the very high treble are attenuated relative to the ~1 kHz midrange, so the
+/// bars more closely track what the ear actually perceives as loud.
+/// `none` leaves the raw magnitude spectrum untouched.
+pub const Weighting = enum { none, a_weight };
 
 /// Per-band envelope with automatic gain control: attack is instant (follow
 /// the peak up), decay is slow, and the whole spectrum is normalized against a
@@ -40,7 +49,17 @@ pub const Smoother = struct {
 
 /// Compute `n_bands` log-spaced band magnitudes in [0,1] from `samples`
 /// (0 < len <= n_samples; shorter input is zero-padded).
+/// Compute A-weighted bar bands at the engine's default sample rate. This is
+/// what the visualizer uses; see `computeBandsEx` for the full control knob.
 pub fn computeBands(samples: []const f32, bands: *[n_bands]f32) void {
+    computeBandsEx(samples, bands, default_sample_rate, .a_weight);
+}
+
+/// Compute `n_bands` log-spaced band magnitudes in [0,1] from `samples`
+/// (0 < len <= n_samples; shorter input is zero-padded). Optionally applies an
+/// A-weight gain per band (based on its center frequency) before the final
+/// scale/clamp.
+pub fn computeBandsEx(samples: []const f32, bands: *[n_bands]f32, rate: u32, weighting: Weighting) void {
     var re: [n_samples]f32 = [_]f32{0} ** n_samples;
     var im: [n_samples]f32 = [_]f32{0} ** n_samples;
 
@@ -73,12 +92,35 @@ pub fn computeBands(samples: []const f32, bands: *[n_bands]f32) void {
             cnt += 1;
         }
         bands[b] = if (cnt > 0) acc / @as(f32, @floatFromInt(cnt)) else 0.0;
+
+        // Perceptual weighting from the band's center frequency.
+        if (weighting == .a_weight) {
+            const center_bin: f32 = (@as(f32, @floatFromInt(first)) + @as(f32, @floatFromInt(last))) * 0.5;
+            const freq = center_bin * @as(f32, @floatFromInt(rate)) / @as(f32, n_samples);
+            bands[b] *= aWeightGain(freq);
+        }
     }
 
     // Normalize: scale so typical music sits comfortably below 1.0.
     for (bands) |*v| {
         v.* = @min(v.* * 6.0, 1.0);
     }
+}
+
+/// A-weighting as a linear amplitude gain for a frequency in Hz. The standard
+/// SSPL 'A' curve is roughly flat (~0 dB) around 1 kHz and rolls off hard in
+/// the bass (≈ -20 dB at 120 Hz). Returns a fraction in (0, 1] for audible
+/// frequencies.
+fn aWeightGain(freq: f32) f32 {
+    const f2 = freq * freq;
+    const num = 12194.0 * 12194.0 * f2 * f2;
+    const fa = f2 + 20.6 * 20.6;
+    const fb = f2 + 107.7 * 107.7;
+    const fc = f2 + 737.9 * 737.9;
+    const fd = f2 + 12194.0 * 12194.0;
+    const r = num / (fa * @sqrt(fb * fc) * fd);
+    const db = 20.0 * @log10(r) + 2.0;
+    return std.math.pow(f32, 10.0, db / 20.0);
 }
 
 test "computeBands: silence yields silence" {
@@ -141,4 +183,58 @@ test "smoother: AGC normalizes loudness with fast attack, slow decay" {
     sm2.update(&raw2);
     try std.testing.expect(sm2.levels[3] < before);
     try std.testing.expect(sm2.levels[3] > 0.0);
+}
+
+fn findMax(bands: []const f32) f32 {
+    var m: f32 = 0.0;
+    for (bands) |v| m = @max(m, v);
+    return m;
+}
+
+test "A-weighting gain: flat near 1kHz, rolled off in the bass and treble" {
+    // ~0 dB (gain ~1.0) near 1 kHz, where the A curve is flat.
+    try std.testing.expect(@abs(aWeightGain(1000.0) - 1.0) < 0.05);
+    // Strong attenuation in the bass (~-20 dB at 120 Hz).
+    try std.testing.expect(aWeightGain(120.0) < 0.2);
+    // Some roll-off in the treble too (relative to the 1 kHz reference).
+    try std.testing.expect(aWeightGain(10000.0) < aWeightGain(1000.0));
+}
+
+test "A-weighted bands attenuate a low-frequency tone vs a mid one" {
+    const rate: u32 = 44100;
+    var samples: [n_samples]f32 = undefined;
+
+    // Fill the window with a tone. Same peak amplitude for both tones.
+    const fill = struct {
+        fn go(freq: f32, ratev: u32, out: *[n_samples]f32) void {
+            for (0..n_samples) |i| {
+                out[i] = @sin(2.0 * std.math.pi * freq * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(ratev))) * 0.5;
+            }
+        }
+    }.go;
+
+    fill(120.0, rate, &samples);
+    var low_raw: [n_bands]f32 = undefined;
+    var low_w: [n_bands]f32 = undefined;
+    computeBandsEx(&samples, &low_raw, rate, .none);
+    computeBandsEx(&samples, &low_w, rate, .a_weight);
+
+    fill(1000.0, rate, &samples);
+    var mid_raw: [n_bands]f32 = undefined;
+    var mid_w: [n_bands]f32 = undefined;
+    computeBandsEx(&samples, &mid_raw, rate, .none);
+    computeBandsEx(&samples, &mid_w, rate, .a_weight);
+
+    // Unweighted, equal-amplitude tones both register (raw spectrum doesn't
+    // zero out either).
+    try std.testing.expect(findMax(&low_raw) > 0.4);
+    try std.testing.expect(findMax(&mid_raw) > 0.4);
+
+    // A-weighting cuts the 120 Hz tone's peak ~5x (0.73 -> 0.15) while leaving
+    // the 1 kHz tone essentially untouched (0.49 -> 0.50), which is exactly the
+    // perceptual loudness shaping it should apply.
+    const low_reduction = findMax(&low_raw) / findMax(&low_w);
+    const mid_reduction = findMax(&mid_raw) / findMax(&mid_w);
+    try std.testing.expect(low_reduction > 2.5);
+    try std.testing.expect(mid_reduction < 1.5);
 }

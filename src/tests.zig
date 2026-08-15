@@ -6,7 +6,7 @@ test {
 }
 
 test {
-    _ = @import("core/play_queue.zig");
+    _ = @import("music/play_queue.zig");
 }
 
 test {
@@ -14,19 +14,23 @@ test {
 }
 
 test {
-    _ = @import("core/discord_rpc.zig");
+    _ = @import("integrations/discord_rpc.zig");
 }
 
 test {
-    _ = @import("core/cover_resolver.zig");
+    _ = @import("integrations/cover_resolver.zig");
 }
 
 test {
-    _ = @import("core/fft.zig");
+    _ = @import("dsp/fft.zig");
 }
 
 test {
-    _ = @import("core/spectrum.zig");
+    _ = @import("dsp/spectrum.zig");
+}
+
+test {
+    _ = @import("ui/cover_art.zig");
 }
 
 test {

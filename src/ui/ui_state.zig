@@ -5,7 +5,7 @@
 //! scroll) and receives a `Cmd` describing the player operation to execute.
 
 const std = @import("std");
-const RepeatMode = @import("../core/play_queue.zig").RepeatMode;
+const RepeatMode = @import("../music/play_queue.zig").RepeatMode;
 
 pub const Screen = enum { now_playing, library };
 
@@ -70,11 +70,29 @@ pub const State = struct {
     /// Per-band magnitudes in [0,1] for the TUI spectrum (empty = hidden).
     spectrum: []const f32 = &.{},
 
+    // ---- album art snapshot ----
+    /// Downsampled cover grid (half-block cells) for Now Playing.
+    art: Art = .{},
+
     // ---- library snapshot ----
     /// Number of selectable songs (index 0..row_count-1 valid).
     row_count: usize = 0,
     /// Index (in the library) of the currently-playing song, if known.
     playing_index: ?usize = null,
+};
+
+/// One half-block art cell: upper pixel color (fg) + lower pixel color (bg),
+/// rendered with the '▀' character so each cell shows two full-color pixels.
+pub const ArtCell = struct {
+    fg: [3]u8,
+    bg: [3]u8,
+};
+
+/// A downsampled cover grid (w x h cells). Empty when no art is available.
+pub const Art = struct {
+    w: u16 = 0,
+    h: u16 = 0,
+    cells: []const ArtCell = &.{},
 };
 
 /// Pure reducer. `visible` is the number of library rows that fit in the main

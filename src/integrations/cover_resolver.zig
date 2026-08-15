@@ -29,6 +29,8 @@ pub const CoverResolver = struct {
     threaded: std.Io.Threaded,
     client: std.http.Client,
     cache: std.AutoHashMapUnmanaged(i64, Entry) = .{},
+    /// Fetched cover image bytes per album (empty slice = tried, no image).
+    image_cache: std.AutoHashMapUnmanaged(i64, []const u8) = .{},
     pending: std.ArrayList(i64) = .{ .items = &.{}, .capacity = 0 },
     pending_album: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 },
     pending_artist: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 },
@@ -81,6 +83,9 @@ pub const CoverResolver = struct {
             else => {},
         };
         self.cache.deinit(self.allocator);
+        var iit = self.image_cache.valueIterator();
+        while (iit.next()) |bytes| self.allocator.free(bytes.*);
+        self.image_cache.deinit(self.allocator);
         self.pending.deinit(self.allocator);
         self.pending_album.deinit(self.allocator);
         self.pending_artist.deinit(self.allocator);
@@ -103,6 +108,31 @@ pub const CoverResolver = struct {
             .ok => |url| url,
             else => null,
         };
+    }
+
+    /// The decoded cover image bytes for an album, fetching them on first use
+    /// (follows the Cover Art Archive redirect). An empty slice means "tried,
+    /// no image" and is cached so we don't re-fetch. Best-effort.
+    pub fn coverImageBytes(self: *CoverResolver, album_id: i64) ?[]const u8 {
+        if (self.image_cache.get(album_id)) |bytes| return bytes;
+        const url = self.coverUrlFor(album_id) orelse return null;
+
+        var buf: [2 << 20]u8 = undefined; // CAA front covers are well under 2MB
+        var w = std.Io.Writer.fixed(&buf);
+        const bytes: []const u8 = blk: {
+            const res = self.client.fetch(.{
+                .location = .{ .url = url },
+                .headers = .{ .user_agent = .{ .override = user_agent } },
+                .response_writer = &w,
+            }) catch break :blk "";
+            break :blk if (res.status == .ok) buf[0..w.end] else "";
+        };
+        const stored = self.allocator.dupe(u8, bytes) catch return null;
+        self.image_cache.put(self.allocator, album_id, stored) catch {
+            self.allocator.free(stored);
+            return null;
+        };
+        return stored;
     }
 
     /// Run at most one lookup, respecting the rate limit. Returns true if a

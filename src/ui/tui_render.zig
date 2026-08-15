@@ -10,6 +10,7 @@
 const std = @import("std");
 const view = @import("ui_view.zig");
 const theme = @import("theme.zig");
+const U = @import("ui_state.zig");
 
 const cterm = @cImport({
     @cInclude("termios.h");
@@ -25,13 +26,23 @@ const Cell = struct {
     chars: [4]u8 = .{ ' ', 0, 0, 0 },
     len: u8 = 1,
     style: Style = .normal,
+    /// Truecolor foreground/background overrides (for half-block art).
+    fg: ?[3]u8 = null,
+    bg: ?[3]u8 = null,
 
     fn eql(a: Cell, b: Cell) bool {
         if (a.len != b.len or a.style != b.style) return false;
+        if (!optRgbEql(a.fg, b.fg) or !optRgbEql(a.bg, b.bg)) return false;
         for (0..a.len) |k| if (a.chars[k] != b.chars[k]) return false;
         return true;
     }
 };
+
+fn optRgbEql(a: ?[3]u8, b: ?[3]u8) bool {
+    const aa = a orelse return (b == null);
+    const bb = b orelse return false;
+    return aa[0] == bb[0] and aa[1] == bb[1] and aa[2] == bb[2];
+}
 
 fn blankCell() Cell {
     return .{ .chars = .{ ' ', 0, 0, 0 }, .len = 1, .style = .normal };
@@ -176,6 +187,21 @@ fn setCell(x: usize, y: usize, chars: []const u8, st: Style) void {
     for (0..n) |k| c.chars[k] = chars[k];
     c.len = @intCast(n);
     c.style = st;
+    c.fg = null;
+    c.bg = null;
+}
+
+/// Like `setCell` but with per-cell truecolor overrides (half-block art).
+fn setCellRgb(x: usize, y: usize, chars: []const u8, st: Style, fg: [3]u8, bg: [3]u8) void {
+    if (y >= g_h or x >= g_w) return;
+    const c = &g_cur[y * g_w + x];
+    @memset(&c.chars, 0);
+    const n = @min(chars.len, 4);
+    for (0..n) |k| c.chars[k] = chars[k];
+    c.len = @intCast(n);
+    c.style = st;
+    c.fg = fg;
+    c.bg = bg;
 }
 
 fn blitStr(x: usize, y: usize, s: []const u8, st: Style) void {
@@ -203,6 +229,19 @@ fn blitBar(x: usize, y: usize, w: usize, frac: f32) void {
 fn blitHline(y: usize) void {
     if (y >= g_h) return;
     for (0..g_w) |x| setCell(x, y, "-", .dim);
+}
+
+/// Half-block art: every cell draws the '▀' glyph with the cell's fg as the
+/// upper pixel and bg as the lower pixel (two full-color pixels per cell).
+fn blitArt(x: usize, y: usize, w: usize, h: usize, cells: []const U.ArtCell) void {
+    if (y >= g_h) return;
+    for (0..h) |yy| {
+        if (y + yy >= g_h) break;
+        for (0..w) |xx| {
+            const c = cells[yy * w + xx];
+            setCellRgb(x + xx, y + yy, "▀", .normal, c.fg, c.bg);
+        }
+    }
 }
 
 fn blitRow(y: usize, s: []const u8, selected: bool, playing: bool) void {
@@ -234,11 +273,17 @@ fn flush() void {
         if (same) continue;
         pos(0, y);
         var cur_style: ?Style = null;
+        var cur_fg: ?[3]u8 = null;
+        var cur_bg: ?[3]u8 = null;
         for (0..g_w) |x| {
             const c = g_cur[lo + x];
-            if (cur_style == null or cur_style.? != c.style) {
+            if (cur_style == null or cur_style.? != c.style or !optRgbEql(cur_fg, c.fg) or !optRgbEql(cur_bg, c.bg)) {
                 cur_style = c.style;
+                cur_fg = c.fg;
+                cur_bg = c.bg;
                 termWrite(styleSgr(c.style));
+                if (c.fg) |f| termPrint("\x1b[38;2;{d};{d};{d}m", .{ f[0], f[1], f[2] });
+                if (c.bg) |b| termPrint("\x1b[48;2;{d};{d};{d}m", .{ b[0], b[1], b[2] });
             }
             termWrite(c.chars[0..c.len]);
         }
@@ -261,6 +306,7 @@ pub fn render(cmds: []const view.Cmd, width: usize, height: usize) void {
         .bar => |b| blitBar(b.x, b.y, @min(b.width, width -| 4), b.frac),
         .row => |r| blitRow(r.y, r.s, r.selected, r.playing),
         .hline => |h| blitHline(h.y),
+        .art => |a| blitArt(a.x, a.y, a.w, a.h, a.cells),
     };
     flush();
 }

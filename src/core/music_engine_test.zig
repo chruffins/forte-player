@@ -4,7 +4,7 @@
 const std = @import("std");
 const al = @import("allegro");
 const music = @import("music_engine.zig");
-const PlayQueue = @import("play_queue.zig").PlayQueue;
+const PlayQueue = @import("../music/play_queue.zig").PlayQueue;
 const FakeEngine = music.MusicEngine(music.FakeDriver);
 
 /// A driver identical to `FakeDriver` except that `load` fails for any path
