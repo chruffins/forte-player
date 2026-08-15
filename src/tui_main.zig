@@ -13,6 +13,7 @@ const app_mod = @import("app.zig");
 const cover_resolver = @import("integrations/cover_resolver.zig");
 const cover_art = @import("ui/cover_art.zig");
 const discord_rpc = @import("integrations/discord_rpc.zig");
+const lastfm = @import("integrations/lastfm.zig");
 const spectrum = @import("dsp/spectrum.zig");
 
 const U = @import("ui/ui_state.zig");
@@ -36,6 +37,7 @@ const TuiUser = struct {
     app: *app_mod.App,
     discord: *discord_rpc.Client,
     resolver: *cover_resolver.CoverResolver,
+    scrobbler: ?*lastfm.Scrobbler,
     details_format: []const u8,
 };
 
@@ -59,6 +61,8 @@ fn onSongChanged(user_ctx: *anyopaque, path: [:0]const u8) void {
 
     // Queue a MusicBrainz cover lookup for this album (runs on resolver.tick()).
     u.resolver.enqueue(album_id, album, artist);
+    // Record the track start for Last.fm scrobbling (submits once eligible).
+    if (u.scrobbler) |s| s.onSongStarted(id, artist, title, album);
     pushPresence(u, title, artist, album, album_id, app.engine.getDuration());
 }
 
@@ -195,10 +199,21 @@ pub fn main() !void {
         return;
     };
     defer resolver.destroy();
+
+    // Last.fm scrobbling (best-effort; disabled unless credentials are set).
+    const scrobbler = lastfm.Scrobbler.init(
+        allocator,
+        app.config.getLastFmApiKey(),
+        app.config.getLastFmSharedSecret(),
+        app.config.getLastFmSessionKey(),
+    );
+    defer if (scrobbler) |s| s.destroy();
+
     var tui_user = TuiUser{
         .app = app,
         .discord = &discord,
         .resolver = resolver,
+        .scrobbler = scrobbler,
         .details_format = app.config.getDiscordDetailsFormat(),
     };
     // Wire the TUI-specific per-song work (presence + cover lookup) in.
@@ -314,6 +329,9 @@ pub fn main() !void {
             }
 
             fillState(&st, app, album_rows.items);
+
+            // Last.fm: submit the current track the moment it's played enough.
+            if (scrobbler) |s| s.tick(st.playing, st.position, st.duration);
 
             // Refresh the spectrum from the newest captured mono samples.
             const got = app.engine.copyRecentMono(sample_buf.len, &sample_buf);

@@ -158,6 +158,9 @@ pub const Config = struct {
         self.setInt("display", "height", 300);
         self.setInt("discord", "application_id", 0);
         self.setInt("audio", "volume_percent", 100);
+        self.setStr("lastfm", "api_key", "");
+        self.setStr("lastfm", "shared_secret", "");
+        self.setStr("lastfm", "session_key", "");
     }
 
     // ---- typed accessors ----
@@ -220,6 +223,26 @@ pub const Config = struct {
 
     pub fn setVolumePercent(self: *Config, percent: i32) void {
         self.setInt("audio", "volume_percent", clamp(percent, 0, 100));
+    }
+
+    // ---- Last.fm scrobbling credentials ----
+
+    pub fn getLastFmApiKey(self: *const Config) []const u8 {
+        return self.getStr("lastfm", "api_key", "");
+    }
+    pub fn getLastFmSharedSecret(self: *const Config) []const u8 {
+        return self.getStr("lastfm", "shared_secret", "");
+    }
+    pub fn getLastFmSessionKey(self: *const Config) []const u8 {
+        return self.getStr("lastfm", "session_key", "");
+    }
+    /// Persist a freshly-exchanged session key so future runs scrobble directly.
+    pub fn setLastFmSessionKey(self: *Config, key: []const u8) void {
+        var buf: [64:0]u8 = undefined;
+        if (key.len >= buf.len) return;
+        @memcpy(buf[0..key.len], key);
+        buf[key.len] = 0;
+        self.setStr("lastfm", "session_key", buf[0..key.len :0]);
     }
 };
 

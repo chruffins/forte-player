@@ -31,9 +31,20 @@ pub fn build(b: *std.Build) void {
     const sdep = b.dependency("sqlite", .{ .target = target, .optimize = optimize });
     const sqlite = sdep.module("sqlite");
 
+    // zscrob (local Zig rewrite of libscrob) for Last.fm scrobbling. Its build
+    // doesn't publish a module, so root a module at its source path.
+    const zscrob_dep = b.dependency("zscrob", .{ .target = target, .optimize = optimize });
+    const zscrob = b.createModule(.{
+        .root_source_file = zscrob_dep.path("src/libscrobbler.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     const imports: []const std.Build.Module.Import = &.{
         .{ .name = "allegro", .module = allegro },
         .{ .name = "sqlite", .module = sqlite },
+        .{ .name = "zscrob", .module = zscrob },
     };
 
     // C++ shim exposing TagLib embedded-art extraction. Compiled with the

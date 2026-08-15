@@ -22,6 +22,10 @@ test {
 }
 
 test {
+    _ = @import("integrations/lastfm.zig");
+}
+
+test {
     _ = @import("dsp/fft.zig");
 }
 
