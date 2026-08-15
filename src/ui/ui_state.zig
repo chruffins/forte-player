@@ -165,6 +165,12 @@ pub fn apply(self: *State, action: Action, visible: usize) Cmd {
                 const id = self.albums[self.selection].id;
                 self.album_detail_id = id;
                 self.screen = .album_detail;
+                // The cursor was an album index; reset to the first track so the
+                // highlighted row in the detail view is actually track 0 (and
+                // enter plays it). Otherwise the stale album index leaks in as
+                // a wrong/out-of-range track selection.
+                self.selection = 0;
+                self.scroll = 0;
                 return .{ .open_album_detail = id };
             }
             if (self.screen == .album_detail and self.album_detail_count > 0) {
@@ -338,6 +344,9 @@ test "reducer: album screen enter opens detail; detail enter plays a track" {
     try std.testing.expectEqual(@as(Cmd, .{ .open_album_detail = 11 }), open);
     try std.testing.expectEqual(Screen.album_detail, st.screen);
     try std.testing.expectEqual(@as(i64, 11), st.album_detail_id);
+    // The cursor must reset to the first track (not inherit the album index).
+    try std.testing.expectEqual(@as(usize, 0), st.selection);
+    try std.testing.expectEqual(@as(usize, 0), st.scroll);
 
     // Back returns to the album list.
     _ = apply(&st, .back, 10);
