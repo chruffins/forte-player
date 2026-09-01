@@ -24,10 +24,15 @@ pub fn build(b: *std.Build) void {
     // added to the linker search path AND to the runtime search path of the
     // produced binaries so they load that build instead of the distro's.
     //   zig build -Dallegro_prefix=/path/to/allegro
-    // Use the system Allegro by default so the project is portable. For MP3
-    // support, pass a custom Allegro install (for example the streaming build
-    // described in the README) with `-Dallegro_prefix=<path>`.
-    const default_allegro_prefix = "";
+    // Prefer the user's local streaming Allegro build on Linux when it exists;
+    // this keeps the normal development command MP3-capable without baking a
+    // machine-specific home directory into the project. Other platforms and
+    // machines fall back to system Allegro. Override with
+    // `-Dallegro_prefix=<path>` when using another installation.
+    const default_allegro_prefix = if (target.result.os.tag == .linux)
+        if (b.graph.environ_map.get("HOME")) |home| b.fmt("{s}/.local/forte-allegro-streaming", .{home}) else ""
+    else
+        "";
     const allegro_prefix = b.option([]const u8, "allegro_prefix", "Prefix of a custom Allegro 5 install (adds <prefix>/lib to link + rpath)") orelse default_allegro_prefix;
     const taglib_prefix = b.option([]const u8, "taglib_prefix", "TagLib installation prefix (for example /usr or /opt/homebrew/opt/taglib)") orelse "/usr";
     const cxx = b.option([]const u8, "cxx", "C++ compiler used for the TagLib shim") orelse if (target.result.os.tag == .macos) "clang++" else "g++";
