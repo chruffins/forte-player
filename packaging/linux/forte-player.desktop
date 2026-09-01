@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=forte-player
+Comment=Music player
+Exec=forte-player
+Terminal=false
+Categories=Audio;AudioVideo;Player;

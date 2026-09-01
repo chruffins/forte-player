@@ -268,6 +268,8 @@ test "playNext skips songs that cannot be loaded" {
     try std.testing.expect(engine.isPlaying());
     // len("ok2") = 3 -> duration 4
     try std.testing.expectEqual(@as(f64, 4.0), engine.getDuration());
+    // The failed middle track is not inserted into previous() history.
+    try std.testing.expectEqual(@as(?i32, 0), queue.previous());
 }
 
 test "playNext with only unloadable songs left returns false, keeps current playing" {
@@ -283,4 +285,7 @@ test "playNext with only unloadable songs left returns false, keeps current play
     // playNext: next is "bad1" (skip) then end-of-queue (repeat off) -> false.
     try std.testing.expect(!try engine.playNext());
     try std.testing.expect(engine.isPlaying()); // current song still playing
+    // The failed transition must not consume the queue cursor/history.
+    try std.testing.expectEqual(@as(?i32, 0), queue.current());
+    try std.testing.expectEqual(@as(?i32, null), queue.previous());
 }

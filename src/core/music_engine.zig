@@ -47,6 +47,9 @@ pub fn MusicEngine(comptime Drv: type) type {
 
         /// Optional external queue the current stream's event source registers onto.
         event_queue: ?*al.events.EventQueue = null,
+        /// Registered source for the current stream; unregister before the
+        /// stream is destroyed so the queue cannot retain a dead source.
+        stream_event_source: ?al.events.EventSource = null,
 
         /// Opaque context forwarded to the hook callbacks (e.g. the Library).
         user_context: ?*anyopaque = null,
@@ -84,8 +87,16 @@ pub fn MusicEngine(comptime Drv: type) type {
             return self;
         }
 
+        fn unregisterStreamSource(self: *Self) void {
+            if (self.event_queue) |q| {
+                if (self.stream_event_source) |*src| q.unregisterSource(src);
+            }
+            self.stream_event_source = null;
+        }
+
         pub fn destroy(self: *Self) void {
             const allocator = self.allocator;
+            self.unregisterStreamSource();
             if (self.stream) |*s| s.destroy();
             self.drv.deinit();
             allocator.destroy(self.drv);
@@ -102,6 +113,7 @@ pub fn MusicEngine(comptime Drv: type) type {
             var stream = try self.drv.load(path);
             errdefer stream.destroy();
 
+            self.unregisterStreamSource();
             if (self.stream) |*old| old.destroy();
             self.stream = null;
 
@@ -112,8 +124,8 @@ pub fn MusicEngine(comptime Drv: type) type {
 
             if (self.event_queue) |q| {
                 if (self.drv.streamEventSource(&stream)) |src| {
-                    var src_mut = src;
-                    q.registerSource(&src_mut);
+                    self.stream_event_source = src;
+                    if (self.stream_event_source) |*src_mut| q.registerSource(src_mut);
                 }
             }
 
@@ -130,6 +142,7 @@ pub fn MusicEngine(comptime Drv: type) type {
         }
 
         pub fn stop(self: *Self) void {
+            self.unregisterStreamSource();
             if (self.stream) |*s| {
                 _ = s.setPlaying(false);
                 s.destroy();
@@ -188,6 +201,9 @@ pub fn MusicEngine(comptime Drv: type) type {
         pub fn bufferedCount(self: *const Self) usize {
             return self.drv.bufferedCount();
         }
+        pub fn captureSequence(self: *const Self) u64 {
+            return self.drv.captureSequence();
+        }
         pub fn copyRecentMono(self: *const Self, max_frames: usize, out: []f32) usize {
             return self.drv.copyRecentMono(max_frames, out);
         }
@@ -210,22 +226,44 @@ pub fn MusicEngine(comptime Drv: type) type {
         /// a dead next entry used to kill the currently-playing stream too.
         pub fn playNext(self: *Self) !bool {
             const q = self.queue orelse return false;
+            const initial = q.cursor();
             const total = q.size();
             var attempts: usize = 0;
             while (attempts < total) : (attempts += 1) {
-                const id = (try q.next()) orelse return false;
+                const id = q.next() catch |err| {
+                    q.restore(initial);
+                    return err;
+                } orelse break;
                 const path = self.resolveSongPath(id) orelse continue;
-                self.playSound(path) catch continue;
-                return true;
+                if (self.playSound(path)) |_| {
+                    // `next()` may have skipped one or more undecodable files.
+                    // Commit only the successfully loaded destination so those
+                    // failed files do not pollute previous() history.
+                    const destination = q.currentIndex();
+                    q.restore(initial);
+                    try q.commitIndex(destination);
+                    return true;
+                } else |_| {}
             }
+            // A failed transition must leave both playback and queue state as
+            // they were before the attempt.
+            q.restore(initial);
             return false;
         }
 
         /// Move to the previous song from play history and start it (no-op if none).
         pub fn playPrevious(self: *Self) !void {
             const q = self.queue orelse return;
+            const initial = q.cursor();
             const id = q.previous() orelse return;
-            if (self.resolveSongPath(id)) |path| try self.playSound(path);
+            const path = self.resolveSongPath(id) orelse {
+                q.restore(initial);
+                return;
+            };
+            self.playSound(path) catch |err| {
+                q.restore(initial);
+                return err;
+            };
         }
 
         /// End-of-song handling: fire the hook, then auto-advance according to the

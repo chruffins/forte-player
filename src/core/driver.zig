@@ -95,6 +95,9 @@ pub const AllegroDriver = struct {
     pub fn bufferedCount(self: *const AllegroDriver) usize {
         return self.capture.getSize();
     }
+    pub fn captureSequence(self: *const AllegroDriver) u64 {
+        return self.capture.sequence();
+    }
     pub fn copyRecentMono(self: *const AllegroDriver, max_frames: usize, out: []f32) usize {
         return self.capture.copyRecentMono(max_frames, out);
     }
@@ -175,6 +178,9 @@ pub const FakeDriver = struct {
     pub fn setSampleBufferCapacity(_: *FakeDriver, _: usize) !void {}
     pub fn enableCapture(_: *FakeDriver, _: bool) void {}
     pub fn bufferedCount(_: *const FakeDriver) usize {
+        return 0;
+    }
+    pub fn captureSequence(_: *const FakeDriver) u64 {
         return 0;
     }
     pub fn copyRecentMono(_: *const FakeDriver, _: usize, out: []f32) usize {

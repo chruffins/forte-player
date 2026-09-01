@@ -15,5 +15,6 @@ taglib_art.o
 # pi session state
 .pi/
 
-# local progress notes (not committed per request)
+# local agent notes
 PROGRESS.md
+context.md

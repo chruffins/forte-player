@@ -7,13 +7,16 @@
 const std = @import("std");
 const RepeatMode = @import("../music/play_queue.zig").RepeatMode;
 
-pub const Screen = enum { now_playing, library, albums, album_detail };
+pub const Screen = enum { now_playing, library, albums, album_detail, artists, artist_detail, genres, genre_detail, playlists, playlist_detail, queue, settings };
 
 /// A row in the album-detail track list.
 pub const AlbumTrackRow = struct {
     title: []const u8,
-    track: i64,
-    song_id: i64,
+    artist: []const u8 = "",
+    track: i64 = 0,
+    disc_number: i64 = 1,
+    duration: i64 = 0,
+    song_id: i64 = -1,
 };
 
 /// A playable album row for the album browser.
@@ -25,6 +28,11 @@ pub const AlbumRow = struct {
     track_count: i64,
     has_cover: bool,
 };
+
+pub const ArtistRow = struct { id: i64, name: []const u8, song_count: i64, album_count: i64 };
+pub const GenreRow = struct { id: i64, name: []const u8, song_count: i64 };
+pub const PlaylistRow = struct { id: i64, name: []const u8, description: []const u8 = "", song_count: i64 };
+pub const QueueRow = struct { song_id: i64, title: []const u8, artist: []const u8 = "" };
 
 /// A player operation the UI glue must run against the engine.
 pub const Cmd = union(enum) {
@@ -45,6 +53,18 @@ pub const Cmd = union(enum) {
     open_album_detail: i64,
     /// Play the album-detail track at this index (seek into the album).
     play_track_in_album: usize,
+    /// Play all songs belonging to an artist or genre.
+    play_artist: i64,
+    play_genre: i64,
+    open_artist_detail: i64,
+    play_artist_track: usize,
+    open_genre_detail: i64,
+    play_genre_track: usize,
+    /// Open/playlist-detail operations.
+    open_playlist_detail: i64,
+    play_playlist_track: usize,
+    play_playlist: i64,
+    play_queue_index: usize,
 };
 
 /// Semantic input (frontends map raw keys to these).
@@ -60,6 +80,11 @@ pub const Action = enum {
     goto_nowplaying,
     goto_library,
     goto_albums,
+    goto_artists,
+    goto_genres,
+    goto_playlists,
+    goto_queue,
+    goto_settings,
     back,
     select_up,
     toggle_favorite,
@@ -98,10 +123,13 @@ pub const State = struct {
     // ---- album art snapshot ----
     /// Downsampled cover grid (half-block cells) for Now Playing.
     art: Art = .{},
+    art_status: ArtStatus = .none,
 
     // ---- library snapshot ----
     /// Number of selectable library songs (index 0..row_count-1 valid).
     row_count: usize = 0,
+    library_filter: []const u8 = "",
+    library_searching: bool = false,
     /// Index (in the library) of the currently-playing song, if known.
     playing_index: ?usize = null,
 
@@ -114,8 +142,13 @@ pub const State = struct {
     playing_album_id: i64 = -1,
     /// Label for the current album-list sort (e.g. "name"), for the header.
     album_sort_label: []const u8 = "",
+    /// Current album-browser search filter.
+    album_filter: []const u8 = "",
+    album_searching: bool = false,
 
     // ---- album detail snapshot ----
+    album_art: Art = .{},
+    album_art_status: ArtStatus = .none,
     /// Album id whose tracks are shown on the album_detail screen.
     album_detail_id: i64 = -1,
     /// Track rows for the open album (borrowed from the caller).
@@ -123,6 +156,63 @@ pub const State = struct {
     album_detail_count: usize = 0,
     /// Index (into album_detail_tracks) of the currently-playing track, if known.
     album_detail_playing: ?usize = null,
+
+    // ---- artist / genre browser snapshots ----
+    artists: []const ArtistRow = &.{},
+    artist_count: usize = 0,
+    artist_detail_id: i64 = -1,
+    artist_detail_name: []const u8 = "",
+    artist_detail_tracks: []const AlbumTrackRow = &.{},
+    artist_detail_count: usize = 0,
+    genres: []const GenreRow = &.{},
+    genre_count: usize = 0,
+    genre_detail_id: i64 = -1,
+    genre_detail_name: []const u8 = "",
+    genre_detail_tracks: []const AlbumTrackRow = &.{},
+    genre_detail_count: usize = 0,
+    filter: []const u8 = "",
+    searching: bool = false,
+
+    // ---- playlist detail snapshot ----
+    playlist_detail_id: i64 = -1,
+    playlist_detail_name: []const u8 = "",
+    playlist_detail_tracks: []const AlbumTrackRow = &.{},
+    playlist_detail_count: usize = 0,
+
+    // ---- queue snapshot ----
+    playlists: []const PlaylistRow = &.{},
+    playlist_count: usize = 0,
+    queue: []const QueueRow = &.{},
+    queue_count: usize = 0,
+    queue_current_index: ?usize = null,
+    queue_context_label: []const u8 = "Queue",
+
+    // ---- metadata editor snapshot ----
+    metadata_editing: bool = false,
+    metadata_field: []const u8 = "",
+    metadata_value: []const u8 = "",
+    metadata_song_title: []const u8 = "",
+
+    // ---- settings snapshot ----
+    settings_music_directory: []const u8 = "",
+    settings_lastfm_enabled: bool = false,
+    settings_api_key: []const u8 = "",
+    settings_shared_secret: []const u8 = "",
+    settings_session_key: []const u8 = "",
+    settings_editing: bool = false,
+    settings_active_field: i8 = -1,
+    settings_cursor: usize = 0,
+    settings_field: []const u8 = "",
+    settings_value: []const u8 = "",
+    settings_auth_status: []const u8 = "",
+    settings_auth_url: []const u8 = "",
+
+    // ---- background library scan snapshot
+    scanning: bool = false,
+    scan_scanned: usize = 0,
+    scan_imported: usize = 0,
+    scan_updated: usize = 0,
+    scan_removed: usize = 0,
 };
 
 /// One half-block art cell: upper pixel color (fg) + lower pixel color (bg),
@@ -133,15 +223,94 @@ pub const ArtCell = struct {
 };
 
 /// A downsampled cover grid (w x h cells). Empty when no art is available.
+pub const ArtStatus = enum { none, loading, ready, unavailable };
+
 pub const Art = struct {
     w: u16 = 0,
     h: u16 = 0,
     cells: []const ArtCell = &.{},
 };
 
+fn resetCursor(self: *State) void {
+    self.selection = 0;
+    self.scroll = 0;
+}
+
+fn enter(self: *State) Cmd {
+    switch (self.screen) {
+        .artists => if (self.selection < self.artists.len and self.artist_count > 0) {
+            self.artist_detail_id = self.artists[self.selection].id;
+            self.artist_detail_name = self.artists[self.selection].name;
+            self.screen = .artist_detail;
+            resetCursor(self);
+            return .{ .open_artist_detail = self.artist_detail_id };
+        },
+        .artist_detail => if (self.artist_detail_count > 0) return .{ .play_artist_track = self.selection },
+        .genres => if (self.selection < self.genres.len and self.genre_count > 0) {
+            self.genre_detail_id = self.genres[self.selection].id;
+            self.genre_detail_name = self.genres[self.selection].name;
+            self.screen = .genre_detail;
+            resetCursor(self);
+            return .{ .open_genre_detail = self.genre_detail_id };
+        },
+        .genre_detail => if (self.genre_detail_count > 0) return .{ .play_genre_track = self.selection },
+        .playlists => if (self.selection < self.playlists.len and self.playlist_count > 0) {
+            self.playlist_detail_id = self.playlists[self.selection].id;
+            self.playlist_detail_name = self.playlists[self.selection].name;
+            self.screen = .playlist_detail;
+            resetCursor(self);
+            return .{ .open_playlist_detail = self.playlist_detail_id };
+        },
+        .playlist_detail => if (self.playlist_detail_count > 0) return .{ .play_playlist_track = self.selection },
+        .queue => if (self.selection < self.queue.len and self.queue_count > 0) return .{ .play_queue_index = self.selection },
+        .albums => if (self.selection < self.albums.len and self.album_count > 0) {
+            self.album_detail_id = self.albums[self.selection].id;
+            self.screen = .album_detail;
+            resetCursor(self);
+            return .{ .open_album_detail = self.album_detail_id };
+        },
+        .album_detail => if (self.album_detail_count > 0) return .{ .play_track_in_album = self.selection },
+        .library => if (self.row_count > 0) return .{ .play_index = self.selection },
+        else => {},
+    }
+    return .none;
+}
+
+fn nextScreen(screen: Screen) Screen {
+    return switch (screen) {
+        .now_playing => .library,
+        .library => .albums,
+        .albums => .artists,
+        .artists => .genres,
+        .artist_detail => .genres,
+        .genres => .playlists,
+        .genre_detail => .playlists,
+        .playlists => .queue,
+        .queue => .settings,
+        .album_detail, .playlist_detail, .settings => .now_playing,
+    };
+}
+
+fn screenForNavigation(action: Action) ?Screen {
+    return switch (action) {
+        .goto_nowplaying => .now_playing,
+        .goto_library => .library,
+        .goto_albums => .albums,
+        .goto_artists => .artists,
+        .goto_genres => .genres,
+        .goto_playlists => .playlists,
+        .goto_queue => .queue,
+        .goto_settings => .settings,
+        else => null,
+    };
+}
+
 /// Pure reducer. `visible` is the number of library rows that fit in the main
 /// content area (used for page scrolling + keeping the selection on screen).
 pub fn apply(self: *State, action: Action, visible: usize) Cmd {
+    // List rebuilds can happen between input events (for example after a
+    // rescan). Clamp stale state before interpreting Enter or page movement.
+    self.selection = @min(self.selection, rowCount(self) -| 1);
     switch (action) {
         .toggle_pause => return .toggle_pause,
         .next => return .next,
@@ -160,50 +329,26 @@ pub fn apply(self: *State, action: Action, visible: usize) Cmd {
             const target = self.position + seek_step;
             return .{ .seek = if (self.duration > 0) @min(target, self.duration) else target };
         },
-        .enter => {
-            if (self.screen == .albums and self.album_count > 0 and self.selection < self.albums.len) {
-                const id = self.albums[self.selection].id;
-                self.album_detail_id = id;
-                self.screen = .album_detail;
-                // The cursor was an album index; reset to the first track so the
-                // highlighted row in the detail view is actually track 0 (and
-                // enter plays it). Otherwise the stale album index leaks in as
-                // a wrong/out-of-range track selection.
-                self.selection = 0;
-                self.scroll = 0;
-                return .{ .open_album_detail = id };
-            }
-            if (self.screen == .album_detail and self.album_detail_count > 0) {
-                return .{ .play_track_in_album = self.selection };
-            }
-            if (self.screen == .library and self.row_count > 0) {
-                return .{ .play_index = self.selection };
-            }
-            return .none;
-        },
+        .enter => return enter(self),
         .toggle_screen => {
-            self.screen = switch (self.screen) {
-                .now_playing => .library,
-                .library => .albums,
-                // tab from the album detail returns to the album list
-                .albums, .album_detail => .now_playing,
-            };
+            self.screen = nextScreen(self.screen);
+            resetCursor(self);
             return .none;
         },
         .back => {
-            if (self.screen == .album_detail) self.screen = .albums;
+            self.screen = switch (self.screen) {
+                .album_detail => .albums,
+                .artist_detail => .artists,
+                .genre_detail => .genres,
+                .playlist_detail => .playlists,
+                else => self.screen,
+            };
+            resetCursor(self);
             return .none;
         },
-        .goto_nowplaying => {
-            self.screen = .now_playing;
-            return .none;
-        },
-        .goto_library => {
-            self.screen = .library;
-            return .none;
-        },
-        .goto_albums => {
-            self.screen = .albums;
+        .goto_nowplaying, .goto_library, .goto_albums, .goto_artists, .goto_genres, .goto_playlists, .goto_queue, .goto_settings => {
+            self.screen = screenForNavigation(action).?;
+            resetCursor(self);
             return .none;
         },
         .select_up => {
@@ -236,6 +381,14 @@ fn rowCount(s: *const State) usize {
     return switch (s.screen) {
         .albums => s.album_count,
         .album_detail => s.album_detail_count,
+        .playlists => s.playlist_count,
+        .queue => s.queue_count,
+        .settings => 0,
+        .artists => s.artist_count,
+        .artist_detail => s.artist_detail_count,
+        .genres => s.genre_count,
+        .genre_detail => s.genre_detail_count,
+        .playlist_detail => s.playlist_detail_count,
         else => s.row_count,
     };
 }
@@ -261,6 +414,11 @@ pub fn keyToAction(key: u8) ?Action {
         '1' => .goto_nowplaying,
         '2' => .goto_library,
         '3' => .goto_albums,
+        '4' => .goto_artists,
+        '5' => .goto_genres,
+        '6' => .goto_playlists,
+        '7' => .goto_queue,
+        '8' => .goto_settings,
         'b', '\x1b' => .back,
         'j' => .select_down,
         'k' => .select_up,
@@ -366,14 +524,18 @@ test "reducer: album screen enter opens detail; detail enter plays a track" {
     try std.testing.expectEqual(@as(Cmd, .{ .play_track_in_album = 4 }), play);
 }
 
-test "reducer: toggle_screen cycles now_playing -> library -> albums -> now_playing" {
+test "reducer: toggle_screen cycles through library browsers" {
     var st = State{};
     _ = apply(&st, .toggle_screen, 10);
     try std.testing.expectEqual(Screen.library, st.screen);
     _ = apply(&st, .toggle_screen, 10);
     try std.testing.expectEqual(Screen.albums, st.screen);
     _ = apply(&st, .toggle_screen, 10);
-    try std.testing.expectEqual(Screen.now_playing, st.screen);
+    try std.testing.expectEqual(Screen.artists, st.screen);
+    _ = apply(&st, .toggle_screen, 10);
+    try std.testing.expectEqual(Screen.genres, st.screen);
+    _ = apply(&st, .toggle_screen, 10);
+    try std.testing.expectEqual(Screen.playlists, st.screen);
 }
 
 test "reducer: goto_* set the screen directly" {

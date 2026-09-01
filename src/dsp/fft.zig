@@ -24,7 +24,26 @@ const Vec = @Vector(W, f32);
 
 /// Largest n (power of two) the SIMD path serves. Bigger inputs use the scalar
 /// fallback so the per-stage twiddle table can live on the stack.
-const max_simd_n: usize = 8192;
+pub const max_simd_n: usize = 8192;
+
+/// Twiddle factors for a fixed transform size. A stage of length `len` uses
+/// entries spaced by `n / len`, avoiding fresh sin/cos calls on every frame.
+pub const TwiddleCache = struct {
+    n: usize = 0,
+    re: [max_simd_n / 2]f32 = undefined,
+    im: [max_simd_n / 2]f32 = undefined,
+
+    pub fn init(n: usize) TwiddleCache {
+        std.debug.assert(n >= 2 and n <= max_simd_n and (n & (n - 1)) == 0);
+        var out = TwiddleCache{ .n = n };
+        for (0..n / 2) |k| {
+            const phase = -2.0 * std.math.pi * @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(n));
+            out.re[k] = @cos(phase);
+            out.im[k] = @sin(phase);
+        }
+        return out;
+    }
+};
 
 /// In-place FFT on the complex data in `re`/`im`.
 pub fn fft(re: []f32, im: []f32) void {
@@ -36,6 +55,19 @@ pub fn fft(re: []f32, im: []f32) void {
 
     if (n <= max_simd_n) {
         simdStages(re, im);
+    } else {
+        scalarStages(re, im);
+    }
+}
+
+/// Cached equivalent of `fft` for a repeatedly-used transform size.
+pub fn fftWithCache(re: []f32, im: []f32, cache: *const TwiddleCache) void {
+    const n = re.len;
+    std.debug.assert(n == im.len and n == cache.n);
+    std.debug.assert(n >= 2 and (n & (n - 1)) == 0);
+    bitReverse(re, im);
+    if (n <= max_simd_n) {
+        simdStagesCached(re, im, cache);
     } else {
         scalarStages(re, im);
     }
@@ -140,6 +172,52 @@ fn simdStages(re: []f32, im: []f32) void {
                 const a_im = im[top + k];
                 const w_re = tw_re[k];
                 const w_im = tw_im[k];
+                const v_re = a_re * w_re - a_im * w_im;
+                const v_im = a_re * w_im + a_im * w_re;
+                re[i + k] = u_re + v_re;
+                im[i + k] = u_im + v_im;
+                re[top + k] = u_re - v_re;
+                im[top + k] = u_im - v_im;
+            }
+        }
+    }
+}
+
+fn simdStagesCached(re: []f32, im: []f32, cache: *const TwiddleCache) void {
+    const n = re.len;
+    var len: usize = 2;
+    while (len <= n) : (len <<= 1) {
+        const half = len / 2;
+        const stride = n / len;
+        var i: usize = 0;
+        while (i < n) : (i += len) {
+            const top = i + half;
+            var k: usize = 0;
+            while (k + W <= half) : (k += W) {
+                const ure: Vec = re[i + k ..][0..W].*;
+                const uim: Vec = im[i + k ..][0..W].*;
+                const are: Vec = re[top + k ..][0..W].*;
+                const aim: Vec = im[top + k ..][0..W].*;
+                var wre: Vec = undefined;
+                var wim: Vec = undefined;
+                inline for (0..W) |lane| {
+                    wre[lane] = cache.re[(k + lane) * stride];
+                    wim[lane] = cache.im[(k + lane) * stride];
+                }
+                const vre = are * wre - aim * wim;
+                const vim = are * wim + aim * wre;
+                re[i + k ..][0..W].* = ure + vre;
+                im[i + k ..][0..W].* = uim + vim;
+                re[top + k ..][0..W].* = ure - vre;
+                im[top + k ..][0..W].* = uim - vim;
+            }
+            while (k < half) : (k += 1) {
+                const u_re = re[i + k];
+                const u_im = im[i + k];
+                const a_re = re[top + k];
+                const a_im = im[top + k];
+                const w_re = cache.re[k * stride];
+                const w_im = cache.im[k * stride];
                 const v_re = a_re * w_re - a_im * w_im;
                 const v_im = a_re * w_im + a_im * w_re;
                 re[i + k] = u_re + v_re;

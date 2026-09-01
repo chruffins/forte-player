@@ -13,6 +13,22 @@ const entity = @import("entity.zig");
 const database = @import("database.zig");
 const Database = database.Database;
 
+// Keep the library load streaming: materializing an intermediate []Song and
+// then copying every row into the id map needlessly doubles peak row storage.
+const library_song_query =
+    \\SELECT id, song_path,
+    \\       COALESCE(title, ''),
+    \\       COALESCE(album_id, -1),
+    \\       COALESCE(track, 0),
+    \\       COALESCE(comment, ''),
+    \\       COALESCE(duration, 0),
+    \\       COALESCE(disc_number, 1),
+    \\       COALESCE(play_count, 0),
+    \\       COALESCE(last_played, -1),
+    \\       COALESCE(favorite, 0)
+    \\FROM songs ORDER BY id;
+;
+
 pub const Library = struct {
     backing: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -23,6 +39,8 @@ pub const Library = struct {
     path_to_id: std.StringHashMap(i64),
     /// Ordered list of song ids (the natural playback order).
     order: std.ArrayList(i64),
+    /// Reverse lookup for current-track highlighting.
+    index_by_id: std.AutoHashMap(i64, usize),
 
     /// Allocate a Library whose arena backs every owned structure.
     pub fn create(backing: std.mem.Allocator) !*Library {
@@ -36,12 +54,14 @@ pub const Library = struct {
             .paths_by_id = undefined,
             .path_to_id = undefined,
             .order = undefined,
+            .index_by_id = undefined,
         };
         const alloc = self.arena.allocator();
         self.songs_by_id = std.AutoHashMap(i64, entity.Song).init(alloc);
         self.paths_by_id = std.AutoHashMap(i64, [:0]const u8).init(alloc);
         self.path_to_id = std.StringHashMap(i64).init(alloc);
         self.order = std.ArrayList(i64){ .items = &.{}, .capacity = 0 };
+        self.index_by_id = std.AutoHashMap(i64, usize).init(alloc);
         return self;
     }
 
@@ -54,19 +74,27 @@ pub const Library = struct {
     /// Populate the library from the database. The db must have been opened with
     /// this library's arena allocator so its rows are library-owned.
     pub fn load(self: *Library, db: *Database) !void {
-        const songs = try db.getAllSongs();
+        // A reload replaces every borrowed row and path. Reset the arena rather
+        // than retaining old maps/strings forever after repeated rescans.
+        _ = self.arena.reset(.free_all);
         const alloc = self.arena.allocator();
+        self.songs_by_id = std.AutoHashMap(i64, entity.Song).init(alloc);
+        self.paths_by_id = std.AutoHashMap(i64, [:0]const u8).init(alloc);
+        self.path_to_id = std.StringHashMap(i64).init(alloc);
+        self.order = std.ArrayList(i64){ .items = &.{}, .capacity = 0 };
+        self.index_by_id = std.AutoHashMap(i64, usize).init(alloc);
 
-        self.songs_by_id.clearRetainingCapacity();
-        self.paths_by_id.clearRetainingCapacity();
-        self.order.clearRetainingCapacity();
-
-        for (songs) |s| {
+        var stmt = try db.raw.prepareDynamic(library_song_query);
+        defer stmt.deinit();
+        var iter = try stmt.iteratorAlloc(entity.Song, alloc, .{});
+        while (try iter.nextAlloc(alloc, .{})) |s| {
             try self.songs_by_id.put(s.id, s);
             const path_z = try alloc.dupeZ(u8, s.path);
             try self.paths_by_id.put(s.id, path_z);
             try self.path_to_id.put(s.path, s.id);
-            try self.order.append(self.arena.allocator(), s.id);
+            const index = self.order.items.len;
+            try self.order.append(alloc, s.id);
+            try self.index_by_id.put(s.id, index);
         }
     }
 
@@ -100,10 +128,7 @@ pub const Library = struct {
 
     /// Index of a song id in playback order, or null.
     pub fn indexOfId(self: *const Library, id: i64) ?usize {
-        for (self.order.items, 0..) |v, i| {
-            if (v == id) return i;
-        }
-        return null;
+        return self.index_by_id.get(id);
     }
 
     /// Flip the in-memory favorite flag (kept in sync with the DB by the caller).
@@ -136,4 +161,11 @@ test "library: loads songs + path lookup" {
 
     const song = lib.getSongById(1).?;
     try std.testing.expectEqualStrings("One", song.title);
+
+    // Reloading after a rescan must not retain paths for deleted songs.
+    try db.deleteSongById(1);
+    try lib.load(&db);
+    try std.testing.expectEqual(@as(usize, 1), lib.size());
+    try std.testing.expect(lib.songIdByPath("/m/one.ogg") == null);
+    try std.testing.expectEqual(@as(i64, 2), lib.songIdByPath("/m/two.ogg").?);
 }

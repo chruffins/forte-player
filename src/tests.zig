@@ -64,6 +64,10 @@ test {
 }
 
 test {
+    _ = @import("music/metadata_edit.zig");
+}
+
+test {
     _ = @import("ui/ui_state.zig");
 }
 
@@ -73,4 +77,24 @@ test {
 
 test {
     _ = @import("ui/theme.zig");
+}
+
+test {
+    _ = @import("ui/gui_render.zig");
+}
+
+test {
+    _ = @import("ui/gui_input.zig");
+}
+
+test {
+    _ = @import("ui/gui_fonts.zig");
+}
+
+test {
+    _ = @import("ui/gui_framework.zig");
+}
+
+test {
+    _ = @import("ui/gui_icons.zig");
 }

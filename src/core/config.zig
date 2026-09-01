@@ -66,9 +66,17 @@ pub fn discordTokenPath(allocator: std.mem.Allocator) ![:0]u8 {
 }
 
 /// Relative-to-executable asset directories, most specific first.
-const exe_asset_roots = [_][]const u8{ "../share/audiovis/assets", "../assets", "assets" };
+const exe_asset_roots = [_][]const u8{
+    "../share/forte-player",
+    "../Resources",
+    "share/forte-player",
+    "../share/audiovis/assets",
+    "../assets",
+    "assets",
+};
 
 /// The first existing asset root, or `<exe_dir>/../assets` as a fallback.
+/// Packaged GUI builds use `share/forte-player`; macOS bundles use Resources.
 pub fn assetRoot(buf: []u8) ![]const u8 {
     var exe_buf: [path_buf_size]u8 = undefined;
     const exe = try exeDirectory(&exe_buf);
@@ -204,9 +212,14 @@ pub const Config = struct {
         return std.fmt.parseInt(u64, v, 10) catch 0;
     }
 
-    /// Discord activity details format. Placeholders: {song} {artist} {album}.
-    pub fn getDiscordDetailsFormat(self: *const Config) []const u8 {
-        return self.getStr("discord", "details_format", "{song} - {artist}");
+    /// Discord activity details format (`[discord] details_format=`): one of the
+    /// `DetailsFormat` preset names. Unknown values fall back to the default
+    /// (`song - artist`).
+    pub fn getDiscordDetailsFormat(self: *const Config) DetailsFormat {
+        const s = self.getStr("discord", "details_format", "song - artist");
+        // Accept the legacy default that stored the raw fmt string verbatim.
+        if (std.mem.eql(u8, s, "{song} - {artist}")) return .@"song - artist";
+        return std.meta.stringToEnum(DetailsFormat, s) orelse .@"song - artist";
     }
 
     pub fn getDisplayWidth(self: *const Config) i32 {
@@ -243,6 +256,45 @@ pub const Config = struct {
         @memcpy(buf[0..key.len], key);
         buf[key.len] = 0;
         self.setStr("lastfm", "session_key", buf[0..key.len :0]);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// DetailsFormat: Discord presence details presets
+// ---------------------------------------------------------------------------
+
+/// Preset Discord details formats. The variant name is exactly what goes in
+/// `config.ini` under `[discord] details_format=` (e.g. `song - artist`);
+/// `format()` renders the preset with std.fmt.bufPrint, whose format string is
+/// comptime-known and validated against its `{song}` / `{artist}` / `{album}`
+/// args at compile time.
+pub const DetailsFormat = enum {
+    @"song - artist",
+    song,
+    artist,
+    album,
+    @"artist - song",
+    @"song - album",
+    @"album - song",
+    @"artist - album - song",
+    @"song (album)",
+
+    /// Render this preset into `buf`. The format literal is comptime (and each
+    /// passes exactly the named args its placeholders use — std.fmt rejects
+    /// unused named args), so any mismatch is a compile error. On buffer
+    /// overflow the result is truncated to empty rather than panicking.
+    pub fn format(comptime self: DetailsFormat, song: []const u8, artist: []const u8, album: []const u8, buf: []u8) []const u8 {
+        return switch (self) {
+            .@"song - artist" => std.fmt.bufPrint(buf, "{[song]s} - {[artist]s}", .{ .song = song, .artist = artist }) catch buf[0..0],
+            .song => std.fmt.bufPrint(buf, "{[song]s}", .{ .song = song }) catch buf[0..0],
+            .artist => std.fmt.bufPrint(buf, "{[artist]s}", .{ .artist = artist }) catch buf[0..0],
+            .album => std.fmt.bufPrint(buf, "{[album]s}", .{ .album = album }) catch buf[0..0],
+            .@"artist - song" => std.fmt.bufPrint(buf, "{[artist]s} - {[song]s}", .{ .artist = artist, .song = song }) catch buf[0..0],
+            .@"song - album" => std.fmt.bufPrint(buf, "{[song]s} - {[album]s}", .{ .song = song, .album = album }) catch buf[0..0],
+            .@"album - song" => std.fmt.bufPrint(buf, "{[album]s} - {[song]s}", .{ .album = album, .song = song }) catch buf[0..0],
+            .@"artist - album - song" => std.fmt.bufPrint(buf, "{[artist]s} - {[album]s} - {[song]s}", .{ .artist = artist, .album = album, .song = song }) catch buf[0..0],
+            .@"song (album)" => std.fmt.bufPrint(buf, "{[song]s} ({[album]s})", .{ .song = song, .album = album }) catch buf[0..0],
+        };
     }
 };
 
@@ -310,7 +362,9 @@ fn isDirectory(path: []const u8) bool {
 }
 
 fn fileExists(path: []const u8) bool {
-    return al.filesystem.fsEntryExists(toSentinel(path) catch return false);
+    var entry = al.filesystem.Entry.create(toSentinel(path) catch return false) catch return false;
+    defer entry.destroy();
+    return entry.update() and entry.isFile();
 }
 
 /// Create `path` and any missing parents. Errors are ignored: on the standard
@@ -376,4 +430,30 @@ test "config: getInt falls back to default on missing/parse-error" {
     // parse error -> default
     c.setStr("s", "k", "not-a-number");
     try std.testing.expectEqual(@as(i64, 7), c.getInt("s", "k", 7));
+}
+
+test "config: DetailsFormat maps config strings and renders presets" {
+    var c = Config.create();
+    defer c.destroy();
+
+    // default when unset
+    try std.testing.expectEqual(DetailsFormat.@"song - artist", c.getDiscordDetailsFormat());
+    // exact preset names from config.ini
+    c.setStr("discord", "details_format", "song - album");
+    try std.testing.expectEqual(DetailsFormat.@"song - album", c.getDiscordDetailsFormat());
+    c.setStr("discord", "details_format", "album");
+    try std.testing.expectEqual(DetailsFormat.album, c.getDiscordDetailsFormat());
+    // legacy raw fmt string still maps to the default preset
+    c.setStr("discord", "details_format", "{song} - {artist}");
+    try std.testing.expectEqual(DetailsFormat.@"song - artist", c.getDiscordDetailsFormat());
+    // unknown value falls back to the default
+    c.setStr("discord", "details_format", "title: {song} // {album}");
+    try std.testing.expectEqual(DetailsFormat.@"song - artist", c.getDiscordDetailsFormat());
+
+    // format() renders exactly the placeholders each preset declares
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("Beat It - Michael Jackson", DetailsFormat.@"song - artist".format("Beat It", "Michael Jackson", "Thriller", &buf));
+    try std.testing.expectEqualStrings("Thriller", DetailsFormat.album.format("Beat It", "Michael Jackson", "Thriller", &buf));
+    try std.testing.expectEqualStrings("Michael Jackson - Thriller - Beat It", DetailsFormat.@"artist - album - song".format("Beat It", "Michael Jackson", "Thriller", &buf));
+    try std.testing.expectEqualStrings("Beat It (Thriller)", DetailsFormat.@"song (album)".format("Beat It", "Michael Jackson", "Thriller", &buf));
 }

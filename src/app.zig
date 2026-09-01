@@ -17,14 +17,16 @@ const allegro_init = @import("core/allegro_init.zig");
 const config_mod = @import("core/config.zig");
 const RealEngine = @import("core/music_engine.zig").RealEngine;
 const PlayQueue = @import("music/play_queue.zig").PlayQueue;
+const RepeatMode = @import("music/play_queue.zig").RepeatMode;
+const PlaybackContextType = @import("music/play_queue.zig").PlaybackContextType;
 const db_mod = @import("music/database.zig");
 const lib_mod = @import("music/library.zig");
 const scanner = @import("music/scanner.zig");
 const taglib_meta = @import("music/taglib_meta.zig");
 
-const c_time = @cImport({ @cInclude("time.h"); });
+/// Current wall-clock time in unix seconds (std.Io.Clock; no C imports).
 fn unixSeconds() i64 {
-    return @intCast(c_time.time(null));
+    return std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).toSeconds();
 }
 
 /// Frontend-supplied per-song hook (Discord presence, cover lookups, ...).
@@ -37,6 +39,7 @@ pub const EngineCtx = struct {
     db: *db_mod.Database,
     /// The currently-playing path, kept in sync on every song change.
     current_path: *[:0]const u8,
+    has_current_path: *bool,
     engine: *RealEngine,
     user: ?*anyopaque = null,
     song_changed: ?SongChangedFn = null,
@@ -47,11 +50,45 @@ fn resolveSong(id: i32, ctx: *anyopaque) ?[:0]const u8 {
     return p.lib.songPath(@intCast(id));
 }
 
+fn restoreSavedQueue(queue: *PlayQueue, lib: *lib_mod.Library, config: *const config_mod.Config, allocator: std.mem.Allocator) void {
+    const encoded = config.getStr("queue", "ids", "");
+    if (encoded.len == 0) return;
+    var ids = std.ArrayList(i32){ .items = &.{}, .capacity = 0 };
+    defer ids.deinit(allocator);
+    var parts = std.mem.splitScalar(u8, encoded, ',');
+    while (parts.next()) |part| {
+        const id = std.fmt.parseInt(i64, part, 10) catch continue;
+        if (id < std.math.minInt(i32) or id > std.math.maxInt(i32)) continue;
+        if (lib.songPath(id)) |_| ids.append(allocator, @intCast(id)) catch return;
+    }
+    if (ids.items.len == 0) return;
+    const context_type: PlaybackContextType = switch (config.getInt("queue", "context_type", 0)) {
+        1 => .Album,
+        2 => .Playlist,
+        3 => .Artist,
+        4 => .Genre,
+        else => .Individual,
+    };
+    const context_id_value = config.getInt("queue", "context_id", -1);
+    const context_id: i32 = if (context_id_value < std.math.minInt(i32) or context_id_value > std.math.maxInt(i32)) -1 else @intCast(context_id_value);
+    queue.replace(ids.items, context_type, context_id) catch return;
+    const start = @as(usize, @intCast(@max(@as(i64, 0), config.getInt("queue", "current_index", 0))));
+    queue.setStartIndex(@min(start, ids.items.len - 1)) catch return;
+    const repeat_value = config.getInt("queue", "repeat", 0);
+    queue.setRepeatMode(switch (repeat_value) {
+        1 => .All,
+        2 => .One,
+        else => .None,
+    });
+    queue.setShuffled(config.getInt("queue", "shuffle", 0) != 0) catch {};
+}
+
 fn onSongChanged(path: [:0]const u8, ctx: *anyopaque) void {
     const p: *EngineCtx = @ptrCast(@alignCast(ctx));
     p.current_path.* = path;
+    p.has_current_path.* = true;
     if (p.lib.songIdByPath(path)) |id| {
-        p.db.markPlayed(@intCast(id), unixSeconds()) catch {};
+        p.db.markPlayed(@intCast(id), unixSeconds()) catch |e| std.log.err("failed to record play for song {d}: {}", .{ id, e });
     }
     if (p.song_changed) |cb| {
         if (p.user) |u| cb(u, path);
@@ -69,12 +106,25 @@ pub const App = struct {
 
     /// Path of the currently-playing song (borrowed from the library arena).
     current_path: [:0]const u8 = undefined,
+    has_current_path: bool = false,
     ctx: EngineCtx = undefined,
 
     /// Set up Allegro, persisted config, the scanned DB + in-memory library,
     /// the engine + queue, and the engine's library hooks. `user`/`song_changed`
     /// are optional frontend extensions (pass both or neither).
     pub fn create(allocator: std.mem.Allocator, user: ?*anyopaque, song_changed: ?SongChangedFn) !*App {
+        return createImpl(allocator, user, song_changed, true);
+    }
+
+    /// Build the application without walking the music directory. Frontends
+    /// with an event loop can start a background scan immediately, avoiding a
+    /// blocking startup while keeping the existing synchronous API available
+    /// for non-interactive callers.
+    pub fn createDeferred(allocator: std.mem.Allocator, user: ?*anyopaque, song_changed: ?SongChangedFn) !*App {
+        return createImpl(allocator, user, song_changed, false);
+    }
+
+    fn createImpl(allocator: std.mem.Allocator, user: ?*anyopaque, song_changed: ?SongChangedFn, initial_scan: bool) !*App {
         const self = try allocator.create(App);
         errdefer allocator.destroy(self);
         self.* = undefined;
@@ -96,10 +146,12 @@ pub const App = struct {
         self.db = try db_mod.Database.open(self.lib.arena.allocator(), db_path);
         errdefer self.db.deinit();
 
-        self.scan = scanner.scanDirectory(&self.db, allocator, config.getMusicDirectory(), taglib_meta.extractor) catch |e| blk: {
-            std.debug.print("app: scan failed: {}\n", .{e});
-            break :blk .{};
-        };
+        if (initial_scan) {
+            self.scan = scanner.scanDirectory(&self.db, allocator, config.getMusicDirectory(), taglib_meta.extractor) catch |e| blk: {
+                std.log.err("scan failed: {}", .{e});
+                break :blk .{};
+            };
+        } else self.scan = .{};
         try self.lib.load(&self.db);
 
         self.engine = try RealEngine.create(allocator);
@@ -108,6 +160,7 @@ pub const App = struct {
         self.play_queue = PlayQueue.init(allocator);
         var qi: usize = 0;
         while (qi < self.lib.count()) : (qi += 1) try self.play_queue.enqueue(@intCast(self.lib.songIdAt(qi)));
+        restoreSavedQueue(&self.play_queue, self.lib, &config, allocator);
 
         self.config = config;
         self.allocator = allocator;
@@ -115,6 +168,7 @@ pub const App = struct {
             .lib = self.lib,
             .db = &self.db,
             .current_path = &self.current_path,
+            .has_current_path = &self.has_current_path,
             .engine = self.engine,
             .user = user,
             .song_changed = song_changed,
@@ -127,8 +181,74 @@ pub const App = struct {
         return self;
     }
 
+    fn saveQueue(self: *App) void {
+        var encoded: [32768:0]u8 = undefined;
+        var len: usize = 0;
+        for (self.play_queue.items(), 0..) |id, i| {
+            const prefix: []const u8 = if (i == 0) "" else ",";
+            const part = std.fmt.bufPrint(encoded[len..], "{s}{d}", .{ prefix, id }) catch break;
+            len += part.len;
+        }
+        encoded[len] = 0;
+        self.config.setStr("queue", "ids", encoded[0..len :0]);
+        self.config.setInt("queue", "current_index", @intCast(self.play_queue.currentIndex()));
+        self.config.setInt("queue", "repeat", @intCast(@intFromEnum(self.play_queue.getRepeatMode())));
+        self.config.setInt("queue", "shuffle", @intFromBool(self.play_queue.isShuffled()));
+        self.config.setInt("queue", "context_type", @intCast(@intFromEnum(self.play_queue.context_type)));
+        self.config.setInt("queue", "context_id", self.play_queue.context_id);
+    }
+
+    /// Re-apply the persisted queue after a deferred initial scan reloads the
+    /// library and filters out entries that no longer exist.
+    pub fn restoreSavedQueueState(self: *App) void {
+        restoreSavedQueue(&self.play_queue, self.lib, &self.config, self.allocator);
+    }
+
+    pub fn saveConfig(self: *App) void {
+        const path = config_mod.configFilePath(self.allocator) catch |e| {
+            std.log.err("config path failed: {}", .{e});
+            return;
+        };
+        defer self.allocator.free(path);
+        if (!self.config.save(path)) std.log.err("failed to save config", .{});
+    }
+
+    /// Apply a completed scan on the main thread. The scanner itself may run
+    /// on a worker, but library/queue/engine state remains single-threaded.
+    pub fn finishRescan(self: *App, result: scanner.ScanResult, previous_path: []const u8) !void {
+        self.engine.stop();
+        try self.lib.load(&self.db);
+        // Library.load resets the arena that backs current_path. Do not expose
+        // the old slice while deciding whether the previous track survived.
+        self.has_current_path = false;
+        self.play_queue.clear();
+        var i: usize = 0;
+        while (i < self.lib.count()) : (i += 1) {
+            try self.play_queue.enqueue(@intCast(self.lib.songIdAt(i)));
+        }
+        if (previous_path.len > 0) {
+            if (self.lib.songIdByPath(previous_path)) |id| {
+                _ = self.playSongId(id) catch {};
+            }
+        }
+        self.scan = result;
+    }
+
+    /// Rescan synchronously for non-interactive callers.
+    pub fn rescan(self: *App) !scanner.ScanResult {
+        var previous_path: ?[]u8 = null;
+        if (self.has_current_path) previous_path = try self.allocator.dupe(u8, self.current_path);
+        defer if (previous_path) |p| self.allocator.free(p);
+
+        const result = try scanner.scanDirectory(&self.db, self.allocator, self.config.getMusicDirectory(), taglib_meta.extractor);
+        try self.finishRescan(result, previous_path orelse "");
+        return result;
+    }
+
     pub fn destroy(self: *App) void {
         const allocator = self.allocator;
+        self.saveQueue();
+        self.saveConfig();
         self.engine.destroy();
         self.play_queue.deinit();
         self.db.deinit();
@@ -137,23 +257,54 @@ pub const App = struct {
         allocator.destroy(self);
     }
 
+    /// Start a library song while keeping the queue cursor and navigation
+    /// history synchronized with the stream. A failed load restores the queue
+    /// cursor, leaving the currently playing stream untouched.
+    pub fn playSongId(self: *App, id: i64) ![:0]const u8 {
+        const path = self.lib.songPath(id) orelse return error.SongNotFound;
+        const cursor = self.play_queue.cursor();
+        try self.play_queue.selectSong(@intCast(id));
+        self.engine.playSound(path) catch |err| {
+            self.play_queue.restore(cursor);
+            return err;
+        };
+        return path;
+    }
+
+    /// Play the exact queue occurrence at `index`; unlike playSongId this
+    /// remains unambiguous when a queue contains duplicate song ids.
+    pub fn playQueueIndex(self: *App, index: usize) ![:0]const u8 {
+        if (index >= self.play_queue.size()) return error.IndexOutOfBounds;
+        const id = self.play_queue.items()[index];
+        const path = self.lib.songPath(@intCast(id)) orelse return error.SongNotFound;
+        const cursor = self.play_queue.cursor();
+        try self.play_queue.selectIndex(index);
+        self.engine.playSound(path) catch |err| {
+            self.play_queue.restore(cursor);
+            return err;
+        };
+        return path;
+    }
+
     /// Start the first playable song, preferring non-MP3 files first (this
     /// Allegro build may lack an MP3 codec) and falling back to MP3. Returns
     /// the chosen path, or null if nothing in the library is playable.
     pub fn startFirstSong(self: *App) ?[:0]const u8 {
-        var tries: usize = 0;
+        // Resume the saved queue cursor when one exists; the default queue also
+        // starts at its first library entry, so this preserves first-run behavior.
+        if (self.play_queue.current()) |id| {
+            if (self.playSongId(@intCast(id))) |started| return started else |_| {}
+        }
+        // Try every candidate; the old arbitrary 80-song cap could report an
+        // empty library even when a playable song existed later in the scan.
         for ([_]bool{ false, true }) |want_mp3| {
             var i: usize = 0;
-            while (i < self.lib.count() and tries < 80) : (i += 1) {
+            while (i < self.lib.count()) : (i += 1) {
                 const id = self.lib.songIdAt(i);
                 const path = self.lib.songPath(id) orelse continue;
                 const is_mp3 = std.mem.endsWith(u8, path, ".mp3");
                 if (is_mp3 != want_mp3) continue;
-                tries += 1;
-                if (self.engine.playSound(path)) |_| {
-                    self.current_path = path;
-                    return path;
-                } else |_| {}
+                if (self.playSongId(id)) |started| return started else |_| {}
             }
         }
         return null;
@@ -164,28 +315,52 @@ pub const App = struct {
         return self.playAlbumFromIndex(album_id, 0);
     }
 
-    /// Play an album starting at `start_index`: rebuilds the play queue as an
-    /// Album context (so next/prev/auto-advance stay within this album) and
-    /// begins playback at the chosen track. Returns the started path.
-    pub fn playAlbumFromIndex(self: *App, album_id: i64, start_index: usize) ?[:0]const u8 {
-        const songs = self.db.getSongsByAlbum(album_id) catch return null;
-        if (songs.len == 0) return null;
-        const start = @min(start_index, songs.len - 1);
-
-        var ids = std.ArrayList(i32){ .items = &.{}, .capacity = 0 };
-        defer ids.deinit(self.allocator);
-        for (songs) |s| {
-            ids.append(self.allocator, @intCast(s.id)) catch return null;
+    /// Replace the queue and start one item, restoring the old queue if stream
+    /// loading fails. Album, playlist, artist, and genre playback all use this
+    /// transaction so their failure behavior cannot drift apart.
+    /// Transactionally replace playback with an arbitrary song set.
+    /// Frontends use this for artist/genre contexts without duplicating queue
+    /// rollback and stream-loading logic.
+    pub fn playSongIdsInContext(self: *App, song_ids: []const i64, context: PlaybackContextType, context_id: i64, start_index: usize) ?[:0]const u8 {
+        if (song_ids.len == 0 or start_index >= song_ids.len) return null;
+        const path = self.lib.songPath(song_ids[start_index]) orelse return null;
+        var queue_ids = std.ArrayList(i32){ .items = &.{}, .capacity = 0 };
+        defer queue_ids.deinit(self.allocator);
+        for (song_ids) |id| {
+            if (id < std.math.minInt(i32) or id > std.math.maxInt(i32)) return null;
+            queue_ids.append(self.allocator, @intCast(id)) catch return null;
         }
-
-        self.play_queue.clear();
-        self.play_queue.context_type = .Album;
-        self.play_queue.context_id = @intCast(album_id);
-        self.play_queue.enqueueMany(ids.items) catch return null;
-        self.play_queue.current_index = start;
-
-        const path = self.lib.songPath(songs[start].id) orelse return null;
-        _ = self.engine.playSound(path) catch return null;
+        var rollback = self.play_queue.snapshot() catch return null;
+        defer rollback.deinit();
+        self.play_queue.replace(queue_ids.items, context, @intCast(context_id)) catch return null;
+        self.play_queue.setStartIndex(start_index) catch {
+            self.play_queue.restoreSnapshot(&rollback);
+            return null;
+        };
+        self.engine.playSound(path) catch {
+            self.play_queue.restoreSnapshot(&rollback);
+            return null;
+        };
         return path;
+    }
+
+    /// Play an album starting at `start_index`: rebuild the queue as an Album
+    /// context so next/prev/auto-advance remain inside this album.
+    pub fn playAlbumFromIndex(self: *App, album_id: i64, start_index: usize) ?[:0]const u8 {
+        var query_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer query_arena.deinit();
+        const songs = self.db.getSongsByAlbumWithAllocator(query_arena.allocator(), album_id) catch return null;
+        var ids = std.ArrayList(i64){ .items = &.{}, .capacity = 0 };
+        defer ids.deinit(self.allocator);
+        for (songs) |song| ids.append(self.allocator, song.id) catch return null;
+        return self.playSongIdsInContext(ids.items, .Album, album_id, start_index);
+    }
+
+    /// Load and play every song in a saved playlist.
+    pub fn playPlaylist(self: *App, playlist_id: i64, start_index: usize) ?[:0]const u8 {
+        var query_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer query_arena.deinit();
+        const song_ids = self.db.getPlaylistSongIdsWithAllocator(query_arena.allocator(), playlist_id) catch return null;
+        return self.playSongIdsInContext(song_ids, .Playlist, playlist_id, start_index);
     }
 };

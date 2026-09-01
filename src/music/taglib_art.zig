@@ -15,6 +15,81 @@ pub const Cover = struct {
     mime: []const u8,
 };
 
+pub const Metadata = struct {
+    title: []const u8 = "",
+    artist: []const u8 = "",
+    album: []const u8 = "",
+    genre: []const u8 = "",
+    comment: []const u8 = "",
+    year: u32 = 0,
+    track: u32 = 0,
+    disc: u32 = 0,
+};
+
+pub const WriteError = error{ PathTooLong, TagLibSaveFailed };
+
+pub fn extractDiscNumber(path: []const u8) u32 {
+    var pathbuf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
+    if (path.len + 1 > pathbuf.len) return 1;
+    @memcpy(pathbuf[0..path.len], path);
+    pathbuf[path.len] = 0;
+    const disc = c.forte_extract_disc_number(pathbuf[0..path.len :0].ptr);
+    return if (disc > 0) disc else 1;
+}
+
+/// Write common tags through the C++ shim. The operation is intentionally
+/// synchronous: callers can update the database only after this succeeds.
+pub fn writeMetadata(path: []const u8, metadata: Metadata) WriteError!void {
+    var pathbuf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
+    if (path.len + 1 > pathbuf.len) return error.PathTooLong;
+    @memcpy(pathbuf[0..path.len], path);
+    pathbuf[path.len] = 0;
+    var title: [1024:0]u8 = undefined;
+    var artist: [1024:0]u8 = undefined;
+    var album: [1024:0]u8 = undefined;
+    var genre: [1024:0]u8 = undefined;
+    var comment: [1024:0]u8 = undefined;
+    const title_z = copyZ(&title, metadata.title) orelse return error.PathTooLong;
+    const artist_z = copyZ(&artist, metadata.artist) orelse return error.PathTooLong;
+    const album_z = copyZ(&album, metadata.album) orelse return error.PathTooLong;
+    const genre_z = copyZ(&genre, metadata.genre) orelse return error.PathTooLong;
+    const comment_z = copyZ(&comment, metadata.comment) orelse return error.PathTooLong;
+    var error_buf: [256:0]u8 = undefined;
+    const ok = c.forte_write_metadata(
+        pathbuf[0..path.len :0].ptr,
+        title_z.ptr,
+        artist_z.ptr,
+        album_z.ptr,
+        genre_z.ptr,
+        comment_z.ptr,
+        metadata.year,
+        metadata.track,
+        metadata.disc,
+        &error_buf,
+        error_buf.len,
+    );
+    if (ok != 1) return error.TagLibSaveFailed;
+}
+
+fn copyZ(dst: []u8, value: []const u8) ?[:0]u8 {
+    if (value.len + 1 > dst.len) return null;
+    @memcpy(dst[0..value.len], value);
+    dst[value.len] = 0;
+    return dst[0..value.len :0];
+}
+
+/// Extract a copied ALBUMARTIST value using TagLib's C++ property API.
+/// The C shim owns the temporary C string; the returned slice is allocator-owned.
+pub fn extractAlbumArtist(a: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    var pathbuf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
+    if (path.len + 1 > pathbuf.len) return null;
+    @memcpy(pathbuf[0..path.len], path);
+    pathbuf[path.len] = 0;
+    const value = c.forte_extract_album_artist(pathbuf[0..path.len :0].ptr) orelse return null;
+    defer c.forte_free_string(value);
+    return a.dupe(u8, std.mem.span(value)) catch null;
+}
+
 /// Extract the cover for `path` (allocator-owned on success).
 pub fn extract(a: std.mem.Allocator, path: []const u8) ?Cover {
     var pathbuf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;

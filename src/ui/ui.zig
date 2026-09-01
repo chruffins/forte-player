@@ -1,9 +1,8 @@
 //! The redesigned UI layer.
 //!
-//! This module is intentionally a *seed*: the redesign hasn't been specced yet,
-//! so this only defines the small, stable geometry types the rest of the layer
-//! will build on. Everything here is pure math (no Allegro), so it's fully
-//! testable headless -- keep it that way as the layer grows.
+//! This module owns the small, frontend-independent geometry types. Rendering
+//! stays in `tui_render.zig` and `gui_render.zig`; state and command emission
+//! remain pure and headless-testable.
 //!
 //! See `ui/DESIGN.md` for the intended architecture.
 

@@ -18,6 +18,7 @@
 #include <taglib/vorbisfile.h>
 #include <taglib/tag.h>
 #include <taglib/tbytevector.h>
+#include <taglib/tpropertymap.h>
 #include <taglib/xiphcomment.h>
 
 #include <cctype>
@@ -221,6 +222,87 @@ int forte_extract_cover(const char *path,
 void forte_free_cover(unsigned char *data, char *mime) {
     std::free(data);
     std::free(mime);
+}
+
+char *forte_extract_album_artist(const char *path) {
+    if (!path)
+        return nullptr;
+    TagLib::FileRef f(path);
+    if (f.isNull() || !f.file())
+        return nullptr;
+    const TagLib::PropertyMap properties = f.file()->properties();
+    const TagLib::StringList values = properties[TagLib::String("ALBUMARTIST")];
+    if (values.isEmpty() || values.front().isEmpty())
+        return nullptr;
+    return dupStr(values.front().to8Bit(true));
+}
+
+unsigned int forte_extract_disc_number(const char *path) {
+    if (!path)
+        return 1;
+    TagLib::FileRef f(path);
+    if (f.isNull() || !f.file())
+        return 1;
+    const TagLib::PropertyMap properties = f.file()->properties();
+    const TagLib::StringList values = properties[TagLib::String("DISCNUMBER")];
+    if (values.isEmpty() || values.front().isEmpty())
+        return 1;
+    bool ok = false;
+    const unsigned int disc = values.front().toInt(&ok);
+    return ok && disc > 0 ? disc : 1;
+}
+
+void forte_free_string(char *value) {
+    std::free(value);
+}
+
+int forte_write_metadata(const char *path,
+                         const char *title, const char *artist,
+                         const char *album, const char *genre,
+                         const char *comment, unsigned int year,
+                         unsigned int track, unsigned int disc,
+                         char *error, size_t error_size) {
+    auto report = [error, error_size](const char *message) {
+        if (!error || error_size == 0)
+            return;
+        std::strncpy(error, message, error_size - 1);
+        error[error_size - 1] = '\0';
+    };
+    if (!path) {
+        report("missing audio path");
+        return 0;
+    }
+
+    TagLib::FileRef f(path);
+    if (f.isNull() || !f.file() || !f.tag()) {
+        report("TagLib could not open the audio file");
+        return 0;
+    }
+    auto *tag = f.tag();
+    tag->setTitle(TagLib::String(title ? title : "", TagLib::String::UTF8));
+    tag->setArtist(TagLib::String(artist ? artist : "", TagLib::String::UTF8));
+    tag->setAlbum(TagLib::String(album ? album : "", TagLib::String::UTF8));
+    tag->setGenre(TagLib::String(genre ? genre : "", TagLib::String::UTF8));
+    tag->setComment(TagLib::String(comment ? comment : "", TagLib::String::UTF8));
+    tag->setYear(year);
+    tag->setTrack(track);
+
+    // DISCNUMBER is not part of TagLib::Tag's portable basic fields. Use the
+    // property map when the format supports it (FLAC/Ogg/Opus and newer MP4/
+    // ID3 backends); failure to expose it must not prevent the common fields
+    // from being saved.
+    if (disc > 0) {
+        TagLib::PropertyMap properties = f.file()->properties();
+        properties.replace("DISCNUMBER", TagLib::StringList(TagLib::String::number(disc)));
+        f.file()->setProperties(properties);
+    }
+
+    if (!f.save()) {
+        report("TagLib failed to save the audio file");
+        return 0;
+    }
+    report("");
+    return 1;
 }
 
 } // extern "C"

@@ -55,36 +55,96 @@ var g_cur: []Cell = &.{};
 var g_prev: []Cell = &.{};
 var g_cursor_hidden = false;
 var g_old_tio: cterm.struct_termios = undefined;
+var g_old_flags: c_int = 0;
+var g_raw_enabled = false;
+
+// Terminal output is assembled in one reusable buffer per frame. This avoids
+// a syscall for every glyph/style transition while retaining partial-write
+// handling for slow or short-writing PTYs.
+var g_out: [65536]u8 = undefined;
+var g_out_len: usize = 0;
+var g_output_failed = false;
+var g_force_redraw = true;
 
 // ---------------------------------------------------------------------------
 // Raw terminal
 // ---------------------------------------------------------------------------
 
 pub fn enableRaw() void {
+    if (g_raw_enabled) return;
     if (cterm.tcgetattr(0, &g_old_tio) != 0) return;
+    const flags = cterm.fcntl(0, cterm.F_GETFL, @as(c_int, 0));
+    if (flags < 0) return;
+    g_old_flags = flags;
     var raw = g_old_tio;
     raw.c_lflag &= ~(@as(cterm.tcflag_t, cterm.ICANON) | @as(cterm.tcflag_t, cterm.ECHO));
     raw.c_cc[cterm.VMIN] = 0;
     raw.c_cc[cterm.VTIME] = 0;
-    _ = cterm.tcsetattr(0, cterm.TCSANOW, &raw);
-    const flags = cterm.fcntl(0, cterm.F_GETFL, @as(c_int, 0));
-    _ = cterm.fcntl(0, cterm.F_SETFL, @as(c_int, flags) | cterm.O_NONBLOCK);
+    if (cterm.tcsetattr(0, cterm.TCSANOW, &raw) != 0) return;
+    if (cterm.fcntl(0, cterm.F_SETFL, flags | cterm.O_NONBLOCK) != 0) {
+        _ = cterm.tcsetattr(0, cterm.TCSANOW, &g_old_tio);
+        return;
+    }
+    g_raw_enabled = true;
 }
 
 pub fn restoreRaw() void {
+    if (!g_raw_enabled) return;
     termWrite("\x1b[?25h\x1b[0m\x1b[2J\x1b[H");
+    _ = flushOutput();
+    // Restoring termios alone leaves O_NONBLOCK set on stdin. Shells and
+    // readline-like programs then see EAGAIN instead of waiting for input.
     _ = cterm.tcsetattr(0, cterm.TCSANOW, &g_old_tio);
+    _ = cterm.fcntl(0, cterm.F_SETFL, g_old_flags);
+    g_raw_enabled = false;
 }
 
 pub fn pollKey() ?u8 {
+    if (!g_raw_enabled) return null;
     var b: [1]u8 = undefined;
     const n = cterm.read(0, &b, 1);
     if (n <= 0) return null;
     return b[0];
 }
 
+fn flushOutput() bool {
+    var written: usize = 0;
+    while (written < g_out_len) {
+        const n = cterm.write(1, g_out[written..g_out_len].ptr, g_out_len - written);
+        if (n <= 0) {
+            // Retain unwritten bytes so a later frame can retry instead of
+            // silently dropping a partial terminal update.
+            if (written > 0) {
+                @memmove(g_out[0 .. g_out_len - written], g_out[written..g_out_len]);
+                g_out_len -= written;
+            }
+            return false;
+        }
+        written += @intCast(n);
+    }
+    g_out_len = 0;
+    return true;
+}
+
 fn termWrite(s: []const u8) void {
-    _ = cterm.write(1, s.ptr, s.len);
+    if (g_output_failed) return;
+    var rest = s;
+    while (rest.len > 0) {
+        const available = g_out.len - g_out_len;
+        if (available == 0) {
+            if (!flushOutput()) {
+                // The current command could not be queued completely. Keep
+                // the framebuffer unswapped and retry the whole frame later.
+                g_output_failed = true;
+                return;
+            }
+            continue;
+        }
+        const n = @min(rest.len, available);
+        @memcpy(g_out[g_out_len .. g_out_len + n], rest[0..n]);
+        g_out_len += n;
+        rest = rest[n..];
+    }
 }
 fn termPrint(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
@@ -100,11 +160,13 @@ fn pos(x: usize, y: usize) void {
 
 pub fn setPalette(scheme: theme.Scheme) void {
     g_palette = theme.palette(scheme);
+    g_force_redraw = true;
 }
 
 pub fn detectScheme(override: theme.Scheme, auto: bool) theme.Scheme {
-    if (!auto) return override;
+    if (!auto or !g_raw_enabled) return override;
     termWrite("\x1b]11;?\x1b\\");
+    _ = flushOutput();
     var resp: [256]u8 = undefined;
     var n: usize = 0;
     var tries: usize = 0;
@@ -158,11 +220,16 @@ fn ensure(w: usize, h: usize) void {
         }
         g_cur = a.alloc(Cell, n) catch unreachable;
         g_prev = a.alloc(Cell, n) catch unreachable;
+        @memset(g_cur, blankCell());
+        @memset(g_prev, blankCell());
         g_w = w;
         g_h = h;
+        g_force_redraw = true;
     } else if (w != g_w or h != g_h) {
         g_w = w;
         g_h = h;
+        @memset(g_prev, blankCell());
+        g_force_redraw = true;
     }
 }
 
@@ -256,6 +323,10 @@ fn blitRow(y: usize, s: []const u8, selected: bool, playing: bool) void {
 }
 
 fn flush() void {
+    // Retry bytes retained by a previous short/failed write before composing
+    // another frame. Do not swap buffers unless this frame reached the TTY.
+    if (!flushOutput()) return;
+    g_output_failed = false;
     if (!g_cursor_hidden) {
         termWrite("\x1b[?25l");
         g_cursor_hidden = true;
@@ -263,11 +334,13 @@ fn flush() void {
     var y: usize = 0;
     while (y < g_h) : (y += 1) {
         const lo = y * g_w;
-        var same = true;
-        for (0..g_w) |x| {
-            if (!g_cur[lo + x].eql(g_prev[lo + x])) {
-                same = false;
-                break;
+        var same = !g_force_redraw;
+        if (same) {
+            for (0..g_w) |x| {
+                if (!g_cur[lo + x].eql(g_prev[lo + x])) {
+                    same = false;
+                    break;
+                }
             }
         }
         if (same) continue;
@@ -289,9 +362,14 @@ fn flush() void {
         }
         termWrite("\x1b[0m\x1b[K");
     }
+    if (g_output_failed or !flushOutput()) {
+        g_output_failed = true;
+        return;
+    }
     const tmp = g_cur;
     g_cur = g_prev;
     g_prev = tmp;
+    g_force_redraw = false;
 }
 
 // ---------------------------------------------------------------------------

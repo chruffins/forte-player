@@ -1,49 +1,70 @@
 //! Album cover resolution for Discord presence.
 //!
-//! The library's tags carry no MusicBrainz ids, so we resolve covers at runtime
-//! by querying the MusicBrainz release-group search API (over HTTPS via Zig's
-//! native std.http/TLS), then hand Discord the Cover Art Archive "front" URL:
-//!   https://coverartarchive.org/release-group/{mbid}/front
-//!
-//! Best-effort and rate-limited (MusicBrainz allows ~1 req/s and wants a real
-//! User-Agent). Results are cached in memory for the session and persisted to
-//! the albums table, so each album is looked up at most once. `tick()` runs
-//! from the app's main loop (never from a hook), so a slow network can't block
-//! playback or input.
+//! MusicBrainz and Cover Art Archive requests run on a dedicated worker thread.
+//! The main thread only queues jobs and applies completed results, so a slow
+//! network or TLS handshake cannot stall playback, rendering, or input.
 
 const std = @import("std");
 const db_mod = @import("../music/database.zig");
 
-const c = @cImport({
-    @cInclude("time.h");
-});
-
 const user_agent = "forte-player/0.1 (https://github.com/chruffins/audio-visualizer-cpp)";
-const min_request_interval_secs: i64 = 1;
 const search_url_base = "https://musicbrainz.org/ws/2/release-group/?query=";
 const cover_url_base = "https://coverartarchive.org/release-group/";
+
+const JobKind = enum { lookup, image };
+const Job = struct {
+    kind: JobKind,
+    album_id: i64,
+    first: []u8,
+    second: []u8,
+};
+pub const FailureKind = enum { invalid_query, request_failed, http_status, invalid_response, out_of_memory };
+
+pub const Failure = struct {
+    kind: FailureKind,
+    album_id: i64,
+};
+
+const Result = struct {
+    kind: JobKind,
+    album_id: i64,
+    failure: ?FailureKind = null,
+    url: ?[]u8 = null,
+    mbid: ?[]u8 = null,
+    bytes: ?[]u8 = null,
+};
 
 pub const CoverResolver = struct {
     allocator: std.mem.Allocator,
     db: *db_mod.Database,
     threaded: std.Io.Threaded,
     client: std.http.Client,
+
+    // These fields are main-thread-owned. The worker communicates through the
+    // jobs/results queues below and never touches the database or UI caches.
     cache: std.AutoHashMapUnmanaged(i64, Entry) = .{},
-    /// Fetched cover image bytes per album (empty slice = tried, no image).
     image_cache: std.AutoHashMapUnmanaged(i64, []const u8) = .{},
-    pending: std.ArrayList(i64) = .{ .items = &.{}, .capacity = 0 },
-    pending_album: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 },
-    pending_artist: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 },
-    last_request_secs: i64 = 0,
+    /// FIFO eviction keeps downloaded artwork bounded for large libraries.
+    image_order: std.ArrayList(i64) = .{ .items = &.{}, .capacity = 0 },
+    image_cache_bytes: usize = 0,
+    image_pending: std.AutoHashMapUnmanaged(i64, void) = .{},
+    last_failure: ?Failure = null,
+
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
+    jobs: std.ArrayList(Job) = .{ .items = &.{}, .capacity = 0 },
+    results: std.ArrayList(Result) = .{ .items = &.{}, .capacity = 0 },
+    worker: ?std.Thread = null,
+    stopping: bool = false,
 
     const Entry = union(enum) {
         pending,
-        ok: []const u8, // cover URL (allocator-owned)
+        ok: []const u8,
         none,
     };
 
-    /// Create on the heap: the std.http client's `Io` holds a pointer to this
-    /// resolver's Threaded, so the instance must live at a stable address.
+    /// Create on the heap: the HTTP client's Io and the worker both retain a
+    /// pointer to this resolver, so its address must remain stable.
     pub fn init(allocator: std.mem.Allocator, db: *db_mod.Database) !*CoverResolver {
         const r = try allocator.create(CoverResolver);
         errdefer allocator.destroy(r);
@@ -67,6 +88,10 @@ pub const CoverResolver = struct {
             }
         } else |_| {}
 
+        // If thread creation fails, deinit also tears down the HTTP client,
+        // caches, and threaded I/O before the heap object is released.
+        errdefer r.deinit();
+        r.worker = try std.Thread.spawn(.{}, workerMain, .{r});
         return r;
     }
 
@@ -77,29 +102,62 @@ pub const CoverResolver = struct {
     }
 
     pub fn deinit(self: *CoverResolver) void {
+        const io = self.threaded.io();
+        if (self.worker) |thread| {
+            self.mutex.lockUncancelable(io);
+            self.stopping = true;
+            for (self.jobs.items) |job| freeJob(self.allocator, job);
+            self.jobs.clearRetainingCapacity();
+            self.condition.broadcast(io);
+            self.mutex.unlock(io);
+            thread.join();
+            self.worker = null;
+        }
+
         var it = self.cache.valueIterator();
         while (it.next()) |e| switch (e.*) {
             .ok => |url| self.allocator.free(url),
             else => {},
         };
         self.cache.deinit(self.allocator);
+
         var iit = self.image_cache.valueIterator();
-        while (iit.next()) |bytes| self.allocator.free(bytes.*);
+        while (iit.next()) |bytes| if (bytes.*.len > 0) self.allocator.free(bytes.*);
         self.image_cache.deinit(self.allocator);
-        self.pending.deinit(self.allocator);
-        self.pending_album.deinit(self.allocator);
-        self.pending_artist.deinit(self.allocator);
+        self.image_order.deinit(self.allocator);
+        self.image_pending.deinit(self.allocator);
+
+        for (self.results.items) |result| freeResult(self.allocator, result);
+        self.results.deinit(self.allocator);
+        self.jobs.deinit(self.allocator);
         self.client.deinit();
+        self.threaded.deinit();
     }
 
-    /// Queue a cover lookup for an album (idempotent). Called when a song
-    /// changes; the actual network request happens later on `tick()`.
+    /// Queue a MusicBrainz lookup for an album. This is idempotent.
     pub fn enqueue(self: *CoverResolver, album_id: i64, album: []const u8, artist: []const u8) void {
         if (self.cache.contains(album_id)) return;
         self.cache.put(self.allocator, album_id, .pending) catch return;
-        self.pending.append(self.allocator, album_id) catch return;
-        self.pending_album.append(self.allocator, album) catch return;
-        self.pending_artist.append(self.allocator, artist) catch return;
+
+        const owned_album = self.allocator.dupe(u8, album) catch {
+            _ = self.cache.remove(album_id);
+            return;
+        };
+        const owned_artist = self.allocator.dupe(u8, artist) catch {
+            self.allocator.free(owned_album);
+            _ = self.cache.remove(album_id);
+            return;
+        };
+        if (!self.enqueueOwned(.{
+            .kind = .lookup,
+            .album_id = album_id,
+            .first = owned_album,
+            .second = owned_artist,
+        })) {
+            self.allocator.free(owned_album);
+            self.allocator.free(owned_artist);
+            _ = self.cache.remove(album_id);
+        }
     }
 
     /// Cover URL for an album if already resolved, else null.
@@ -110,71 +168,252 @@ pub const CoverResolver = struct {
         };
     }
 
-    /// The decoded cover image bytes for an album, fetching them on first use
-    /// (follows the Cover Art Archive redirect). An empty slice means "tried,
-    /// no image" and is cached so we don't re-fetch. Best-effort.
+    /// Return already-fetched cover bytes. If the URL is known but the image is
+    /// not cached, this schedules a background download and returns null until
+    /// a later poll observes its result.
     pub fn coverImageBytes(self: *CoverResolver, album_id: i64) ?[]const u8 {
-        if (self.image_cache.get(album_id)) |bytes| return bytes;
+        if (self.image_cache.get(album_id)) |bytes| {
+            return if (bytes.len > 0) bytes else null;
+        }
+        if (self.image_pending.contains(album_id)) return null;
         const url = self.coverUrlFor(album_id) orelse return null;
-
-        var buf: [2 << 20]u8 = undefined; // CAA front covers are well under 2MB
-        var w = std.Io.Writer.fixed(&buf);
-        const bytes: []const u8 = blk: {
-            const res = self.client.fetch(.{
-                .location = .{ .url = url },
-                .headers = .{ .user_agent = .{ .override = user_agent } },
-                .response_writer = &w,
-            }) catch break :blk "";
-            break :blk if (res.status == .ok) buf[0..w.end] else "";
-        };
-        const stored = self.allocator.dupe(u8, bytes) catch return null;
-        self.image_cache.put(self.allocator, album_id, stored) catch {
-            self.allocator.free(stored);
+        const owned_url = self.allocator.dupe(u8, url) catch return null;
+        self.image_pending.put(self.allocator, album_id, {}) catch {
+            self.allocator.free(owned_url);
             return null;
         };
-        return stored;
+        if (!self.enqueueOwned(.{
+            .kind = .image,
+            .album_id = album_id,
+            .first = owned_url,
+            .second = &.{},
+        })) {
+            self.allocator.free(owned_url);
+            _ = self.image_pending.remove(album_id);
+        }
+        return null;
     }
 
-    /// Run at most one lookup, respecting the rate limit. Returns true if a
-    /// lookup completed this call (so the caller can refresh the presence).
-    pub fn tick(self: *CoverResolver) bool {
-        if (self.pending.items.len == 0) return false;
-        const now: i64 = @intCast(c.time(null));
-        if (self.last_request_secs != 0 and now - self.last_request_secs < min_request_interval_secs) return false;
-        self.last_request_secs = now;
+    /// Return and clear the most recent worker failure.
+    pub fn takeFailure(self: *CoverResolver) ?Failure {
+        const failure = self.last_failure;
+        self.last_failure = null;
+        return failure;
+    }
 
-        const album_id = self.pending.orderedRemove(0);
-        const album = self.pending_album.orderedRemove(0);
-        const artist = self.pending_artist.orderedRemove(0);
-        const url = self.lookup(album_id, album, artist);
-        _ = self.cache.put(self.allocator, album_id, if (url) |u| .{ .ok = u } else .none) catch {};
+    /// Apply completed worker results. No network is performed here. Returns
+    /// true when at least one result was applied so the frontend can redraw.
+    pub fn tick(self: *CoverResolver) bool {
+        var changed = false;
+        while (true) {
+            var result: ?Result = null;
+            const io = self.threaded.io();
+            self.mutex.lockUncancelable(io);
+            if (self.results.items.len > 0) result = self.results.orderedRemove(0);
+            self.mutex.unlock(io);
+            const r = result orelse break;
+            changed = true;
+            self.applyResult(r);
+        }
+        return changed;
+    }
+
+    fn enqueueOwned(self: *CoverResolver, job: Job) bool {
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.jobs.append(self.allocator, job) catch return false;
+        self.condition.signal(io);
         return true;
     }
 
-    // ---- lookup ----
+    fn workerMain(self: *CoverResolver) void {
+        const io = self.threaded.io();
+        var made_request = false;
+        while (true) {
+            self.mutex.lockUncancelable(io);
+            while (self.jobs.items.len == 0 and !self.stopping) {
+                self.condition.waitUncancelable(io, &self.mutex);
+            }
+            if (self.stopping and self.jobs.items.len == 0) {
+                self.mutex.unlock(io);
+                return;
+            }
+            const job = self.jobs.orderedRemove(0);
+            self.mutex.unlock(io);
 
-    fn lookup(self: *CoverResolver, album_id: i64, album: []const u8, artist: []const u8) ?[]const u8 {
+            // MusicBrainz requests are rate-limited to roughly one per second.
+            // Sleeping here, rather than in tick(), keeps the UI responsive.
+            if (made_request) {
+                _ = std.Io.Clock.Duration.sleep(
+                    .{ .clock = .boot, .raw = std.Io.Duration.fromSeconds(1) },
+                    io,
+                ) catch {};
+            }
+            made_request = true;
+            const result = switch (job.kind) {
+                .lookup => self.lookupNetwork(job.album_id, job.first, job.second),
+                .image => self.fetchImage(job.album_id, job.first),
+            };
+            freeJob(self.allocator, job);
+
+            self.mutex.lockUncancelable(io);
+            if (self.stopping) {
+                freeResult(self.allocator, result);
+            } else {
+                self.results.append(self.allocator, result) catch freeResult(self.allocator, result);
+            }
+            self.mutex.unlock(io);
+        }
+    }
+
+    // The TUI only needs the current/near-current artwork. Keeping 32 MiB of
+    // decoded network responses made RSS look like a leak after browsing a
+    // few albums, even though the cache was technically bounded. Eight MiB
+    // retains normal cover sizes while putting a tighter ceiling on long runs.
+    const max_image_cache_bytes: usize = 8 * 1024 * 1024;
+
+    fn removeImageOrder(self: *CoverResolver, album_id: i64) void {
+        var i: usize = 0;
+        while (i < self.image_order.items.len) {
+            if (self.image_order.items[i] == album_id) {
+                _ = self.image_order.orderedRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn trimImageCache(self: *CoverResolver) void {
+        // Keep the newest result even if a single response is larger than the
+        // budget; otherwise the next frame would immediately re-download the
+        // same current artwork forever.
+        while (self.image_cache_bytes > max_image_cache_bytes and self.image_order.items.len > 1) {
+            const album_id = self.image_order.orderedRemove(0);
+            if (self.image_cache.fetchRemove(album_id)) |old| {
+                self.image_cache_bytes -|= old.value.len;
+                if (old.value.len > 0) self.allocator.free(old.value);
+            }
+        }
+    }
+
+    fn applyResult(self: *CoverResolver, result: Result) void {
+        if (result.failure) |kind| self.last_failure = .{ .kind = kind, .album_id = result.album_id };
+        switch (result.kind) {
+            .lookup => {
+                if (result.mbid) |mbid| {
+                    self.db.setAlbumMbid(result.album_id, mbid) catch {};
+                    self.allocator.free(mbid);
+                }
+                if (result.url) |url| {
+                    if (self.cache.fetchRemove(result.album_id)) |old| {
+                        switch (old.value) {
+                            .ok => |old_url| self.allocator.free(old_url),
+                            else => {},
+                        }
+                    }
+                    self.cache.put(self.allocator, result.album_id, .{ .ok = url }) catch {
+                        self.allocator.free(url);
+                    };
+                } else {
+                    _ = self.cache.put(self.allocator, result.album_id, .none) catch {};
+                }
+            },
+            .image => {
+                _ = self.image_pending.remove(result.album_id);
+                const bytes = result.bytes orelse &.{};
+                if (self.image_cache.fetchRemove(result.album_id)) |old| {
+                    self.image_cache_bytes -|= old.value.len;
+                    if (old.value.len > 0) self.allocator.free(old.value);
+                    self.removeImageOrder(result.album_id);
+                }
+                self.image_cache.put(self.allocator, result.album_id, bytes) catch {
+                    if (bytes.len > 0) self.allocator.free(bytes);
+                    return;
+                };
+                self.image_cache_bytes += bytes.len;
+                if (bytes.len > 0) self.image_order.append(self.allocator, result.album_id) catch {
+                    _ = self.image_cache.remove(result.album_id);
+                    self.image_cache_bytes -|= bytes.len;
+                    self.allocator.free(bytes);
+                    return;
+                };
+                self.trimImageCache();
+            },
+        }
+    }
+
+    fn lookupNetwork(self: *CoverResolver, album_id: i64, album: []const u8, artist: []const u8) Result {
+        var result = Result{ .kind = .lookup, .album_id = album_id };
         var url_buf: [1024]u8 = undefined;
-        const url = buildSearchUrl(&url_buf, album, artist) orelse return null;
+        const search_url = buildSearchUrl(&url_buf, album, artist) orelse {
+            result.failure = .invalid_query;
+            return result;
+        };
 
         var body_buf: [1 << 20]u8 = undefined;
         var w = std.Io.Writer.fixed(&body_buf);
-        const res = self.client.fetch(.{
+        const response = self.client.fetch(.{
+            .location = .{ .url = search_url },
+            .headers = .{ .user_agent = .{ .override = user_agent } },
+            .response_writer = &w,
+        }) catch {
+            result.failure = .request_failed;
+            return result;
+        };
+        if (response.status != .ok) {
+            result.failure = .http_status;
+            return result;
+        }
+
+        const mbid = pickReleaseGroup(self.allocator, body_buf[0..w.end], album) orelse {
+            result.failure = .invalid_response;
+            return result;
+        };
+        const url = std.fmt.allocPrint(self.allocator, "{s}{s}/front", .{ cover_url_base, mbid }) catch {
+            self.allocator.free(mbid);
+            result.failure = .out_of_memory;
+            return result;
+        };
+        result.mbid = mbid;
+        result.url = url;
+        return result;
+    }
+
+    fn fetchImage(self: *CoverResolver, album_id: i64, url: []const u8) Result {
+        var result = Result{ .kind = .image, .album_id = album_id };
+        var buf: [2 << 20]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        const response = self.client.fetch(.{
             .location = .{ .url = url },
             .headers = .{ .user_agent = .{ .override = user_agent } },
             .response_writer = &w,
-        }) catch return null;
-        if (res.status != .ok) return null;
-
-        const mbid = pickReleaseGroup(self.allocator, body_buf[0..w.end], album) orelse return null;
-        defer self.allocator.free(mbid);
-
-        // Persist so subsequent runs skip the lookup.
-        self.db.setAlbumMbid(album_id, mbid) catch {};
-
-        return std.fmt.allocPrint(self.allocator, "{s}{s}/front", .{ cover_url_base, mbid }) catch null;
+        }) catch {
+            result.failure = .request_failed;
+            return result;
+        };
+        if (response.status != .ok) {
+            result.failure = .http_status;
+            return result;
+        }
+        result.bytes = self.allocator.dupe(u8, buf[0..w.end]) catch {
+            result.failure = .out_of_memory;
+            return result;
+        };
+        return result;
     }
 };
+
+fn freeJob(allocator: std.mem.Allocator, job: Job) void {
+    allocator.free(job.first);
+    if (job.second.len > 0) allocator.free(job.second);
+}
+
+fn freeResult(allocator: std.mem.Allocator, result: Result) void {
+    if (result.url) |url| allocator.free(url);
+    if (result.mbid) |mbid| allocator.free(mbid);
+    if (result.bytes) |bytes| allocator.free(bytes);
+}
 
 /// Percent-encode `src` (RFC 3986 unreserved chars pass through).
 fn percentEncode(dst: []u8, src: []const u8) ?[]const u8 {
@@ -218,7 +457,7 @@ const SearchResponse = struct {
 
 /// Pick the best release group for `album` (case-insensitive title match wins,
 /// else the first/highest-score result). Returns an allocator-owned MBID.
-fn pickReleaseGroup(allocator: std.mem.Allocator, body: []const u8, album: []const u8) ?[]const u8 {
+fn pickReleaseGroup(allocator: std.mem.Allocator, body: []const u8, album: []const u8) ?[]u8 {
     var parsed = std.json.parseFromSlice(SearchResponse, allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
     defer parsed.deinit();
 

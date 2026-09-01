@@ -55,56 +55,62 @@ pub fn computeBands(samples: []const f32, bands: *[n_bands]f32) void {
     computeBandsEx(samples, bands, default_sample_rate, .a_weight);
 }
 
-/// Compute `n_bands` log-spaced band magnitudes in [0,1] from `samples`
-/// (0 < len <= n_samples; shorter input is zero-padded). Optionally applies an
-/// A-weight gain per band (based on its center frequency) before the final
-/// scale/clamp.
+/// Cached analyzer for repeated fixed-size spectrum frames. All transcendental
+/// setup work is done once; `compute` only windows, transforms, and accumulates.
+pub const Analyzer = struct {
+    rate: u32,
+    weighting: Weighting,
+    hann: [n_samples]f32,
+    first: [n_bands]usize,
+    last: [n_bands]usize,
+    weights: [n_bands]f32,
+    twiddles: fft_mod.TwiddleCache,
+
+    pub fn init(rate: u32, weighting: Weighting) Analyzer {
+        var out: Analyzer = undefined;
+        out.rate = rate;
+        out.weighting = weighting;
+        out.twiddles = fft_mod.TwiddleCache.init(n_samples);
+        for (0..n_samples) |i| {
+            out.hann[i] = 0.5 - 0.5 * @cos(2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_samples)));
+        }
+        const max_bin: f32 = @floatFromInt(n_samples / 2);
+        const lo_log = @log(@as(f32, 2.0));
+        const span_log = @log(max_bin) - lo_log;
+        for (0..n_bands) |b| {
+            const bf: f32 = @floatFromInt(b);
+            out.first[b] = @intFromFloat(@exp(lo_log + span_log * bf / @as(f32, @floatFromInt(n_bands))));
+            out.last[b] = @min(@as(usize, @intFromFloat(@exp(lo_log + span_log * (bf + 1.0) / @as(f32, @floatFromInt(n_bands))))), n_samples / 2);
+            if (weighting == .a_weight) {
+                const center = (@as(f32, @floatFromInt(out.first[b])) + @as(f32, @floatFromInt(out.last[b]))) * 0.5;
+                out.weights[b] = aWeightGain(center * @as(f32, @floatFromInt(rate)) / @as(f32, @floatFromInt(n_samples)));
+            } else out.weights[b] = 1.0;
+        }
+        return out;
+    }
+
+    pub fn compute(self: *const Analyzer, samples: []const f32, bands: *[n_bands]f32) void {
+        var re: [n_samples]f32 = [_]f32{0} ** n_samples;
+        var im: [n_samples]f32 = [_]f32{0} ** n_samples;
+        const n = @min(samples.len, n_samples);
+        for (0..n) |i| re[i] = samples[i] * self.hann[i];
+        fft_mod.fftWithCache(&re, &im, &self.twiddles);
+        const norm = 1.0 / @as(f32, @floatFromInt(n_samples));
+        for (0..n_bands) |b| {
+            var acc: f32 = 0.0;
+            var k = self.first[b];
+            const end = self.last[b];
+            while (k < end) : (k += 1) acc += @sqrt(re[k] * re[k] + im[k] * im[k]) * norm;
+            const count = end -| self.first[b];
+            bands[b] = if (count > 0) @min((acc / @as(f32, @floatFromInt(count))) * self.weights[b] * 6.0, 1.0) else 0.0;
+        }
+    }
+};
+
+/// Compatibility wrapper for callers that do not retain an analyzer.
 pub fn computeBandsEx(samples: []const f32, bands: *[n_bands]f32, rate: u32, weighting: Weighting) void {
-    var re: [n_samples]f32 = [_]f32{0} ** n_samples;
-    var im: [n_samples]f32 = [_]f32{0} ** n_samples;
-
-    const n = @min(samples.len, n_samples);
-    for (0..n) |i| {
-        // Hann window.
-        const w = 0.5 - 0.5 * @cos(2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n)));
-        re[i] = samples[i] * w;
-    }
-    fft_mod.fft(&re, &im);
-
-    // Band boundaries: log-spaced from bin 2 up to bin n/2.
-    const max_bin: f32 = @floatFromInt(n_samples / 2);
-    const lo: f32 = 2.0;
-    const lo_log = @log(lo);
-    const span_log = @log(max_bin) - lo_log;
-    const norm = 1.0 / @as(f32, @floatFromInt(n_samples));
-
-    for (0..n_bands) |b| {
-        const bf: f32 = @floatFromInt(b);
-        const b_lo = @exp(lo_log + span_log * bf / @as(f32, @floatFromInt(n_bands)));
-        const b_hi = @exp(lo_log + span_log * (bf + 1.0) / @as(f32, @floatFromInt(n_bands)));
-        const first: usize = @intFromFloat(b_lo);
-        const last: usize = @min(@as(usize, @intFromFloat(b_hi)), n_samples / 2);
-        var acc: f32 = 0.0;
-        var cnt: usize = 0;
-        var k = first;
-        while (k < last) : (k += 1) {
-            acc += @sqrt(re[k] * re[k] + im[k] * im[k]) * norm;
-            cnt += 1;
-        }
-        bands[b] = if (cnt > 0) acc / @as(f32, @floatFromInt(cnt)) else 0.0;
-
-        // Perceptual weighting from the band's center frequency.
-        if (weighting == .a_weight) {
-            const center_bin: f32 = (@as(f32, @floatFromInt(first)) + @as(f32, @floatFromInt(last))) * 0.5;
-            const freq = center_bin * @as(f32, @floatFromInt(rate)) / @as(f32, n_samples);
-            bands[b] *= aWeightGain(freq);
-        }
-    }
-
-    // Normalize: scale so typical music sits comfortably below 1.0.
-    for (bands) |*v| {
-        v.* = @min(v.* * 6.0, 1.0);
-    }
+    var analyzer = Analyzer.init(rate, weighting);
+    analyzer.compute(samples, bands);
 }
 
 /// A-weighting as a linear amplitude gain for a frequency in Hz. The standard

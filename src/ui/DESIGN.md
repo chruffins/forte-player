@@ -1,8 +1,8 @@
-# UI layer design (WIP)
+# UI layer design
 
-This is a placeholder for the redesign of the music player's UI. Nothing here is
-specced yet; the notes below capture the direction so the layout and test
-strategy can accommodate it.
+The redesign replaces the old drawable tree with a pure state/view pipeline and
+an Allegro edge. The shared screens are now functional; this document records
+the contracts that keep the GUI framework maintainable.
 
 ## Goals
 
@@ -18,23 +18,55 @@ strategy can accommodate it.
   - **input** (pure mapping of raw events -> semantic actions)
   - **render** (Allegro) — draw the layout
 
-## Proposed structure (under `src/ui/`)
+The GUI deliberately does not mirror the old retained drawable tree. A frame is
+an immutable command stream: `ui_view` emits it, and each frontend interprets
+it. Allegro events are mapped to semantic actions at the edge, then reduced by
+`ui_state` and executed by the application adapter. This avoids per-widget
+allocations, virtual drawables, UV objects, and callback lifetime graphs. The
+Allegro edge also performs bounded coordinate hit testing for list rows and the
+progress bar, including pointer capture for seek and scrollbar dragging,
+while local cover art is decoded once per song change into the same `Art`
+snapshot consumed by the TUI. Reusable behavior corresponding to the C++
+buttons, textboxes, sliders, scroll frames, alignment, and UV geometry lives in
+pure `gui_framework.zig` rather than callback-owning drawable objects.
+
+## Structure (under `src/ui/`)
 
 ```
 src/ui/
   ui.zig          # module root, re-exports the public surface
   DESIGN.md       # this file
-  layout/
-    rect.zig      # Rect/inset/contains (started)
-    tree.zig      # layout tree / constraints
-  state/          # view models / app state (pure)
-  input/          # event classification (pure)
-  render/         # Allegro draw commands (the only impure part)
+  gui_input.zig   # pure pixel/cell hit testing
+  gui_layout.zig  # responsive shell geometry
+  gui_framework.zig # pure UV, text, slider, scroll, and event models
+  gui_render.zig  # Allegro command-stream interpreter
+  gui_fonts.zig   # font resources and packaged asset fallback
+  gui_jobs.zig    # asynchronous scan/auth workers
+  ui_state.zig    # shared semantic state and reducer
+  ui_view.zig     # shared typed draw commands
+  render.zig      # small Allegro primitive helpers
 ```
 
-Everything under `layout/`, `state/`, `input/` should stay dependency-free
-(single importable module, co-located `test` blocks). `render/` is the only
-place that imports `allegro`.
+`gui_layout.zig`, `gui_framework.zig`, `gui_input.zig`, `ui_state.zig`, and
+`ui_view.zig` stay headless-testable. Only `gui_render.zig`, `gui_fonts.zig`,
+and `render.zig` import Allegro directly.
+
+## Album view contract
+
+The TUI treats album browsing as two distinct screens rather than one layout
+whose geometry changes when cover art arrives:
+
+- **Albums** is a stable, keyboard-first list. It shows title, artist, year, and
+  track count; the cover indicator is metadata only and does not trigger image
+  loading.
+- **Album detail** is a full-width track list. Song rows are truncated at the
+  terminal edge rather than wrapped or competing with cover art. Album cover
+  art is not rendered in either album screen; it remains a Now Playing feature.
+- Cover state is explicit (`none`, `loading`, `ready`, `unavailable`) for Now
+  Playing only.
+
+This keeps navigation predictable, avoids asynchronous art changing album
+geometry, and leaves album browsing cheap to render.
 
 ## Testing
 

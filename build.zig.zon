@@ -2,10 +2,16 @@
     .name = .forte_player,
     .version = "0.0.1",
     .minimum_zig_version = "0.16.0",
-    .paths = .{ "" },
+    .paths = .{""},
     .dependencies = .{
-        .allegro = .{ .path = "../allegro5-zig" },
-        .zscrob = .{ .path = "../zscrob" },
+        .allegro = .{
+            .url = "https://github.com/chruffins/allegro5-zig/archive/d729b17.tar.gz",
+            .hash = "N-V-__8AACL1AgBGDtuu6O3joIp5hIeACD5be3-MpL-OC45X",
+        },
+        .zscrobble = .{
+            .url = "https://github.com/chruffins/zscrobble/archive/f687f34cc8eb709f9d87b870c694b48f61b81212.tar.gz",
+            .hash = "N-V-__8AANuYAACXEz53lEljW3i4GbfZdvXepMBHmQlHn_Oa",
+        },
         .sqlite = .{
             .url = "https://github.com/vrischmann/zig-sqlite/archive/946d77c526258760b52836187af32d1a192c5d36.tar.gz",
             .hash = "sqlite-3.48.0-F2R_azCQDgBGaWDIX4g2vxKpuqzYEQOOfAeJGMNocPu0",

@@ -24,8 +24,8 @@ const builtin = @import("builtin");
 const os_tag = builtin.os.tag;
 
 /// Cross-platform C imports (provided on Windows too via mingw headers).
+/// Only `stdlib.h` (getenv) is needed here; wall-clock time uses std.Io.Clock.
 const c = @cImport({
-    @cInclude("time.h");
     @cInclude("stdlib.h");
 });
 
@@ -221,6 +221,35 @@ fn currentPid() u32 {
 // ---------------------------------------------------------------------------
 // Client: shared, protocol-only (handshake + READY + SET_ACTIVITY)
 // ---------------------------------------------------------------------------
+/// Everything Discord shows for the now-playing activity. Fill the fields you
+/// want; unset/empty ones are omitted from the payload. Tweak this (or how
+/// `setPresence` serializes it) to control the rich-presence display.
+pub const Presence = struct {
+    /// Discord's `details` field (commonly "song - artist").
+    details: []const u8 = "",
+    /// Discord's `state` field (commonly the artist or album).
+    state: []const u8 = "",
+    /// Which field Discord shows as the status text next to the music icon:
+    /// 0 = app name, 1 = `state`, 2 = `details`.
+    status_display_type: u8 = 2,
+    /// Activity type: 0 = Playing, 2 = Listening. Defaults to Listening.
+    activity_type: u8 = 2,
+    /// Track duration in seconds; if > 0, start/end timestamps are sent.
+    duration_secs: f64 = 0,
+    // ---- Rich-Presence assets (parity with the C++ prototype's
+    // `ActivityAssets`; each ships as snake_case on the wire). ----
+    /// Large image (cover-art URL or an uploaded asset key).
+    large_image: ?[]const u8 = null,
+    /// Tooltip shown when hovering the large image (e.g. album name).
+    large_text: ?[]const u8 = null,
+    /// Small image (uploaded asset key such as "logo", or a URL).
+    small_image: ?[]const u8 = null,
+    /// Tooltip shown when hovering the small image (e.g. app name).
+    small_text: ?[]const u8 = null,
+    /// Click-through URL associated with the small image (e.g. the repo).
+    small_url: ?[]const u8 = null,
+};
+
 pub const Client = struct {
     app_id: u64 = 0,
     pid: u32 = 0,
@@ -228,12 +257,45 @@ pub const Client = struct {
     connected: bool = false,
     transport: Transport = Transport.init(),
 
+    // Presence writes and the READY/activity replies happen on this worker,
+    // never on the playback/render thread. Only the latest pending activity is
+    // retained because an older song update is no longer useful.
+    allocator: std.mem.Allocator = std.heap.page_allocator,
+    threaded: std.Io.Threaded,
+    mutex: std.Io.Mutex = .init,
+    condition: std.Io.Condition = .init,
+    pending: ?[]u8 = null,
+    worker: ?std.Thread = null,
+    stopping: bool = false,
+
     pub fn init(app_id: u64) Client {
-        return .{ .app_id = app_id, .pid = currentPid() };
+        return .{
+            .app_id = app_id,
+            .pid = currentPid(),
+            .threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}),
+        };
+    }
+
+    fn syncIo(self: *Client) std.Io {
+        return self.threaded.io();
     }
 
     pub fn deinit(self: *Client) void {
+        const io = self.syncIo();
+        if (self.worker) |thread| {
+            self.mutex.lockUncancelable(io);
+            self.stopping = true;
+            if (self.pending) |payload| {
+                self.allocator.free(payload);
+                self.pending = null;
+            }
+            self.condition.broadcast(io);
+            self.mutex.unlock(io);
+            thread.join();
+            self.worker = null;
+        }
         self.close();
+        self.threaded.deinit();
     }
 
     fn close(self: *Client) void {
@@ -280,22 +342,33 @@ pub const Client = struct {
             self.close();
             return false;
         };
-        if (!self.transport.writeAll(handshake)) {
+        // CRITICAL: the handshake must be a full IPC frame (8-byte header + JSON),
+        // not raw JSON -- otherwise Discord reads the JSON bytes as a bogus
+        // header and replies with a "protocol error" frame.
+        if (!self.writeFrame(.handshake, handshake)) {
             dbg("handshake write failed", .{});
             self.close();
             return false;
         }
 
-        // Wait briefly (bounded) for the READY ack. Best-effort: a timeout logs
-        // but does not tear the connection down.
+        // Wait briefly for the READY ack and confirm it actually says READY; a
+        // malformed handshake surfaces here as an error frame.
         var ready_buf: [1024]u8 = undefined;
         if (self.readFrame(1500, &ready_buf)) |len| {
-            self.ready = true;
-            dbg("READY (opcode 0, {d} bytes): {s}", .{ len, ready_buf[0..@min(len, 160)] });
+            const reply = ready_buf[0..len];
+            if (std.mem.indexOf(u8, reply, "READY") != null) {
+                self.ready = true;
+                dbg("READY: {s}", .{reply[0..@min(reply.len, 160)]});
+            } else {
+                dbg("handshake rejected: {s}", .{reply[0..@min(reply.len, 160)]});
+                self.close();
+                return false;
+            }
         } else {
             dbg("no READY within 1500ms -- handshake unacknowledged", .{});
         }
-        return true;
+
+        return self.ready;
     }
 
     // ---- frame I/O (shared; poll-bounded so reads can't stall) ----
@@ -328,89 +401,247 @@ pub const Client = struct {
         return self.transport.writeAll(frame[0 .. 8 + payload.len]);
     }
 
-    /// Publish the now-playing track. Best-effort and non-blocking.
-    pub fn setPresence(self: *Client, details: []const u8, state: []const u8, duration_secs: f64, cover_url: ?[]const u8) void {
+    /// Publish the now-playing track. JSON construction is cheap and happens
+    /// here, but all socket/pipe I/O is handed to the worker.
+    pub fn setPresence(self: *Client, p: Presence) void {
         if (self.app_id == 0) return;
-        if (!self.connect()) return;
 
-        var dbuf: [160]u8 = undefined;
-        var sbuf: [160]u8 = undefined;
-        const ed = escapeInto(&dbuf, details);
-        const es = escapeInto(&sbuf, state);
-
-        // Optional comma-prefixed assets fragment for the album cover.
-        var assets_buf: [512]u8 = undefined;
-        const assets = if (cover_url) |url| blk: {
-            var ubuf: [256]u8 = undefined;
-            const eu = escapeInto(&ubuf, url);
-            break :blk std.fmt.bufPrint(&assets_buf, ",\"assets\":{{\"large_image\":\"{s}\",\"large_text\":\"{s}\"}}", .{ eu, es }) catch "";
-        } else "";
-
-        const now: i64 = @intCast(c.time(null));
-        var buf: [2048]u8 = undefined;
-        const payload = (if (duration_secs > 0)
-            std.fmt.bufPrint(&buf, "{{\"cmd\":\"SET_ACTIVITY\",\"args\":{{\"pid\":{d},\"activity\":{{\"type\":2,\"details\":\"{s}\",\"state\":\"{s}\",\"timestamps\":{{\"start\":{d},\"end\":{d}}}{s}}},\"nonce\":\"fp-{d}\"}}}}", .{
-                self.pid, ed, es, now, now + @as(i64, @intFromFloat(duration_secs)), assets, self.pid,
-            })
-        else
-            std.fmt.bufPrint(&buf, "{{\"cmd\":\"SET_ACTIVITY\",\"args\":{{\"pid\":{d},\"activity\":{{\"type\":2,\"details\":\"{s}\",\"state\":\"{s}\",\"timestamps\":{{\"start\":{d}}}{s}}},\"nonce\":\"fp-{d}\"}}}}", .{
-                self.pid, ed, es, now, assets, self.pid,
-            })) catch {
-            self.close();
+        var payload_buf: [4096]u8 = undefined;
+        const payload = buildActivityPayload(
+            p,
+            self.pid,
+            std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).toSeconds(),
+            &payload_buf,
+        ) orelse {
+            dbg("SET_ACTIVITY: payload too large", .{});
             return;
         };
+        const owned = self.allocator.dupe(u8, payload) catch return;
 
+        const io = self.syncIo();
+        if (self.worker == null) {
+            self.worker = std.Thread.spawn(.{}, workerMain, .{self}) catch {
+                self.allocator.free(owned);
+                return;
+            };
+        }
+        self.mutex.lockUncancelable(io);
+        if (self.stopping) {
+            self.mutex.unlock(io);
+            self.allocator.free(owned);
+            return;
+        }
+        if (self.pending) |old| self.allocator.free(old);
+        self.pending = owned;
+        self.condition.signal(io);
+        self.mutex.unlock(io);
+    }
+
+    fn workerMain(self: *Client) void {
+        const io = self.syncIo();
+        while (true) {
+            self.mutex.lockUncancelable(io);
+            while (self.pending == null and !self.stopping) {
+                self.condition.waitUncancelable(io, &self.mutex);
+            }
+            if (self.stopping and self.pending == null) {
+                self.mutex.unlock(io);
+                return;
+            }
+            const payload = self.pending.?;
+            self.pending = null;
+            self.mutex.unlock(io);
+
+            self.sendPresence(payload);
+            self.allocator.free(payload);
+        }
+    }
+
+    fn sendPresence(self: *Client, payload: []const u8) void {
+        if (!self.connect()) return;
         dbg("SET_ACTIVITY: {s}", .{payload[0..@min(payload.len, 220)]});
         if (!self.writeFrame(.frame, payload)) {
             dbg("SET_ACTIVITY write failed", .{});
             self.close();
+            return;
+        }
+        // Best-effort: read Discord's reply so a rejected command surfaces in
+        // DISCORD_IPC_DEBUG instead of being silently dropped. This wait is
+        // isolated to the worker and cannot stall playback or rendering.
+        var reply: [2048]u8 = undefined;
+        if (self.readFrame(500, &reply)) |reply_len| {
+            dbg("SET_ACTIVITY reply: {s}", .{reply[0..@min(reply_len, 200)]});
         }
     }
 };
 
-/// Copy `src` into `dst` as a JSON string literal, escaping `"`/`\`/control
-/// chars and truncating to Discord's 128-char activity field limit.
-fn escapeInto(dst: []u8, src: []const u8) []const u8 {
-    var n: usize = 0;
-    for (src) |ch| {
-        if (n >= 128) break;
-        switch (ch) {
-            '"', '\\', '\n', '\r', '\t' => {
-                if (n + 2 >= dst.len) break;
-                dst[n] = '\\';
-                dst[n + 1] = switch (ch) {
-                    '"' => '"',
-                    '\\' => '\\',
-                    '\n' => 'n',
-                    '\r' => 'r',
-                    else => 't',
-                };
-                n += 2;
-            },
-            else => {
-                if (ch < 0x20) continue; // drop other control chars
-                dst[n] = ch;
-                n += 1;
-            },
-        }
-    }
-    return dst[0..n];
+// ---------------------------------------------------------------------------
+// SET_ACTIVITY serialization (std.json streaming; escaping is automatic)
+// ---------------------------------------------------------------------------
+
+/// Serialize the SET_ACTIVITY payload for `p` into `buf` (valid JSON, strings
+/// escaped by std.json.Stringify). Returns null if the payload doesn't fit.
+fn buildActivityPayload(p: Presence, pid: u32, now: i64, buf: []u8) ?[]u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    var js = std.json.Stringify{ .writer = &w };
+    writeActivityJson(&js, p, pid, now) catch return null;
+    return w.buffered();
 }
 
-test "escapeInto escapes JSON specials and truncates" {
-    var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("say \\\"hi\\\"\\\\ok\\n", escapeInto(&buf, "say \"hi\"\\ok\n"));
+/// Stream the SET_ACTIVITY JSON. Hard rules to never break:
+///  * `nonce` must be at the TOP level (Discord rejects it inside `args`
+///    with code 4000 "Payload requires a nonce").
+///  * every SET_ACTIVITY frame starts with an 8-byte IPC header (writeFrame).
+fn writeActivityJson(js: *std.json.Stringify, p: Presence, pid: u32, now: i64) !void {
+    try js.beginObject();
+    try js.objectField("cmd");
+    try js.write("SET_ACTIVITY");
 
-    var long_buf: [200]u8 = undefined;
-    const many = "a" ** 200;
-    const out = escapeInto(&long_buf, many);
-    try std.testing.expectEqual(@as(usize, 128), out.len);
+    try js.objectField("args");
+    try js.beginObject();
+    try js.objectField("pid");
+    try js.write(pid);
+
+    try js.objectField("activity");
+    try js.beginObject();
+    try js.objectField("type");
+    try js.write(p.activity_type);
+    try js.objectField("details");
+    try js.write(clip(p.details, 128));
+    try js.objectField("state");
+    try js.write(clip(p.state, 128));
+    try js.objectField("status_display_type");
+    try js.write(p.status_display_type);
+
+    // timestamps (only when we know the track length)
+    if (p.duration_secs > 0) {
+        try js.objectField("timestamps");
+        try js.beginObject();
+        try js.objectField("start");
+        try js.write(now);
+        try js.objectField("end");
+        try js.write(now + @as(i64, @intFromFloat(p.duration_secs)));
+        try js.endObject();
+    }
+
+    // assets: any subset of the five ActivityAssets fields (parity with the
+    // C++ prototype's large_image/large_text/small_image/small_text/small_url).
+    const AssetField = struct { key: []const u8, value: ?[]const u8, max: usize };
+    const asset_fields = [_]AssetField{
+        .{ .key = "large_image", .value = p.large_image, .max = 512 },
+        .{ .key = "large_text", .value = p.large_text, .max = 128 },
+        .{ .key = "small_image", .value = p.small_image, .max = 512 },
+        .{ .key = "small_text", .value = p.small_text, .max = 128 },
+        .{ .key = "small_url", .value = p.small_url, .max = 512 },
+    };
+    var wrote_assets = false;
+    for (asset_fields) |f| {
+        if (f.value) |v| {
+            if (!wrote_assets) {
+                try js.objectField("assets");
+                try js.beginObject();
+                wrote_assets = true;
+            }
+            try js.objectField(f.key);
+            try js.write(clip(v, f.max));
+        }
+    }
+    if (wrote_assets) try js.endObject();
+
+    try js.endObject(); // activity
+    try js.endObject(); // args
+
+    try js.objectField("nonce");
+    var nonce_buf: [32]u8 = undefined;
+    const nonce = std.fmt.bufPrint(&nonce_buf, "fp-{d}", .{pid}) catch "fp-0";
+    try js.write(nonce);
+    try js.endObject(); // root
+}
+
+/// Byte-truncate `s` to at most `max` bytes without splitting a UTF-8
+/// codepoint. Discord caps text fields at 128 chars; image URLs get more room.
+fn clip(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    var end = max;
+    // Back up over UTF-8 continuation bytes so the cut lands before a lead byte.
+    while (end > 0 and (s[end] & 0xC0) == 0x80) : (end -= 1) {}
+    return s[0..end];
+}
+
+test "buildActivityPayload emits valid, escaped JSON (round-trips)" {
+    const p = Presence{
+        .details = "say \"hi\"\\ok\n",
+        .state = "artist \"x\"",
+        .duration_secs = 100.0,
+        .large_image = "https://coverartarchive.org/release-group/abc/front",
+        .large_text = "Album \"title\"",
+        .small_image = "logo",
+        .small_text = "∫orte player",
+        .small_url = "https://www.github.com/chruffins",
+    };
+    var buf: [4096]u8 = undefined;
+    const json = buildActivityPayload(p, 1234, 1000, &buf) orelse return error.TestUnexpectedResult;
+
+    // Full round-trip through std.json proves the payload is well-formed and
+    // correctly escaped.
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("SET_ACTIVITY", root.get("cmd").?.string);
+    try std.testing.expectEqualStrings("fp-1234", root.get("nonce").?.string);
+
+    const args = root.get("args").?.object;
+    try std.testing.expectEqual(@as(i64, 1234), args.get("pid").?.integer);
+    const activity = args.get("activity").?.object;
+    try std.testing.expectEqual(@as(i64, 2), activity.get("type").?.integer);
+    try std.testing.expectEqualStrings("say \"hi\"\\ok\n", activity.get("details").?.string);
+    try std.testing.expectEqualStrings("artist \"x\"", activity.get("state").?.string);
+
+    const ts = activity.get("timestamps").?.object;
+    try std.testing.expectEqual(@as(i64, 1000), ts.get("start").?.integer);
+    try std.testing.expectEqual(@as(i64, 1100), ts.get("end").?.integer);
+
+    const assets = activity.get("assets").?.object;
+    try std.testing.expectEqualStrings("https://coverartarchive.org/release-group/abc/front", assets.get("large_image").?.string);
+    try std.testing.expectEqualStrings("Album \"title\"", assets.get("large_text").?.string);
+    try std.testing.expectEqualStrings("logo", assets.get("small_image").?.string);
+    try std.testing.expectEqualStrings("https://www.github.com/chruffins", assets.get("small_url").?.string);
+}
+
+test "buildActivityPayload clips long text and omits unset fields" {
+    const p = Presence{
+        .details = "a" ** 200,
+        .state = "",
+    };
+    var buf: [4096]u8 = undefined;
+    const json = buildActivityPayload(p, 7, 0, &buf) orelse return error.TestUnexpectedResult;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const activity = root.get("args").?.object.get("activity").?.object;
+    // clipped to Discord's 128-char cap
+    try std.testing.expectEqual(@as(usize, 128), activity.get("details").?.string.len);
+    // no timestamps without a duration; no assets block when all unset
+    try std.testing.expect(activity.get("timestamps") == null);
+    try std.testing.expect(activity.get("assets") == null);
+    try std.testing.expectEqualStrings("fp-7", root.get("nonce").?.string);
+}
+
+test "clip never splits a UTF-8 codepoint" {
+    // '♪' is 3 bytes (E2 99 AA); a 4-byte cap must not cut inside it.
+    const s = "a♪b";
+    try std.testing.expectEqualStrings("a", clip(s, 2));
+    try std.testing.expectEqualStrings("a", clip(s, 1));
+    try std.testing.expectEqualStrings("a", clip(s, 3));
+    try std.testing.expectEqualStrings("a♪", clip(s, 4));
+    try std.testing.expectEqualStrings(s, clip(s, 5));
 }
 
 test "setPresence is a no-op when disabled (app_id 0)" {
     var cl = Client.init(0);
     defer cl.deinit();
-    cl.setPresence("title", "artist", 100.0, null);
+    cl.setPresence(.{ .details = "title", .state = "artist", .duration_secs = 100.0 });
     try std.testing.expect(cl.connected == false);
 }
 

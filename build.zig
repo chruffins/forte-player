@@ -1,6 +1,9 @@
 const std = @import("std");
 
 const system_libs = [_][]const u8{
+    // Required by Allegro's macOS/Windows entry-point glue; available in the
+    // standard Allegro install on Linux as well.
+    "allegro_main",
     "allegro",
     "allegro_primitives",
     "allegro_image",
@@ -20,15 +23,17 @@ pub fn build(b: *std.Build) void {
     // and Opus support added to the acodec addon). When set, <prefix>/lib is
     // added to the linker search path AND to the runtime search path of the
     // produced binaries so they load that build instead of the distro's.
-    //   zig build -Dallegro_prefix=/home/chris/.local/forte-allegro
-    // Default to the locally-built Allegro (compiled with MP3/Opus in its acodec)
-    // so MP3 libraries play out of the box — the distro Allegro's acodec can't
-    // decode MP3. Override with `-Dallegro_prefix=<path>`, or pass
-    // `-Dallegro_prefix=` (empty) to use the distro build. Adding the lib/rpath
-    // of a missing dir is harmless: the loader falls back to the system libs
-    // if it isn't found here.
-    const default_allegro_prefix = "/home/chris/.local/forte-allegro";
+    //   zig build -Dallegro_prefix=/path/to/allegro
+    // Use the system Allegro by default so the project is portable. For MP3
+    // support, pass a custom Allegro install (for example the streaming build
+    // described in the README) with `-Dallegro_prefix=<path>`.
+    const default_allegro_prefix = "";
     const allegro_prefix = b.option([]const u8, "allegro_prefix", "Prefix of a custom Allegro 5 install (adds <prefix>/lib to link + rpath)") orelse default_allegro_prefix;
+    const taglib_prefix = b.option([]const u8, "taglib_prefix", "TagLib installation prefix (for example /usr or /opt/homebrew/opt/taglib)") orelse "/usr";
+    const cxx = b.option([]const u8, "cxx", "C++ compiler used for the TagLib shim") orelse if (target.result.os.tag == .macos) "clang++" else "g++";
+    const taglib_include_root = b.fmt("{s}/include", .{taglib_prefix});
+    const taglib_include = b.fmt("{s}/include/taglib", .{taglib_prefix});
+    const taglib_lib = b.fmt("{s}/lib", .{taglib_prefix});
 
     // Import the allegro5-zig wrapper as a dependency module.
     const dep = b.dependency("allegro", .{ .target = target, .optimize = optimize });
@@ -38,11 +43,11 @@ pub fn build(b: *std.Build) void {
     const sdep = b.dependency("sqlite", .{ .target = target, .optimize = optimize });
     const sqlite = sdep.module("sqlite");
 
-    // zscrob (local Zig rewrite of libscrob) for Last.fm scrobbling. Its build
-    // doesn't publish a module, so root a module at its source path.
-    const zscrob_dep = b.dependency("zscrob", .{ .target = target, .optimize = optimize });
-    const zscrob = b.createModule(.{
-        .root_source_file = zscrob_dep.path("src/libscrobbler.zig"),
+    // zscrobble (github.com/chruffins/zscrobble) for Last.fm scrobbling. Its
+    // build doesn't publish a module, so root a module at its source path.
+    const zscrobble_dep = b.dependency("zscrobble", .{ .target = target, .optimize = optimize });
+    const zscrobble = b.createModule(.{
+        .root_source_file = zscrobble_dep.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -51,13 +56,16 @@ pub fn build(b: *std.Build) void {
     const imports: []const std.Build.Module.Import = &.{
         .{ .name = "allegro", .module = allegro },
         .{ .name = "sqlite", .module = sqlite },
-        .{ .name = "zscrob", .module = zscrob },
+        .{ .name = "zscrobble", .module = zscrobble },
     };
 
     // C++ shim exposing TagLib embedded-art extraction. Compiled with the
     // system g++ (not Zig's clang) because libtag is built against libstdc++
     // and the std::string ABI must match at the symbol level.
-    const shim_cmd = b.addSystemCommand(&.{ "g++", "-std=c++17", "-c", "src/music/taglib_art.cpp", "-I/usr/include", "-o" });
+    const shim_cmd = b.addSystemCommand(&.{ cxx, "-std=c++17", "-c" });
+    shim_cmd.addFileArg(b.path("src/music/taglib_art.cpp"));
+    shim_cmd.addArg(b.fmt("-I{s}", .{taglib_include_root}));
+    shim_cmd.addArg("-o");
     const taglib_art_obj = shim_cmd.addOutputFileArg("taglib_art.o");
 
     // libtag.so is built with libstdc++; the shim object needs it at link
@@ -73,19 +81,26 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = imports,
     });
-    root_mod.addObjectFile(taglib_art_obj);
-    root_mod.addObjectFile(libstdcpp);
-    root_mod.addObjectFile(libgcc_s);
+    addCppShimRuntime(root_mod, target, taglib_art_obj, libstdcpp, libgcc_s);
     root_mod.addIncludePath(.{ .cwd_relative = "src/music" });
-    root_mod.addIncludePath(.{ .cwd_relative = "/usr/include/taglib" });
+    root_mod.addIncludePath(.{ .cwd_relative = taglib_include });
+    root_mod.addLibraryPath(.{ .cwd_relative = taglib_lib });
     root_mod.linkSystemLibrary("tag", .{});
 
     for (system_libs) |lib| root_mod.linkSystemLibrary(lib, .{});
     maybeUseAllegro(b, root_mod, allegro_prefix);
-    root_mod.addIncludePath(.{ .cwd_relative = "/usr/include/taglib" });
+    root_mod.addIncludePath(.{ .cwd_relative = taglib_include });
     root_mod.linkSystemLibrary("tag_c", .{});
     const exe = b.addExecutable(.{ .name = "forte-player", .root_module = root_mod });
     b.installArtifact(exe);
+    // Ship the GUI font family and licenses alongside the executable. Runtime
+    // lookup is deliberately separate so development builds can use assets/
+    // directly while packaged builds use the installed share directory.
+    b.installDirectory(.{
+        .source_dir = b.path("assets"),
+        .install_dir = .prefix,
+        .install_subdir = "share/forte-player",
+    });
 
     // ---- TUI frontend (second executable sharing the same deps) ----
     const tui_mod = b.createModule(.{
@@ -95,15 +110,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = imports,
     });
-    tui_mod.addObjectFile(taglib_art_obj);
-    tui_mod.addObjectFile(libstdcpp);
-    tui_mod.addObjectFile(libgcc_s);
+    addCppShimRuntime(tui_mod, target, taglib_art_obj, libstdcpp, libgcc_s);
     tui_mod.addIncludePath(.{ .cwd_relative = "src/music" });
-    tui_mod.addIncludePath(.{ .cwd_relative = "/usr/include/taglib" });
+    tui_mod.addIncludePath(.{ .cwd_relative = taglib_include });
+    tui_mod.addLibraryPath(.{ .cwd_relative = taglib_lib });
     tui_mod.linkSystemLibrary("tag", .{});
     for (system_libs) |lib| tui_mod.linkSystemLibrary(lib, .{});
     maybeUseAllegro(b, tui_mod, allegro_prefix);
-    tui_mod.addIncludePath(.{ .cwd_relative = "/usr/include/taglib" });
+    tui_mod.addIncludePath(.{ .cwd_relative = taglib_include });
     tui_mod.linkSystemLibrary("tag_c", .{});
     const tui_exe = b.addExecutable(.{ .name = "forte-tui", .root_module = tui_mod });
     b.installArtifact(tui_exe);
@@ -126,18 +140,33 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = imports,
     });
-    unit_mod.addObjectFile(taglib_art_obj);
-    unit_mod.addObjectFile(libstdcpp);
-    unit_mod.addObjectFile(libgcc_s);
+    addCppShimRuntime(unit_mod, target, taglib_art_obj, libstdcpp, libgcc_s);
     unit_mod.addIncludePath(.{ .cwd_relative = "src/music" });
-    unit_mod.addIncludePath(.{ .cwd_relative = "/usr/include/taglib" });
+    unit_mod.addIncludePath(.{ .cwd_relative = taglib_include });
+    unit_mod.addLibraryPath(.{ .cwd_relative = taglib_lib });
     unit_mod.linkSystemLibrary("tag", .{});
     for (system_libs) |lib| unit_mod.linkSystemLibrary(lib, .{});
     maybeUseAllegro(b, unit_mod, allegro_prefix);
+    unit_mod.addIncludePath(.{ .cwd_relative = taglib_include });
+    unit_mod.linkSystemLibrary("tag_c", .{});
 
     const unit_tests = b.addTest(.{ .root_module = unit_mod });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+}
+
+fn addCppShimRuntime(mod: *std.Build.Module, target: std.Build.ResolvedTarget, shim: std.Build.LazyPath, libstdcpp: std.Build.LazyPath, libgcc_s: std.Build.LazyPath) void {
+    mod.addObjectFile(shim);
+    switch (target.result.os.tag) {
+        .linux => {
+            // This installation has no libstdc++.so development symlink, so
+            // retain the explicit runtime objects used by the local build.
+            mod.addObjectFile(libstdcpp);
+            mod.addObjectFile(libgcc_s);
+        },
+        .macos => mod.linkSystemLibrary("c++", .{}),
+        else => mod.linkSystemLibrary("stdc++", .{}),
+    }
 }
 
 /// If a custom Allegro prefix was supplied, add <prefix>/lib to both the link

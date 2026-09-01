@@ -2,7 +2,7 @@
 
 Working name for a music player, being rewritten in Zig from
 `audio-visualizer-cpp` as a real-world exercise for the
-[allegro5-zig](https://github.com/your-org/allegro5-zig) wrapper.
+[allegro5-zig](https://github.com/chruffins/allegro5-zig) wrapper.
 
 > **Toolchain:** pinned to **Zig 0.16.0** (see `.zigversion`), matching the
 > allegro5-zig wrapper. The Zig std API churns a lot between versions (0.17-dev
@@ -20,19 +20,36 @@ Currently ported:
 - `music/library.zig` — in-memory library loaded from the DB (backs `resolve_song`)
 - `dsp/spectrum.zig` — live FFT bar spectrum for the TUI
 - `integrations/discord_rpc.zig` — Discord rich presence (local IPC socket),
-  `integrations/cover_resolver.zig` — MusicBrainz / Cover Art Archive covers
+  `integrations/cover_resolver.zig` — MusicBrainz / Cover Art Archive covers,
+  `integrations/lastfm.zig` — Last.fm scrobbling
 - `ui/` — the redesigned UI layer (`ui/ui_state.zig` + `ui/ui_view.zig` pure
-  core, `ui/tui_render.zig` terminal renderer; see `ui/DESIGN.md`)
+  core, `ui/tui_render.zig` and `ui/gui_render.zig` frontend renderers,
+  `ui/gui_input.zig` pure hit testing; see `ui/DESIGN.md`)
+- TUI artist/genre browsers with track detail views and context-aware playback,
+  playlist detail editing, queue editing, asynchronous settings rescan/theme controls, and TagLib-backed
+  metadata editing
 
 ## Build / run / test
 
 ```sh
 zig build            # compile both frontends
 zig build run        # GUI frontend (audio + optional display)
-zig build run-tui    # TUI frontend (terminal: space/n/p/s/r/+/-/q)
+zig build run-tui    # TUI frontend (terminal; press 1-8 for screens, q to quit)
 zig build test       # run headless unit tests + compile-checks
 zig build test --summary all   # verbose
 ```
+
+GUI keys: `1`-`8` switch screens, arrows or `j/k` navigate, Enter opens or
+plays, double-click activates rows, and click the footer bar to seek. `A` adds
+the selected item to the queue; `E` adds it next. On Queue, `X` removes, `C`
+clears, and Left/Right reorders. `R` on Settings starts a background rescan
+(`Esc` cancels); click a Last.fm field or press `L` to edit it, and `O`/`K` perform asynchronous Last.fm authorization. TUI screen keys: `1` now playing, `2` library, `3` albums, `4` artists,
+`5` genres, `6` playlists, `7` queue, `8` settings. Use `/` to search artist,
+genre, album, or library lists. `e` edits the selected/current track's metadata;
+`R` starts a background library scan (Esc cancels); `t` cycles the theme; `l` edits Last.fm credentials; `o` starts Last.fm authorization and `k` completes it.
+Playlist detail supports adding, removing, and reordering tracks. Queue supports moving, removing, clearing with `C`, adding selected songs or
+whole detail lists with `a`, and adding the selected item as next with `A`; the
+queue, cursor, shuffle, and repeat mode are restored on the next launch.
 
 ## Layout & test-organization
 
@@ -40,7 +57,7 @@ zig build test --summary all   # verbose
 src/
   main.zig                  # GUI frontend (thin; shares wiring via app.zig)
   tui_main.zig              # TUI frontend (terminal: space/n/p/s/r/+/-/q)
-  app.zig                   # shared composition root both frontends build on
+  app.zig                   # shared composition root; GUI uses deferred scan
   tests.zig                 # test aggregator (imports every module's tests)
   core/                     # audio engine + app shell
     allegro_init.zig
@@ -57,7 +74,8 @@ src/
     play_queue.zig          # queue / repeat / shuffle (pure, tested)
     scanner.zig             # recursive walk + change detection + upsert
     taglib_meta.zig         # TagLib metadata extraction
-    taglib_art.{zig,cpp,h}  # TagLib embedded album-art extractor (C++ shim)
+    taglib_art.{zig,cpp,h}  # TagLib artwork + metadata writing shim
+    metadata_edit.zig       # write tags, then reconcile the database
   dsp/                      # signal processing (for the TUI visualizer)
     fft.zig                 # iterative Cooley–Tukey FFT
     spectrum.zig            # log-spaced band spectrum + AGC smoother
@@ -68,8 +86,17 @@ src/
     ui_state.zig            # pure State + action reducer
     ui_view.zig             # pure State -> draw-command list
     tui_render.zig          # terminal framebuffer renderer
-    cover_art.zig           # image bytes -> half-block terminal art grid
+    gui_render.zig           # Allegro command-stream renderer
+    gui_input.zig            # pure GUI hit testing
+    gui_layout.zig           # responsive shell geometry
+    gui_framework.zig        # pure widgets, text input, slider, scroll models
+    gui_fonts.zig            # installed FontSet + asset fallback
+    gui_icons.zig            # optional packaged transport icons
+    gui_jobs.zig             # GUI scan/auth workers
+    cover_art.zig            # image bytes -> half-block terminal art grid
+    GUI_PLAN.md              # GUI visual/framework plan
     theme.zig, render.zig, ui.zig
+assets/                       # C++ fonts, licenses, icons, and logo
 
 ```
 

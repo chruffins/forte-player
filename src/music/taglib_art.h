@@ -16,6 +16,22 @@ int forte_extract_cover(const char *path,
 
 void forte_free_cover(unsigned char *data, char *mime);
 
+// Extract the ALBUMARTIST property. The returned UTF-8 string is malloc'd and
+// must be released with forte_free_string().
+char *forte_extract_album_artist(const char *path);
+unsigned int forte_extract_disc_number(const char *path);
+void forte_free_string(char *value);
+
+// Write common audio tags in-place. Empty strings clear the corresponding tag.
+// Returns 1 on success, 0 on failure; when provided, `error` receives a short
+// human-readable diagnostic (including the terminating NUL).
+int forte_write_metadata(const char *path,
+                         const char *title, const char *artist,
+                         const char *album, const char *genre,
+                         const char *comment, unsigned int year,
+                         unsigned int track, unsigned int disc,
+                         char *error, size_t error_size);
+
 #ifdef __cplusplus
 }
 #endif
