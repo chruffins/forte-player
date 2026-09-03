@@ -32,10 +32,10 @@ const theme = @import("ui/theme.zig");
 /// ticks every `timer_interval_secs`, and we only render once the event queue
 /// is drained. That gives consistent ~20 FPS for the spectrum, and lets a
 /// slow frame drop instead of backing up behind the tick rate.
-const timer_interval_secs: f64 = 0.05; // 20 ticks/sec
+const timer_interval_secs: f64 = 1.0 / 60.0; // 60 ticks/sec for smooth spectrum/rendering
 /// How often we wake while idle to poll raw terminal keys. stdin has no
 /// Allegro event source headless, so keys are read directly, not from the queue.
-const input_poll_secs: f32 = 0.025;
+const input_poll_secs: f32 = 0.01;
 
 /// TUI-specific per-song extras on top of the shared `App`. `App` owns the
 /// library/db/engine/current_path bookkeeping; this hooks Discord presence +
@@ -809,9 +809,14 @@ fn sortLabel(s: AlbumSort) []const u8 {
 }
 
 pub fn main() !void {
+    // A TUI needs a real terminal. Exit cleanly when launched from a
+    // non-interactive build/CI environment instead of initializing Allegro
+    // and trapping while trying to use terminal input/output.
+    if (!render.hasTerminal()) return;
+
     const allocator = std.heap.page_allocator;
 
-    var app = try app_mod.App.create(allocator, null, null);
+    var app = try app_mod.App.createTui(allocator, null, null);
     defer app.destroy();
     // Live audio capture for the TUI spectrum (ring fed by the mixer callback).
     app.engine.setSampleBufferCapacity(8192) catch |e| std.log.warn("sample capture resize failed: {}", .{e});
@@ -1609,7 +1614,11 @@ pub fn main() !void {
                     const aw_limit: usize = if (st.screen == .album_detail) @max(@as(usize, 8), width / 3) else width -| 52;
                     const ah_limit: usize = height -| 7;
                     const ah = @min(@min(art_max_h, ah_limit), aw_limit / 2);
-                    const width_from_height = if (ah > std.math.maxInt(usize) / 2) std.math.maxInt(usize) else ah * 2;
+                    // The cover buffer is only art_max_w cells wide, so cap
+                    // before multiplying rather than testing against usize's
+                    // maximum (which can trigger a checked-overflow trap on
+                    // some Zig 0.16 targets).
+                    const width_from_height = if (ah > art_max_w / 2) art_max_w else ah * 2;
                     const aw = @min(@min(art_max_w, aw_limit), width_from_height);
                     if (aw >= 8 and ah >= 4 and aw <= art_cells.len / ah) {
                         // Query/decode local art once. Missing or failed local art

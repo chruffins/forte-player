@@ -1,9 +1,6 @@
 const std = @import("std");
 
 const system_libs = [_][]const u8{
-    // Required by Allegro's macOS/Windows entry-point glue; available in the
-    // standard Allegro install on Linux as well.
-    "allegro_main",
     "allegro",
     "allegro_primitives",
     "allegro_image",
@@ -24,18 +21,17 @@ pub fn build(b: *std.Build) void {
     // added to the linker search path AND to the runtime search path of the
     // produced binaries so they load that build instead of the distro's.
     //   zig build -Dallegro_prefix=/path/to/allegro
-    // Prefer the user's local streaming Allegro build on Linux when it exists;
-    // this keeps the normal development command MP3-capable without baking a
-    // machine-specific home directory into the project. Other platforms and
-    // machines fall back to system Allegro. Override with
-    // `-Dallegro_prefix=<path>` when using another installation.
-    const default_allegro_prefix = if (target.result.os.tag == .linux)
-        if (b.graph.environ_map.get("HOME")) |home| b.fmt("{s}/.local/forte-allegro-streaming", .{home}) else ""
-    else
-        "";
+    // Prefer local MP3-enabled Allegro builds where the packaging helpers
+    // install them; override with `-Dallegro_prefix=<path>` when needed.
+    const default_allegro_prefix = switch (target.result.os.tag) {
+        .linux => if (b.graph.environ_map.get("HOME")) |home| b.fmt("{s}/.local/forte-allegro-streaming", .{home}) else "",
+        .macos => "/opt/homebrew/opt/allegro-mp3",
+        else => "",
+    };
     const allegro_prefix = b.option([]const u8, "allegro_prefix", "Prefix of a custom Allegro 5 install (adds <prefix>/lib to link + rpath)") orelse default_allegro_prefix;
-    const taglib_prefix = b.option([]const u8, "taglib_prefix", "TagLib installation prefix (for example /usr or /opt/homebrew/opt/taglib)") orelse "/usr";
+    const taglib_prefix = b.option([]const u8, "taglib_prefix", "TagLib installation prefix (for example /usr or /opt/homebrew/opt/taglib)") orelse if (target.result.os.tag == .macos) "/opt/homebrew" else "/usr";
     const cxx = b.option([]const u8, "cxx", "C++ compiler used for the TagLib shim") orelse if (target.result.os.tag == .macos) "clang++" else "g++";
+    const allegro_include = b.fmt("{s}/include", .{allegro_prefix});
     const taglib_include_root = b.fmt("{s}/include", .{taglib_prefix});
     const taglib_include = b.fmt("{s}/include/taglib", .{taglib_prefix});
     const taglib_lib = b.fmt("{s}/lib", .{taglib_prefix});
@@ -88,12 +84,13 @@ pub fn build(b: *std.Build) void {
     });
     addCppShimRuntime(root_mod, target, taglib_art_obj, libstdcpp, libgcc_s);
     root_mod.addIncludePath(.{ .cwd_relative = "src/music" });
+    root_mod.addIncludePath(.{ .cwd_relative = allegro_include });
     root_mod.addIncludePath(.{ .cwd_relative = taglib_include });
-    root_mod.addLibraryPath(.{ .cwd_relative = taglib_lib });
     root_mod.linkSystemLibrary("tag", .{});
 
     for (system_libs) |lib| root_mod.linkSystemLibrary(lib, .{});
     maybeUseAllegro(b, root_mod, allegro_prefix);
+    root_mod.addLibraryPath(.{ .cwd_relative = taglib_lib });
     root_mod.addIncludePath(.{ .cwd_relative = taglib_include });
     root_mod.linkSystemLibrary("tag_c", .{});
     const exe = b.addExecutable(.{ .name = "forte-player", .root_module = root_mod });
@@ -117,11 +114,12 @@ pub fn build(b: *std.Build) void {
     });
     addCppShimRuntime(tui_mod, target, taglib_art_obj, libstdcpp, libgcc_s);
     tui_mod.addIncludePath(.{ .cwd_relative = "src/music" });
+    tui_mod.addIncludePath(.{ .cwd_relative = allegro_include });
     tui_mod.addIncludePath(.{ .cwd_relative = taglib_include });
-    tui_mod.addLibraryPath(.{ .cwd_relative = taglib_lib });
     tui_mod.linkSystemLibrary("tag", .{});
     for (system_libs) |lib| tui_mod.linkSystemLibrary(lib, .{});
     maybeUseAllegro(b, tui_mod, allegro_prefix);
+    tui_mod.addLibraryPath(.{ .cwd_relative = taglib_lib });
     tui_mod.addIncludePath(.{ .cwd_relative = taglib_include });
     tui_mod.linkSystemLibrary("tag_c", .{});
     const tui_exe = b.addExecutable(.{ .name = "forte-tui", .root_module = tui_mod });
@@ -147,11 +145,12 @@ pub fn build(b: *std.Build) void {
     });
     addCppShimRuntime(unit_mod, target, taglib_art_obj, libstdcpp, libgcc_s);
     unit_mod.addIncludePath(.{ .cwd_relative = "src/music" });
+    unit_mod.addIncludePath(.{ .cwd_relative = allegro_include });
     unit_mod.addIncludePath(.{ .cwd_relative = taglib_include });
-    unit_mod.addLibraryPath(.{ .cwd_relative = taglib_lib });
     unit_mod.linkSystemLibrary("tag", .{});
     for (system_libs) |lib| unit_mod.linkSystemLibrary(lib, .{});
     maybeUseAllegro(b, unit_mod, allegro_prefix);
+    unit_mod.addLibraryPath(.{ .cwd_relative = taglib_lib });
     unit_mod.addIncludePath(.{ .cwd_relative = taglib_include });
     unit_mod.linkSystemLibrary("tag_c", .{});
 

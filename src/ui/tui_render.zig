@@ -70,6 +70,12 @@ var g_force_redraw = true;
 // Raw terminal
 // ---------------------------------------------------------------------------
 
+/// Whether stdin/stdout are attached to a terminal. This lets `zig build
+/// run-tui` fail gracefully when invoked by a build harness or CI runner.
+pub fn hasTerminal() bool {
+    return cterm.isatty(0) != 0 and cterm.isatty(1) != 0;
+}
+
 pub fn enableRaw() void {
     if (g_raw_enabled) return;
     if (cterm.tcgetattr(0, &g_old_tio) != 0) return;

@@ -16,18 +16,27 @@ Set `ALLEGRO_PREFIX` and `TAGLIB_PREFIX` when using non-system installs.
 
 ## macOS
 
-Install Allegro 5 and TagLib with Homebrew. `allegro_main` is required by
-Allegro's macOS entry-point glue and is linked by the build. Run:
+Install TagLib with Homebrew. For MP3 support, first build the Allegro branch
+with vendored minimp3:
 
 ```sh
-TAGLIB_PREFIX="$(brew --prefix taglib)" \
-ALLEGRO_PREFIX="$(brew --prefix allegro)" \
+packaging/macos/build-allegro-mp3.sh
+```
+
+Build the GUI app and DMG with:
+
+```sh
 packaging/macos/build-app.sh
 ```
 
-This creates `dist/forte-player.app` and, when `hdiutil` is available, a DMG.
-The app bundle currently contains both frontends; the TUI executable remains
-available at `Contents/MacOS/forte-tui`.
+To create an Applications-friendly TUI app (it opens a Terminal window):
+
+```sh
+packaging/macos/build-tui-app.sh
+open dist/forte player.app
+```
+
+Use `ALLEGRO_PREFIX` and `TAGLIB_PREFIX` to override dependency locations.
 
 ## Windows
 

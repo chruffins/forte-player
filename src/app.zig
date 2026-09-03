@@ -113,7 +113,7 @@ pub const App = struct {
     /// the engine + queue, and the engine's library hooks. `user`/`song_changed`
     /// are optional frontend extensions (pass both or neither).
     pub fn create(allocator: std.mem.Allocator, user: ?*anyopaque, song_changed: ?SongChangedFn) !*App {
-        return createImpl(allocator, user, song_changed, true);
+        return createImpl(allocator, user, song_changed, true, true);
     }
 
     /// Build the application without walking the music directory. Frontends
@@ -121,15 +121,21 @@ pub const App = struct {
     /// blocking startup while keeping the existing synchronous API available
     /// for non-interactive callers.
     pub fn createDeferred(allocator: std.mem.Allocator, user: ?*anyopaque, song_changed: ?SongChangedFn) !*App {
-        return createImpl(allocator, user, song_changed, false);
+        return createImpl(allocator, user, song_changed, false, true);
     }
 
-    fn createImpl(allocator: std.mem.Allocator, user: ?*anyopaque, song_changed: ?SongChangedFn, initial_scan: bool) !*App {
+    /// TUI startup uses terminal input instead of Allegro's native input
+    /// sources, which are not safe to install without an AppKit context.
+    pub fn createTui(allocator: std.mem.Allocator, user: ?*anyopaque, song_changed: ?SongChangedFn) !*App {
+        return createImpl(allocator, user, song_changed, true, false);
+    }
+
+    fn createImpl(allocator: std.mem.Allocator, user: ?*anyopaque, song_changed: ?SongChangedFn, initial_scan: bool, with_input: bool) !*App {
         const self = try allocator.create(App);
         errdefer allocator.destroy(self);
         self.* = undefined;
 
-        try allegro_init.initialize();
+        try allegro_init.initializeWithInput(with_input);
         config_mod.initAppIdentity();
 
         const config_path = try config_mod.configFilePath(allocator);
