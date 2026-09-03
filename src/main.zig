@@ -59,6 +59,10 @@ const Demo = struct {
     art_h: u16 = 0,
     analyzer: spectrum.Analyzer,
     smoother: spectrum.Smoother = .{},
+    /// The capture sequence lets the GUI avoid running an FFT when the audio
+    /// callback has not published a newer block (and when the spectrum is not
+    /// visible at all).
+    last_capture_sequence: u64 = std.math.maxInt(u64),
     audio_samples: [spectrum.n_samples]f32 = undefined,
     spectrum_bands: [spectrum.n_bands]f32 = undefined,
     auth_token: []u8 = &.{},
@@ -274,13 +278,23 @@ fn updateCurrentTrack(demo: *Demo, state: *U.State) void {
 }
 
 fn updateSpectrum(demo: *Demo, state: *U.State) void {
-    const captured = demo.app.engine.copyRecentMono(spectrum.n_samples, &demo.audio_samples);
-    if (captured == 0) {
+    // The analyzer is only visible on Now Playing. Running it on every GUI
+    // tick while browsing was wasted CPU, and on macOS it competed with the
+    // display thread for time needed by input and presentation.
+    if (state.screen != .now_playing) {
         state.spectrum = &.{};
         return;
     }
-    demo.analyzer.compute(demo.audio_samples[0..captured], &demo.spectrum_bands);
-    demo.smoother.update(&demo.spectrum_bands);
+
+    const sequence = demo.app.engine.captureSequence();
+    if (sequence != demo.last_capture_sequence) {
+        demo.last_capture_sequence = sequence;
+        const captured = demo.app.engine.copyRecentMono(spectrum.n_samples, &demo.audio_samples);
+        if (captured > 0) {
+            demo.analyzer.compute(demo.audio_samples[0..captured], &demo.spectrum_bands);
+            demo.smoother.update(&demo.spectrum_bands);
+        }
+    }
     state.spectrum = &demo.smoother.levels;
 }
 
@@ -320,7 +334,7 @@ fn updateCollections(demo: *Demo, state: *U.State) void {
     state.artist_count = demo.artists.items.len;
     state.artist_detail_tracks = demo.artist_tracks.items;
     state.artist_detail_count = demo.artist_tracks.items.len;
-    for (demo.artists.items) |artist| if (artist.id == state.artist_detail_id) {
+    if (state.screen == .artist_detail) for (demo.artists.items) |artist| if (artist.id == state.artist_detail_id) {
         state.artist_detail_name = artist.name;
         break;
     };
@@ -328,7 +342,7 @@ fn updateCollections(demo: *Demo, state: *U.State) void {
     state.genre_count = demo.genres.items.len;
     state.genre_detail_tracks = demo.genre_tracks.items;
     state.genre_detail_count = demo.genre_tracks.items.len;
-    for (demo.genres.items) |genre| if (genre.id == state.genre_detail_id) {
+    if (state.screen == .genre_detail) for (demo.genres.items) |genre| if (genre.id == state.genre_detail_id) {
         state.genre_detail_name = genre.name;
         break;
     };
@@ -336,7 +350,7 @@ fn updateCollections(demo: *Demo, state: *U.State) void {
     state.playlist_count = demo.playlists.items.len;
     state.playlist_detail_tracks = demo.playlist_tracks.items;
     state.playlist_detail_count = demo.playlist_tracks.items.len;
-    for (demo.playlists.items) |playlist| if (playlist.id == state.playlist_detail_id) {
+    if (state.screen == .playlist_detail) for (demo.playlists.items) |playlist| if (playlist.id == state.playlist_detail_id) {
         state.playlist_detail_name = playlist.name;
         break;
     };
@@ -999,7 +1013,10 @@ pub fn main() !void {
     try bootstrap.run(&queue, .{
         .width = app.config.getDisplayWidth(),
         .height = app.config.getDisplayHeight(),
-        .tick_interval_secs = 1.0 / 30.0,
+        // Keep input/render cadence at display rates. 30 Hz made pointer and
+        // row selection updates visibly laggy even when rendering itself was
+        // within budget; the timer is also the GUI's frame scheduler.
+        .tick_interval_secs = 1.0 / 60.0,
     }, .{
         .ctx = &demo,
         .on_tick = onTick,

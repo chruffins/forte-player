@@ -99,6 +99,15 @@ pub fn run(queue: *al.EventQueue, options: Options, handlers: Handlers) !void {
         queue.waitForEvent(&ev);
         switch (al.eventType(ev)) {
             .timer => {
+                // A slow frame can leave several timer events queued. Rendering
+                // each stale tick back-to-back never lets the loop catch up and
+                // also delays keyboard/mouse events. Timer events are only a
+                // cadence signal, so collapse the contiguous backlog and draw
+                // the newest state once.
+                var queued: al.Event = undefined;
+                while (queue.peekNextEvent(&queued) and al.eventType(queued) == .timer) {
+                    _ = queue.getNextEvent(&queued);
+                }
                 ticks += 1;
                 if (handlers.on_tick) |h| h(handlers.ctx);
                 if (handlers.on_render) |h| {
@@ -136,11 +145,24 @@ pub fn run(queue: *al.EventQueue, options: Options, handlers: Handlers) !void {
                 if (handlers.on_key_up) |h| h(handlers.ctx, al.eventKeyboardKeycode(ev));
             },
             .mouse_axes => {
-                if (handlers.on_mouse_motion) |h| {
-                    h(handlers.ctx, @floatFromInt(ev.mouse.x), @floatFromInt(ev.mouse.y));
+                // Cocoa/trackpads can enqueue a large burst of motion events.
+                // Processing every one before the next timer event makes the
+                // timer (and therefore rendering and row selection updates)
+                // appear to stall. Keep the newest pointer position and
+                // combine wheel deltas from the contiguous motion burst.
+                var latest = ev;
+                var wheel_delta = ev.mouse.dz;
+                var queued: al.Event = undefined;
+                while (queue.peekNextEvent(&queued) and al.eventType(queued) == .mouse_axes) {
+                    _ = queue.getNextEvent(&queued);
+                    latest = queued;
+                    wheel_delta += queued.mouse.dz;
                 }
-                if (ev.mouse.dz != 0) if (handlers.on_mouse_wheel) |h| {
-                    h(handlers.ctx, @floatFromInt(ev.mouse.x), @floatFromInt(ev.mouse.y), ev.mouse.dz);
+                if (handlers.on_mouse_motion) |h| {
+                    h(handlers.ctx, @floatFromInt(latest.mouse.x), @floatFromInt(latest.mouse.y));
+                }
+                if (wheel_delta != 0) if (handlers.on_mouse_wheel) |h| {
+                    h(handlers.ctx, @floatFromInt(latest.mouse.x), @floatFromInt(latest.mouse.y), wheel_delta);
                 };
             },
             .mouse_button_down, .mouse_button_up => {

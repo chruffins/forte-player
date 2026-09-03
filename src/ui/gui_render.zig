@@ -19,6 +19,30 @@ const framework = @import("gui_framework.zig");
 
 pub const Layout = layout_mod.Frame;
 
+// Text metrics are stable for a font/text/width tuple, but asking a TTF font
+// for its width crosses the Allegro C API. Cache the fitted prefix so static
+// rows do not repeat that work on every frame (particularly noticeable with
+// macOS's font backend).
+const WidthCacheEntry = struct {
+    valid: bool = false,
+    font_id: usize = 0,
+    text_hash: u64 = 0,
+    text_len: usize = 0,
+    max_pixels: i32 = 0,
+    fitted_len: usize = 0,
+};
+var width_cache: [256]WidthCacheEntry = [_]WidthCacheEntry{.{}} ** 256;
+var width_cache_next: usize = 0;
+
+fn textHash(text: []const u8) u64 {
+    var hash: u64 = 14695981039346656037;
+    for (text) |byte| {
+        hash ^= byte;
+        hash *%= 1099511628211;
+    }
+    return hash;
+}
+
 fn color(style: view.Style) al.Color {
     return switch (style) {
         .normal => low.textColor(),
@@ -42,12 +66,58 @@ fn drawStringClipped(font: al.font.Font, x: f32, y: f32, text: []const u8, tint:
     buf[n] = 0;
     if (max_width) |limit| {
         const max_pixels: i32 = @intFromFloat(@max(0, limit));
-        while (n > 0) {
-            buf[n] = 0;
-            if (font.getTextWidth(buf[0..n :0]) <= max_pixels) break;
-            n -= 1;
-            while (n > 0 and (buf[n] & 0xc0) == 0x80) n -= 1;
+        const original_len = n;
+        const hash = textHash(text[0..original_len]);
+        const font_id = @intFromPtr(font.data);
+        var fitted_len: ?usize = null;
+        for (width_cache) |entry| {
+            if (entry.valid and entry.font_id == font_id and entry.text_hash == hash and entry.text_len == original_len and entry.max_pixels == max_pixels) {
+                fitted_len = entry.fitted_len;
+                break;
+            }
         }
+
+        if (fitted_len) |value| {
+            n = @intCast(value);
+        } else {
+            // Font metrics are a C call and can be surprisingly expensive for
+            // a TTF backend. The old loop measured every possible UTF-8 prefix,
+            // so a long library row could make hundreds of metric calls on every
+            // frame. Build the valid prefix boundaries once, then binary-search.
+            var boundaries: [513]usize = undefined;
+            var boundary_count: usize = 1;
+            boundaries[0] = 0;
+            var index: usize = 0;
+            while (index < original_len and boundary_count < boundaries.len) {
+                index += 1;
+                while (index < original_len and (buf[index] & 0xc0) == 0x80) index += 1;
+                boundaries[boundary_count] = index;
+                boundary_count += 1;
+            }
+
+            var lo: usize = 0;
+            var hi: usize = boundary_count - 1;
+            while (lo < hi) {
+                const mid = lo + (hi - lo + 1) / 2;
+                const candidate = boundaries[mid];
+                const saved = buf[candidate];
+                buf[candidate] = 0;
+                const fits = font.getTextWidth(buf[0..candidate :0]) <= max_pixels;
+                buf[candidate] = saved;
+                if (fits) lo = mid else hi = mid - 1;
+            }
+            n = @intCast(boundaries[lo]);
+            width_cache[width_cache_next] = .{
+                .valid = true,
+                .font_id = font_id,
+                .text_hash = hash,
+                .text_len = original_len,
+                .max_pixels = max_pixels,
+                .fitted_len = boundaries[lo],
+            };
+            width_cache_next = (width_cache_next + 1) % width_cache.len;
+        }
+
         // An ellipsis makes clipped footer hints and long metadata look
         // intentional instead of ending at an arbitrary glyph boundary.
         if (n < text.len and n >= 3) {
