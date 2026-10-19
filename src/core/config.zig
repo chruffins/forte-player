@@ -87,6 +87,9 @@ pub fn assetRoot(buf: []u8) ![]const u8 {
     }
     const sys = "/usr/share/audiovis/assets";
     if (isDirectory(sys)) return sys;
+    // `zig build run` executes the cached binary, not zig-out/bin. Development
+    // assets are relative to the build's working directory in that case.
+    if (isDirectory("assets")) return std.fmt.bufPrint(buf, "assets", .{}) catch error.PathTooLong;
 
     return std.fmt.bufPrint(buf, "{s}/../assets", .{exe}) catch error.PathTooLong;
 }
@@ -146,6 +149,7 @@ pub const Config = struct {
             if (!self.inner.save(path)) return error.SaveFailed;
         }
         if (!self.load(path)) return error.LoadFailed;
+        self.migratePlaybackProfiles();
     }
 
     /// Fill with default values (mirrors generateDefaultConfig()).
@@ -162,10 +166,23 @@ pub const Config = struct {
             self.setStr("paths", "music_directory", "~/Music");
         }
         self.setStr("paths", "icon_path", "logotransparent.png");
-        self.setInt("display", "width", 1024);
-        self.setInt("display", "height", 300);
+        self.setInt("display", "width", 1120);
+        self.setInt("display", "height", 720);
         self.setInt("discord", "application_id", 0);
         self.setInt("audio", "volume_percent", 100);
+        self.setInt("audio", "crossfade_seconds", 0);
+        self.setInt("audio", "normalization_enabled", 0);
+        self.setStr("audio", "normalization_policy", "track");
+        self.setStr("profiles", "active", "Default");
+        self.setInt("profile_Default", "volume_percent", 100);
+        self.setInt("profile_Default", "normalization_enabled", 0);
+        self.setStr("profile_Default", "normalization_policy", "track");
+        self.setInt("profile_Quiet", "volume_percent", 35);
+        self.setInt("profile_Quiet", "normalization_enabled", 0);
+        self.setStr("profile_Quiet", "normalization_policy", "track");
+        self.setInt("profile_Loud", "volume_percent", 100);
+        self.setInt("profile_Loud", "normalization_enabled", 1);
+        self.setStr("profile_Loud", "normalization_policy", "album");
         self.setStr("lastfm", "api_key", "");
         self.setStr("lastfm", "shared_secret", "");
         self.setStr("lastfm", "session_key", "");
@@ -227,15 +244,85 @@ pub const Config = struct {
     }
 
     pub fn getDisplayHeight(self: *const Config) i32 {
-        return @intCast(clamp(self.getInt("display", "height", 300), 200, 8192));
+        // The GUI shell needs enough vertical room for its navigation and
+        // persistent player fascia. Old saved values below this floor are
+        // promoted on read; users can still resize the live window freely.
+        return @intCast(clamp(self.getInt("display", "height", 720), 480, 8192));
+    }
+
+    pub const PlaybackProfile = enum { Default, Quiet, Loud };
+
+    pub fn getPlaybackProfile(self: *const Config) PlaybackProfile {
+        return std.meta.stringToEnum(PlaybackProfile, self.getStr("profiles", "active", "Default")) orelse .Default;
+    }
+
+    pub fn setPlaybackProfile(self: *Config, profile: PlaybackProfile) void {
+        self.setStr("profiles", "active", @tagName(profile));
+    }
+
+    pub fn nextPlaybackProfile(self: *Config) PlaybackProfile {
+        const profile: PlaybackProfile = switch (self.getPlaybackProfile()) {
+            .Default => .Quiet,
+            .Quiet => .Loud,
+            .Loud => .Default,
+        };
+        self.setPlaybackProfile(profile);
+        return profile;
+    }
+
+    fn profileSection(self: *const Config) [:0]const u8 {
+        return switch (self.getPlaybackProfile()) {
+            .Default => "profile_Default",
+            .Quiet => "profile_Quiet",
+            .Loud => "profile_Loud",
+        };
+    }
+
+    pub fn getCrossfadeSeconds(self: *const Config) u8 {
+        return @intCast(clamp(self.getInt("audio", "crossfade_seconds", 0), 0, 30));
+    }
+
+    pub fn setCrossfadeSeconds(self: *Config, seconds: u8) void {
+        self.setInt("audio", "crossfade_seconds", @min(seconds, 30));
     }
 
     pub fn getVolumePercent(self: *const Config) i32 {
-        return @intCast(clamp(self.getInt("audio", "volume_percent", 100), 0, 100));
+        return @intCast(clamp(self.getInt(self.profileSection(), "volume_percent", 100), 0, 100));
     }
 
     pub fn setVolumePercent(self: *Config, percent: i32) void {
-        self.setInt("audio", "volume_percent", clamp(percent, 0, 100));
+        self.setInt(self.profileSection(), "volume_percent", clamp(percent, 0, 100));
+    }
+
+    pub fn getNormalizationEnabled(self: *const Config) bool {
+        return self.getInt(self.profileSection(), "normalization_enabled", 0) != 0;
+    }
+
+    pub fn setNormalizationEnabled(self: *Config, enabled: bool) void {
+        self.setInt(self.profileSection(), "normalization_enabled", @intFromBool(enabled));
+    }
+
+    pub fn getNormalizationPolicy(self: *const Config) @import("../music/loudness.zig").Policy {
+        return if (std.mem.eql(u8, self.getStr(self.profileSection(), "normalization_policy", "track"), "album")) .album else .track;
+    }
+
+    pub fn setNormalizationPolicy(self: *Config, policy: @import("../music/loudness.zig").Policy) void {
+        self.setStr(self.profileSection(), "normalization_policy", if (policy == .album) "album" else "track");
+    }
+
+    fn migratePlaybackProfiles(self: *Config) void {
+        if (self.get("profiles", "active") != null) return;
+        // Preserve legacy global audio settings as the migrated Default profile.
+        self.setInt("profile_Default", "volume_percent", clamp(self.getInt("audio", "volume_percent", 100), 0, 100));
+        self.setInt("profile_Default", "normalization_enabled", @intFromBool(self.getInt("audio", "normalization_enabled", 0) != 0));
+        self.setStr("profile_Default", "normalization_policy", if (std.mem.eql(u8, self.getStr("audio", "normalization_policy", "track"), "album")) "album" else "track");
+        self.setPlaybackProfile(.Default);
+        self.setInt("profile_Quiet", "volume_percent", 35);
+        self.setInt("profile_Quiet", "normalization_enabled", 0);
+        self.setStr("profile_Quiet", "normalization_policy", "track");
+        self.setInt("profile_Loud", "volume_percent", 100);
+        self.setInt("profile_Loud", "normalization_enabled", 1);
+        self.setStr("profile_Loud", "normalization_policy", "album");
     }
 
     // ---- Last.fm scrobbling credentials ----
@@ -389,6 +476,13 @@ fn ensureDirs(full: []const u8) void {
     }
 }
 
+test "config: cached development executables resolve shader assets" {
+    _ = al.init() catch return error.SkipZigTest;
+    const path = try resolveAssetPath(std.testing.allocator, "shaders/visualizer.vert");
+    defer std.testing.allocator.free(path);
+    try std.testing.expect(fileExists(path));
+}
+
 test "config: save/load round-trip and typed accessors" {
     _ = al.init() catch return error.SkipZigTest;
     const test_path = "/tmp/forte_config_test.ini";
@@ -399,7 +493,10 @@ test "config: save/load round-trip and typed accessors" {
     c.generateDefaults();
     c.setInt("display", "width", 1280);
     c.setInt("display", "height", 720);
-    c.setInt("audio", "volume_percent", 55);
+    c.setPlaybackProfile(.Default);
+    c.setVolumePercent(55);
+    c.setNormalizationEnabled(true);
+    c.setNormalizationPolicy(.album);
     c.setStr("paths", "music_directory", "/home/nobody/music");
     try std.testing.expect(c.save(test_path));
     try std.testing.expect(al.filesystem.filenameExists(test_path));
@@ -412,6 +509,10 @@ test "config: save/load round-trip and typed accessors" {
     try std.testing.expectEqual(@as(i64, 1280), c2.getInt("display", "width", 0));
     try std.testing.expectEqual(@as(i32, 55), c2.getVolumePercent());
     try std.testing.expect(c2.getDisplayWidth() == 1280);
+    c2.setInt("display", "height", 300);
+    try std.testing.expectEqual(@as(i32, 480), c2.getDisplayHeight());
+    try std.testing.expect(c2.getNormalizationEnabled());
+    try std.testing.expectEqual(@import("../music/loudness.zig").Policy.album, c2.getNormalizationPolicy());
 
     // clamping
     c2.setVolumePercent(200);
@@ -420,6 +521,65 @@ test "config: save/load round-trip and typed accessors" {
     try std.testing.expectEqual(@as(i32, 0), c2.getVolumePercent());
 
     _ = al.filesystem.removeFilename(test_path);
+}
+
+test "config: legacy audio preferences migrate and named profiles persist independently" {
+    _ = al.init() catch return error.SkipZigTest;
+    const test_path = "/tmp/forte_profile_migration_test.ini";
+    _ = al.filesystem.removeFilename(test_path);
+    var legacy = Config.create();
+    defer legacy.destroy();
+    legacy.setInt("audio", "volume_percent", 62);
+    legacy.setInt("audio", "normalization_enabled", 1);
+    legacy.setStr("audio", "normalization_policy", "album");
+    try std.testing.expect(legacy.save(test_path));
+
+    var migrated = Config.create();
+    defer migrated.destroy();
+    try migrated.loadOrCreate(test_path);
+    try std.testing.expectEqual(Config.PlaybackProfile.Default, migrated.getPlaybackProfile());
+    try std.testing.expectEqual(@as(i32, 62), migrated.getVolumePercent());
+    try std.testing.expect(migrated.getNormalizationEnabled());
+    try std.testing.expectEqual(@import("../music/loudness.zig").Policy.album, migrated.getNormalizationPolicy());
+
+    migrated.setVolumePercent(48);
+    migrated.setNormalizationEnabled(false);
+    migrated.setNormalizationPolicy(.track);
+    try std.testing.expectEqual(Config.PlaybackProfile.Quiet, migrated.nextPlaybackProfile());
+    try std.testing.expectEqual(@as(i32, 35), migrated.getVolumePercent());
+    try std.testing.expect(!migrated.getNormalizationEnabled());
+    try std.testing.expectEqual(Config.PlaybackProfile.Loud, migrated.nextPlaybackProfile());
+    try std.testing.expect(migrated.getNormalizationEnabled());
+    try std.testing.expectEqual(@import("../music/loudness.zig").Policy.album, migrated.getNormalizationPolicy());
+    try std.testing.expectEqual(Config.PlaybackProfile.Default, migrated.nextPlaybackProfile());
+    try std.testing.expectEqual(@as(i32, 48), migrated.getVolumePercent());
+    try std.testing.expect(!migrated.getNormalizationEnabled());
+    try std.testing.expect(migrated.save(test_path));
+
+    var loaded = Config.create();
+    defer loaded.destroy();
+    try loaded.loadOrCreate(test_path);
+    try std.testing.expectEqual(Config.PlaybackProfile.Default, loaded.getPlaybackProfile());
+    try std.testing.expectEqual(@as(i32, 48), loaded.getVolumePercent());
+    try std.testing.expect(!loaded.getNormalizationEnabled());
+    loaded.setPlaybackProfile(.Quiet);
+    try std.testing.expect(loaded.save(test_path));
+    var selected = Config.create();
+    defer selected.destroy();
+    try selected.loadOrCreate(test_path);
+    try std.testing.expectEqual(Config.PlaybackProfile.Quiet, selected.getPlaybackProfile());
+    try std.testing.expectEqual(@as(i32, 35), selected.getVolumePercent());
+    _ = al.filesystem.removeFilename(test_path);
+}
+
+test "config: crossfade setting clamps and defaults off" {
+    var config = Config.create();
+    defer config.destroy();
+    try std.testing.expectEqual(@as(u8, 0), config.getCrossfadeSeconds());
+    config.setCrossfadeSeconds(6);
+    try std.testing.expectEqual(@as(u8, 6), config.getCrossfadeSeconds());
+    config.setInt("audio", "crossfade_seconds", 99);
+    try std.testing.expectEqual(@as(u8, 30), config.getCrossfadeSeconds());
 }
 
 test "config: getInt falls back to default on missing/parse-error" {

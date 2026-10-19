@@ -1,4 +1,4 @@
-//! Bar-spectrum computation for the TUI visualizer.
+//! Spectrum computation shared by the TUI bars and GPU GUI visualizer.
 //!
 //! Takes the newest mono samples, applies a Hann window, runs the FFT, groups
 //! the magnitude bins into log-spaced bands (like a spectrum analyzer), and
@@ -34,15 +34,25 @@ pub const Smoother = struct {
     decay: f32 = 0.88,
 
     pub fn update(self: *Smoother, raw: []const f32) void {
+        self.updateTimed(raw, 1.0 / 20.0);
+    }
+
+    /// Keep the same 20 Hz envelope constants at arbitrary display cadences.
+    /// Call with zeros when paused/stopped so the meter settles naturally.
+    pub fn updateTimed(self: *Smoother, raw: []const f32, seconds: f32) void {
         std.debug.assert(raw.len == n_bands);
+        if (!std.math.isFinite(seconds) or seconds <= 0) return;
+        const frames = seconds * 20;
+        const release = std.math.pow(f32, 0.90, frames);
+        const decay = std.math.pow(f32, self.decay, frames);
         var frame_peak: f32 = 0.001;
         for (raw) |v| frame_peak = @max(frame_peak, v);
-        self.peak = if (frame_peak > self.peak) frame_peak else self.peak * 0.90 + frame_peak * 0.10;
+        self.peak = if (frame_peak > self.peak) frame_peak else self.peak * release + frame_peak * (1.0 - release);
         const gain = 0.9 / self.peak;
         for (raw, 0..) |v, i| {
             const target = @min(v * gain, 1.0);
             const cur = self.levels[i];
-            self.levels[i] = if (target >= cur) target else cur * self.decay + target * (1.0 - self.decay);
+            self.levels[i] = if (target >= cur) target else cur * decay + target * (1.0 - decay);
         }
     }
 };
@@ -189,6 +199,24 @@ test "smoother: AGC normalizes loudness with fast attack, slow decay" {
     sm2.update(&raw2);
     try std.testing.expect(sm2.levels[3] < before);
     try std.testing.expect(sm2.levels[3] > 0.0);
+}
+
+test "timed smoother decays consistently at 20 Hz and 60 Hz" {
+    var slow = Smoother{};
+    var fast = Smoother{};
+    var raw: [n_bands]f32 = @splat(0);
+    raw[4] = 0.5;
+    slow.update(&raw);
+    fast.update(&raw);
+    raw[4] = 0;
+    for (0..40) |_| slow.updateTimed(&raw, 1.0 / 20.0);
+    for (0..120) |_| fast.updateTimed(&raw, 1.0 / 60.0);
+    try std.testing.expectApproxEqAbs(slow.levels[4], fast.levels[4], 0.00001);
+    try std.testing.expect(fast.levels[4] < 0.01);
+    const before = fast.levels[4];
+    fast.updateTimed(&raw, 0);
+    fast.updateTimed(&raw, std.math.nan(f32));
+    try std.testing.expectEqual(before, fast.levels[4]);
 }
 
 fn findMax(bands: []const f32) f32 {

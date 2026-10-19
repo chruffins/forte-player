@@ -1,0 +1,49 @@
+{
+  "source_project": "audio-visualizer",
+  "source_directory": "build/assets",
+  "license": "Unknown: no attribution/license found in the source project. Verify before redistribution.",
+  "faces": [
+    {
+      "file": "right.png",
+      "axis": "+X",
+      "source_file": "2.png",
+      "source_sha256": "d2145c69b1eddb948991aa4823c24c038dd57bf3a1a5a416cd6bd0cc3801a1f5",
+      "transform": "FLIP_LEFT_RIGHT"
+    },
+    {
+      "file": "left.png",
+      "axis": "-X",
+      "source_file": "4.png",
+      "source_sha256": "36a4b5365914152340c658d29bf7571c3b290ea90da842ff8eaad122f3b834d1",
+      "transform": "FLIP_LEFT_RIGHT"
+    },
+    {
+      "file": "up.png",
+      "axis": "+Y",
+      "source_file": "6.png",
+      "source_sha256": "f5c59d3c1c06452343c71fc52ec92f47d6cb3ba56e69e5abaf6c36fccbd3008d",
+      "transform": "FLIP_TOP_BOTTOM"
+    },
+    {
+      "file": "down.png",
+      "axis": "-Y",
+      "source_file": "5.png",
+      "source_sha256": "291f1c5d2610256f7db581d89cdd245c6da9508db36262335618a8953a47a10e",
+      "transform": "FLIP_TOP_BOTTOM"
+    },
+    {
+      "file": "back.png",
+      "axis": "+Z",
+      "source_file": "3.png",
+      "source_sha256": "580937d994817059c81faf935281ff879f4f571357504929a75f9cea1260df21",
+      "transform": "FLIP_LEFT_RIGHT"
+    },
+    {
+      "file": "front.png",
+      "axis": "-Z",
+      "source_file": "1.png",
+      "source_sha256": "d881c8918259ea50fef4f0869522b760e8c3df1967d524480b967c22e487497d",
+      "transform": "FLIP_LEFT_RIGHT"
+    }
+  ]
+}

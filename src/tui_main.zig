@@ -10,6 +10,7 @@
 const std = @import("std");
 const al = @import("allegro");
 const app_mod = @import("app.zig");
+const lyrics_mod = @import("music/lyrics.zig");
 const config_mod = @import("core/config.zig");
 const cover_resolver = @import("integrations/cover_resolver.zig");
 const cover_art = @import("ui/cover_art.zig");
@@ -19,7 +20,7 @@ const spectrum = @import("dsp/spectrum.zig");
 const db_mod = @import("music/database.zig");
 const scanner = @import("music/scanner.zig");
 const taglib_meta = @import("music/taglib_meta.zig");
-const entity = @import("music/entity.zig");
+const gui_jobs = @import("ui/gui_jobs.zig");
 const metadata_edit = @import("music/metadata_edit.zig");
 const PlaybackContextType = @import("music/play_queue.zig").PlaybackContextType;
 
@@ -45,6 +46,8 @@ const SongContextCache = struct {
     artist: []const u8 = "",
     album_artist: []const u8 = "",
     album: []const u8 = "",
+    lyrics_id: i64 = -1,
+    lyrics: []const lyrics_mod.Line = &.{},
 };
 
 const TuiUser = struct {
@@ -131,6 +134,7 @@ fn runCmd(app: *app_mod.App, cmd: U.Cmd) void {
             const nv = !cur;
             db.setFavorite(id, @intFromBool(nv)) catch return;
             lib.setFavorite(id, nv);
+            if (id >= std.math.minInt(i32) and id <= std.math.maxInt(i32)) app.play_queue.setShuffleFavorite(@intCast(id), nv);
         },
         .seek => |target| engine.setProgress(target),
         .next => _ = engine.playNext() catch |e| std.log.err("next track failed: {}", .{e}),
@@ -185,7 +189,10 @@ fn fillState(st: *U.State, app: *app_mod.App, context_cache: *SongContextCache, 
                 st.artist = context_cache.artist;
                 st.album = context_cache.album;
             } else if (db.getSongContext(id) catch null) |ctx| {
-                context_cache.* = .{ .id = id, .artist = ctx.artist, .album_artist = ctx.album_artist, .album = ctx.album };
+                context_cache.id = id;
+                context_cache.artist = ctx.artist;
+                context_cache.album_artist = ctx.album_artist;
+                context_cache.album = ctx.album;
                 st.artist = ctx.artist;
                 st.album = ctx.album;
             }
@@ -241,6 +248,81 @@ fn rebuildTitles(app: *app_mod.App, out: *std.ArrayList([]const u8), arena: *std
         const title = std.fmt.allocPrint(arena.allocator(), "{s}  —  {s}  [{s}]", .{ d.title, d.artist, d.album }) catch break;
         out.append(app.allocator, title) catch break;
     }
+}
+
+fn startsWithLetter(item: []const u8, letter: u8) bool {
+    var start: usize = 0;
+    while (start < item.len and switch (item[start]) {
+        ' ', '\t', '"', '\'', '(', '[', '{' => true,
+        else => false,
+    }) : (start += 1) {}
+    return start < item.len and std.ascii.toLower(item[start]) == std.ascii.toLower(letter);
+}
+
+fn firstLetterIndex(items: []const []const u8, letter: u8) ?usize {
+    for (items, 0..) |item, index| {
+        if (startsWithLetter(item, letter)) return index;
+    }
+    return null;
+}
+
+test "TUI letter jump ignores leading punctuation and case" {
+    const items = [_][]const u8{ "  #intro", "'Alpha", "beta" };
+    try std.testing.expectEqual(@as(?usize, 1), firstLetterIndex(&items, 'a'));
+    try std.testing.expectEqual(@as(?usize, 2), firstLetterIndex(&items, 'B'));
+    try std.testing.expect(firstLetterIndex(&items, 'z') == null);
+}
+
+fn jumpToLetter(
+    st: *U.State,
+    letter: u8,
+    library_titles: []const []const u8,
+    albums: []const U.AlbumRow,
+    artists: []const U.ArtistRow,
+    genres: []const U.GenreRow,
+    playlists: []const U.PlaylistRow,
+    queue: []const U.QueueRow,
+) bool {
+    const index = switch (st.screen) {
+        .library => firstLetterIndex(library_titles, letter),
+        .albums => blk: {
+            for (albums, 0..) |row, i| {
+                if (startsWithLetter(row.title, letter)) break :blk i;
+            }
+            break :blk null;
+        },
+        .artists => blk: {
+            for (artists, 0..) |row, i| {
+                if (startsWithLetter(row.name, letter)) break :blk i;
+            }
+            break :blk null;
+        },
+        .genres => blk: {
+            for (genres, 0..) |row, i| {
+                if (startsWithLetter(row.name, letter)) break :blk i;
+            }
+            break :blk null;
+        },
+        .playlists => blk: {
+            for (playlists, 0..) |row, i| {
+                if (startsWithLetter(row.name, letter)) break :blk i;
+            }
+            break :blk null;
+        },
+        .queue => blk: {
+            for (queue, 0..) |row, i| {
+                if (startsWithLetter(row.title, letter)) break :blk i;
+            }
+            break :blk null;
+        },
+        else => null,
+    };
+    if (index) |i| {
+        st.selection = i;
+        st.scroll = i;
+        return true;
+    }
+    return false;
 }
 
 fn rebuildLibraryView(all_titles: []const []const u8, out_titles: *std.ArrayList([]const u8), out_indices: *std.ArrayList(usize), allocator: std.mem.Allocator, filter: []const u8) void {
@@ -361,7 +443,7 @@ fn rebuildPlaylistRows(app: *app_mod.App, rows: *std.ArrayList(U.PlaylistRow), a
             allocator.free(name);
             break;
         };
-        rows.append(allocator, .{ .id = p.id, .name = name, .description = description, .song_count = p.song_count }) catch {
+        rows.append(allocator, .{ .id = p.id, .name = name, .description = description, .song_count = p.song_count, .is_smart = p.is_smart }) catch {
             allocator.free(name);
             allocator.free(description);
             break;
@@ -434,48 +516,45 @@ fn loadAlbumTracks(app: *app_mod.App, out: *std.ArrayList(U.AlbumTrackRow), allo
     clearAlbumTracks(out, allocator);
     var query_arena = std.heap.ArenaAllocator.init(allocator);
     defer query_arena.deinit();
-    const songs = app.db.getSongsByAlbumWithAllocator(query_arena.allocator(), album_id) catch return;
-    appendTrackRows(app, out, allocator, query_arena.allocator(), songs);
+    const listings = app.db.getTrackListingsByAlbumWithAllocator(query_arena.allocator(), album_id) catch return;
+    appendTrackRows(out, allocator, listings);
 }
 
 fn loadArtistTracks(app: *app_mod.App, out: *std.ArrayList(U.AlbumTrackRow), allocator: std.mem.Allocator, artist_id: i64) void {
     clearAlbumTracks(out, allocator);
     var query_arena = std.heap.ArenaAllocator.init(allocator);
     defer query_arena.deinit();
-    const songs = app.db.getSongsByArtistWithAllocator(query_arena.allocator(), artist_id) catch return;
-    appendTrackRows(app, out, allocator, query_arena.allocator(), songs);
+    const listings = app.db.getTrackListingsByArtistWithAllocator(query_arena.allocator(), artist_id) catch return;
+    appendTrackRows(out, allocator, listings);
 }
 
 fn loadGenreTracks(app: *app_mod.App, out: *std.ArrayList(U.AlbumTrackRow), allocator: std.mem.Allocator, genre_id: i64) void {
     clearAlbumTracks(out, allocator);
     var query_arena = std.heap.ArenaAllocator.init(allocator);
     defer query_arena.deinit();
-    const songs = app.db.getSongsByGenreWithAllocator(query_arena.allocator(), genre_id) catch return;
-    appendTrackRows(app, out, allocator, query_arena.allocator(), songs);
+    const listings = app.db.getTrackListingsByGenreWithAllocator(query_arena.allocator(), genre_id) catch return;
+    appendTrackRows(out, allocator, listings);
 }
 
 fn loadPlaylistTracks(app: *app_mod.App, out: *std.ArrayList(U.AlbumTrackRow), allocator: std.mem.Allocator, playlist_id: i64) void {
     clearAlbumTracks(out, allocator);
     var query_arena = std.heap.ArenaAllocator.init(allocator);
     defer query_arena.deinit();
-    const songs = app.db.getPlaylistTracksWithAllocator(query_arena.allocator(), playlist_id) catch return;
-    appendTrackRows(app, out, allocator, query_arena.allocator(), songs);
+    const listings = if (app.db.isSmartPlaylist(playlist_id))
+        app.db.getTrackListingsBySmartPlaylistWithAllocator(query_arena.allocator(), playlist_id) catch return
+    else
+        app.db.getTrackListingsByPlaylistWithAllocator(query_arena.allocator(), playlist_id) catch return;
+    appendTrackRows(out, allocator, listings);
 }
 
-fn appendTrackRows(app: *app_mod.App, out: *std.ArrayList(U.AlbumTrackRow), allocator: std.mem.Allocator, arena: std.mem.Allocator, songs: []const entity.Song) void {
-    for (songs) |s| {
-        const title = allocator.dupe(u8, s.title) catch break;
-        const artist = if (app.db.getSongContextWithAllocator(arena, s.id) catch null) |ctx|
-            allocator.dupe(u8, ctx.artist) catch {
-                allocator.free(title);
-                break;
-            }
-        else
-            allocator.dupe(u8, "Unknown Artist") catch {
-                allocator.free(title);
-                break;
-            };
-        out.append(allocator, .{ .title = title, .artist = artist, .track = s.track, .disc_number = s.disc_number, .duration = s.duration, .song_id = s.id }) catch {
+fn appendTrackRows(out: *std.ArrayList(U.AlbumTrackRow), allocator: std.mem.Allocator, listings: []const db_mod.Database.TrackListing) void {
+    for (listings) |listing| {
+        const title = allocator.dupe(u8, listing.title) catch break;
+        const artist = allocator.dupe(u8, if (listing.artist.len > 0) listing.artist else "Unknown Artist") catch {
+            allocator.free(title);
+            break;
+        };
+        out.append(allocator, .{ .title = title, .artist = artist, .track = listing.track, .disc_number = listing.disc_number, .duration = listing.duration, .song_id = listing.id }) catch {
             allocator.free(title);
             allocator.free(artist);
             break;
@@ -485,6 +564,81 @@ fn appendTrackRows(app: *app_mod.App, out: *std.ArrayList(U.AlbumTrackRow), allo
 
 fn playSongSet(app: *app_mod.App, ids: []const i64, context_type: PlaybackContextType, context_id: i64, start_index: usize) bool {
     return app.playSongIdsInContext(ids, context_type, context_id, start_index) != null;
+}
+
+const ContextTrack = struct {
+    id: i64,
+    title: []const u8,
+    artist: []const u8,
+    favorite: bool,
+};
+
+fn contextTrack(app: *app_mod.App, id: i64, title: []const u8, artist: []const u8) ?ContextTrack {
+    const song = app.lib.getSongById(id) orelse return null;
+    return .{
+        .id = id,
+        .title = if (title.len > 0) title else song.title,
+        .artist = artist,
+        .favorite = song.favorite != 0,
+    };
+}
+
+fn selectedContextTrack(app: *app_mod.App, state: *const U.State, library_indices: []const usize, album_tracks: []const U.AlbumTrackRow, artist_tracks: []const U.AlbumTrackRow, genre_tracks: []const U.AlbumTrackRow, playlist_tracks: []const U.AlbumTrackRow, queue_rows: []const U.QueueRow) ?ContextTrack {
+    switch (state.screen) {
+        .now_playing => {
+            if (!app.has_current_path) return null;
+            const id = app.lib.songIdByPath(app.current_path) orelse return null;
+            return contextTrack(app, id, state.title, state.artist);
+        },
+        .library => {
+            if (state.selection >= library_indices.len) return null;
+            const id = app.lib.songIdAt(library_indices[state.selection]);
+            const song = app.lib.getSongById(id) orelse return null;
+            const context = app.db.getSongContext(id) catch null;
+            return contextTrack(app, id, song.title, if (context) |value| value.artist else "Unknown Artist");
+        },
+        .album_detail => if (state.selection < album_tracks.len) {
+            const track = album_tracks[state.selection];
+            return contextTrack(app, track.song_id, track.title, track.artist);
+        } else return null,
+        .artist_detail => if (state.selection < artist_tracks.len) {
+            const track = artist_tracks[state.selection];
+            return contextTrack(app, track.song_id, track.title, track.artist);
+        } else return null,
+        .genre_detail => if (state.selection < genre_tracks.len) {
+            const track = genre_tracks[state.selection];
+            return contextTrack(app, track.song_id, track.title, track.artist);
+        } else return null,
+        .playlist_detail => if (state.selection < playlist_tracks.len) {
+            const track = playlist_tracks[state.selection];
+            return contextTrack(app, track.song_id, track.title, track.artist);
+        } else return null,
+        .queue => if (state.selection < queue_rows.len) {
+            const track = queue_rows[state.selection];
+            return contextTrack(app, track.song_id, track.title, track.artist);
+        } else return null,
+        else => return null,
+    }
+}
+
+fn runContextAction(app: *app_mod.App, track_id: i64, selected: usize, metadata_editor: *MetadataEditor) void {
+    switch (selected) {
+        0 => _ = app.playSongId(track_id) catch |e| std.log.err("play context track failed: {}", .{e}),
+        1 => if (!addQueueSong(app, track_id, false)) std.log.err("add context track to queue failed", .{}),
+        2 => if (!addQueueSong(app, track_id, true)) std.log.err("play context track next failed", .{}),
+        3 => {
+            const current = if (app.lib.getSongById(track_id)) |song| song.favorite != 0 else false;
+            const next = !current;
+            app.db.setFavorite(track_id, @intFromBool(next)) catch |e| {
+                std.log.err("toggle context favorite failed: {}", .{e});
+                return;
+            };
+            app.lib.setFavorite(track_id, next);
+            if (track_id >= std.math.minInt(i32) and track_id <= std.math.maxInt(i32)) app.play_queue.setShuffleFavorite(@intCast(track_id), next);
+        },
+        4 => metadata_editor.start(app, track_id),
+        else => {},
+    }
 }
 
 fn addQueueSong(app: *app_mod.App, id: i64, next: bool) bool {
@@ -636,9 +790,10 @@ const ScanJob = struct {
 };
 
 const SearchBuffer = struct {
-    storage: [128]u8 = undefined,
+    storage: [512]u8 = undefined,
     len: usize = 0,
     active: bool = false,
+    truncated: bool = false,
 
     fn slice(self: *const SearchBuffer) []const u8 {
         return self.storage[0..self.len];
@@ -652,6 +807,14 @@ const SearchBuffer = struct {
     fn clear(self: *SearchBuffer) void {
         self.len = 0;
         self.active = false;
+        self.truncated = false;
+    }
+
+    fn backspace(self: *SearchBuffer) void {
+        if (self.len == 0) return;
+        self.len -= 1;
+        while (self.len > 0 and (self.storage[self.len] & 0xc0) == 0x80) self.len -= 1;
+        if (self.len == 0) self.truncated = false;
     }
 
     fn handle(self: *SearchBuffer, key: u8) SearchEdit {
@@ -661,10 +824,10 @@ const SearchBuffer = struct {
         }
         if (key == 8 or key == 127) {
             if (self.len == 0) return .unchanged;
-            self.len -= 1;
+            self.backspace();
             return .changed;
         }
-        if (key >= 32 and key < 127 and self.len < self.storage.len) {
+        if (key >= 32 and key != 127 and self.len < self.storage.len) {
             self.storage[self.len] = key;
             self.len += 1;
             return .changed;
@@ -705,9 +868,11 @@ const MetadataEditor = struct {
 
     fn set(self: *MetadataEditor, index: usize, value: []const u8) void {
         if (index >= self.fields.len) return;
-        const n = @min(value.len, self.fields[index].storage.len);
+        var n = @min(value.len, self.fields[index].storage.len);
+        while (n > 0 and !std.unicode.utf8ValidateSlice(value[0..n])) n -= 1;
         @memcpy(self.fields[index].storage[0..n], value[0..n]);
         self.fields[index].len = n;
+        self.fields[index].truncated = n < value.len;
     }
 
     fn setInt(self: *MetadataEditor, index: usize, value: i64) void {
@@ -729,11 +894,17 @@ const MetadataEditor = struct {
     }
 
     fn save(self: *const MetadataEditor, app: *app_mod.App) !void {
+        for (self.fields) |field| {
+            if (field.truncated) return error.MetadataFieldTooLong;
+        }
         const parse = struct {
             fn get(s: []const u8) ?u32 {
-                return std.fmt.parseInt(u32, std.mem.trim(u8, s, " "), 10) catch null;
+                return std.fmt.parseInt(u32, std.mem.trim(u8, s, " \t\r\n"), 10) catch null;
             }
         }.get;
+        for (self.fields[5..8]) |field| {
+            if (field.len > 0 and parse(field.slice()) == null) return error.InvalidNumericMetadata;
+        }
         try metadata_edit.editSong(&app.db, app.allocator, self.song_id, .{
             .title = self.fields[0].slice(),
             .artist = self.fields[1].slice(),
@@ -840,6 +1011,10 @@ pub fn main() !void {
     defer if (scrobbler) |s| s.destroy();
 
     var context_cache = SongContextCache{};
+    defer {
+        for (context_cache.lyrics) |line| allocator.free(line.text);
+        if (context_cache.lyrics.len > 0) allocator.free(context_cache.lyrics);
+    }
     var tui_user = TuiUser{
         .app = app,
         .song_context = &context_cache,
@@ -984,6 +1159,7 @@ pub fn main() !void {
     var analyzer = spectrum.Analyzer.init(spectrum.default_sample_rate, .a_weight);
     var smoother = spectrum.Smoother{};
     var last_capture_sequence: u64 = std.math.maxInt(u64);
+    var spectrum_ticks: u8 = 0;
     // Album art scratch (persist so we fetch/decode once per album).
     const art_max_w: usize = 32;
     const art_max_h: usize = 17;
@@ -1008,11 +1184,16 @@ pub fn main() !void {
     var auto_advance_handled = false;
     var scan_job = ScanJob{ .allocator = allocator, .app = app };
     var scan_running = false;
+    var health_job = gui_jobs.HealthJob{ .allocator = allocator };
+    var health_running = false;
     defer {
         if (scan_running) scan_job.cancel.store(true, .release);
+        if (health_running) health_job.requestCancel();
         scan_job.deinit();
+        health_job.deinit();
     }
     var quitting = false;
+    var jump_pending = false;
     while (!quitting) {
         // Wait for a timer tick, or the poll timeout so we can service stdin.
         if (tqueue.waitForEventTimed(&ev, input_poll_secs)) {
@@ -1029,8 +1210,23 @@ pub fn main() !void {
                 quitting = true;
                 break;
             }
+            if (st.help_visible) {
+                if (k == '?' or k == 27) st.help_visible = false;
+                continue;
+            }
             if (scan_running) {
                 if (k == 27) scan_job.cancel.store(true, .release);
+                continue;
+            }
+            if (health_running) {
+                if (k == 27) health_job.requestCancel();
+                continue;
+            }
+            if (jump_pending) {
+                jump_pending = false;
+                if (k >= 32 and k < 127) {
+                    _ = jumpToLetter(&st, k, library_view_titles.items, album_rows.items, artist_rows.items, genre_rows.items, playlist_rows.items, queue_rows.items);
+                }
                 continue;
             }
             if (settings_editor.active) {
@@ -1039,7 +1235,7 @@ pub fn main() !void {
                     continue;
                 }
                 if (k == 8 or k == 127) {
-                    if (settings_editor.fields[settings_editor.index].len > 0) settings_editor.fields[settings_editor.index].len -= 1;
+                    settings_editor.fields[settings_editor.index].backspace();
                     continue;
                 }
                 if (k == '\n' or k == '\r') {
@@ -1049,7 +1245,7 @@ pub fn main() !void {
                     }
                     continue;
                 }
-                if (k >= 32 and k < 127 and settings_editor.fields[settings_editor.index].len < settings_editor.fields[settings_editor.index].storage.len) {
+                if (k >= 32 and k != 127 and settings_editor.fields[settings_editor.index].len < settings_editor.fields[settings_editor.index].storage.len) {
                     const field = &settings_editor.fields[settings_editor.index];
                     field.storage[field.len] = k;
                     field.len += 1;
@@ -1061,13 +1257,28 @@ pub fn main() !void {
                     metadata_editor.active = false;
                     continue;
                 }
+                if (k == '\t' or k == 14) {
+                    metadata_editor.index = (metadata_editor.index + 1) % metadata_editor.fields.len;
+                    continue;
+                }
+                if (k == 16) {
+                    metadata_editor.index = (metadata_editor.index + metadata_editor.fields.len - 1) % metadata_editor.fields.len;
+                    continue;
+                }
+                if (k == 21) {
+                    metadata_editor.fields[metadata_editor.index].clear();
+                    continue;
+                }
                 if (k == 8 or k == 127) {
-                    if (metadata_editor.fields[metadata_editor.index].len > 0) metadata_editor.fields[metadata_editor.index].len -= 1;
+                    metadata_editor.fields[metadata_editor.index].backspace();
                     continue;
                 }
                 if (k == '\n' or k == '\r') {
                     if (metadata_editor.advance()) {
-                        metadata_editor.save(app) catch |e| std.log.err("metadata save failed: {}", .{e});
+                        metadata_editor.save(app) catch |e| {
+                            std.log.err("metadata save failed: {}", .{e});
+                            continue;
+                        };
                         const current_id = if (app.has_current_path) app.lib.songIdByPath(app.current_path) else null;
                         app.has_current_path = false;
                         app.lib.load(&app.db) catch |e| std.log.err("library reload failed: {}", .{e});
@@ -1098,7 +1309,7 @@ pub fn main() !void {
                     }
                     continue;
                 }
-                if (k >= 32 and k < 127 and metadata_editor.fields[metadata_editor.index].len < metadata_editor.fields[metadata_editor.index].storage.len) {
+                if (k >= 32 and k != 127 and metadata_editor.fields[metadata_editor.index].len < metadata_editor.fields[metadata_editor.index].storage.len) {
                     const field = &metadata_editor.fields[metadata_editor.index];
                     field.storage[field.len] = k;
                     field.len += 1;
@@ -1121,9 +1332,57 @@ pub fn main() !void {
                 }
                 continue;
             }
+            if (st.context_menu_open) {
+                if (k == 27 or k == 'v') {
+                    st.context_menu_open = false;
+                    continue;
+                }
+                if (k == '?') {
+                    st.context_menu_open = false;
+                    st.help_visible = true;
+                    continue;
+                }
+                if (k == 'j') st.context_menu_selection = @min(st.context_menu_selection + 1, 4);
+                if (k == 'k') st.context_menu_selection -|= 1;
+                if ((k == '\n' or k == '\r') and st.context_menu_song_id >= 0) {
+                    runContextAction(app, st.context_menu_song_id, st.context_menu_selection, &metadata_editor);
+                    st.context_menu_open = false;
+                } else if (k >= '1' and k <= '5' and st.context_menu_song_id >= 0) {
+                    st.context_menu_selection = @intCast(k - '1');
+                    runContextAction(app, st.context_menu_song_id, st.context_menu_selection, &metadata_editor);
+                    st.context_menu_open = false;
+                }
+                continue;
+            }
+            if (k == 'v') {
+                if (selectedContextTrack(app, &st, library_view_indices.items, album_tracks.items, artist_detail_tracks.items, genre_detail_tracks.items, playlist_tracks.items, queue_rows.items)) |track| {
+                    st.context_menu_song_id = track.id;
+                    st.context_menu_title = track.title;
+                    st.context_menu_artist = track.artist;
+                    st.context_menu_favorite = track.favorite;
+                    _ = U.apply(&st, .toggle_context_menu, 0);
+                }
+                continue;
+            }
             if (k == 'n' and st.screen == .playlists) {
                 playlist_edit_id = -1;
                 playlist_editor.begin();
+                continue;
+            }
+            if (st.screen == .playlists and (k == 'm' or k == 'M' or k == 'R' or k == 'S')) {
+                const template = switch (k) {
+                    'm' => .{ "Favorites", db_mod.Database.SmartRule.favorites, "" },
+                    'M' => .{ "Most played", db_mod.Database.SmartRule.most_played, "" },
+                    'R' => .{ "Recently played", db_mod.Database.SmartRule.recently_played, "" },
+                    else => .{ "Short tracks", db_mod.Database.SmartRule.short_tracks, "300" },
+                };
+                var exists = false;
+                for (playlist_rows.items) |row| if (std.mem.eql(u8, row.name, template[0])) {
+                    exists = true;
+                    break;
+                };
+                if (!exists) _ = app.db.createSmartPlaylist(template[0], template[1], template[2], 100) catch |e| std.log.err("create smart playlist failed: {}", .{e});
+                rebuildPlaylistRows(app, &playlist_rows, allocator);
                 continue;
             }
             if (k == 'r' and st.screen == .playlists and st.selection < playlist_rows.items.len) {
@@ -1239,6 +1498,12 @@ pub fn main() !void {
                 }
                 continue;
             }
+            if (k == 'g' and !album_search.active and !library_search.active and !artist_search.active and !genre_search.active and
+                (st.screen == .library or st.screen == .albums or st.screen == .artists or st.screen == .genres or st.screen == .playlists or st.screen == .queue))
+            {
+                jump_pending = true;
+                continue;
+            }
             if (album_search.active) {
                 const edit = album_search.handle(k);
                 if (edit == .changed) {
@@ -1329,6 +1594,38 @@ pub fn main() !void {
                 st.scroll = 0;
                 continue;
             }
+            if (k == 'p' and st.screen == .settings) {
+                _ = app.config.nextPlaybackProfile();
+                app.engine.setGain(@as(f32, @floatFromInt(app.config.getVolumePercent())) / 100.0);
+                app.saveConfig();
+                app.refreshNormalization();
+                continue;
+            }
+            if (k == 'n' and st.screen == .settings) {
+                app.config.setNormalizationEnabled(!app.config.getNormalizationEnabled());
+                app.saveConfig();
+                app.refreshNormalization();
+                continue;
+            }
+            if (k == 'm' and st.screen == .settings) {
+                app.config.setNormalizationPolicy(if (app.config.getNormalizationPolicy() == .track) .album else .track);
+                app.saveConfig();
+                app.refreshNormalization();
+                continue;
+            }
+            if (k == 'x' and st.screen == .settings) {
+                const current = app.config.getCrossfadeSeconds();
+                const next: u8 = switch (current) {
+                    0 => 3,
+                    3 => 6,
+                    6 => 10,
+                    else => 0,
+                };
+                app.config.setCrossfadeSeconds(next);
+                app.engine.setCrossfadeSecs(@floatFromInt(next));
+                app.saveConfig();
+                continue;
+            }
             if (k == 'l' and st.screen == .settings) {
                 settings_editor.start(app);
                 continue;
@@ -1368,6 +1665,25 @@ pub fn main() !void {
                     app.lib.songIdAt(library_view_indices.items[st.selection])
                 else if (app.has_current_path) app.lib.songIdByPath(app.current_path) orelse -1 else -1;
                 if (song_id >= 0) metadata_editor.start(app, song_id);
+                continue;
+            }
+            if (k == 'H' and st.screen == .settings) {
+                health_job.reset();
+                st.health_findings = &.{};
+                st.health_status = "Library health report running (read-only)...";
+                var health_arena = std.heap.ArenaAllocator.init(allocator);
+                defer health_arena.deinit();
+                const known_rows = app.db.getAllSongPathsWithAllocator(health_arena.allocator()) catch {
+                    st.health_status = "Could not read library paths; no report was run.";
+                    continue;
+                };
+                const known = health_arena.allocator().alloc([]const u8, known_rows.len) catch continue;
+                for (known_rows, 0..) |row, index| known[index] = row.path;
+                health_job.start(app.config.getMusicDirectory(), known) catch {
+                    st.health_status = "Could not start library health report.";
+                    continue;
+                };
+                health_running = true;
                 continue;
             }
             if (k == 'R' and st.screen == .settings) {
@@ -1432,19 +1748,35 @@ pub fn main() !void {
                             if (row.id == id) st.playlist_detail_name = row.name;
                         }
                     },
-                    .play_playlist_track => |i| if (app.playPlaylist(st.playlist_detail_id, i) == null) std.log.err("failed to play playlist track {d}", .{i}),
+                    .play_playlist_track => |i| {
+                        const played = if (app.db.isSmartPlaylist(st.playlist_detail_id))
+                            playTrackRows(app, playlist_tracks.items, i, .Playlist, st.playlist_detail_id)
+                        else
+                            app.playPlaylist(st.playlist_detail_id, i) != null;
+                        if (!played) std.log.err("failed to play playlist track {d}", .{i});
+                    },
                     .play_index => |i| if (i < library_view_indices.items.len) {
                         const full_index = library_view_indices.items[i];
                         const id = app.lib.songIdAt(full_index);
                         _ = app.playSongId(id) catch |e| std.log.err("play selected song failed: {}", .{e});
                     },
-                    .play_playlist => |playlist_id| if (app.playPlaylist(playlist_id, 0) == null) std.log.err("failed to play playlist {d}", .{playlist_id}),
+                    .play_playlist => |playlist_id| {
+                        if (app.db.isSmartPlaylist(playlist_id)) {
+                            loadPlaylistTracks(app, &playlist_tracks, allocator, playlist_id);
+                            if (!playTrackRows(app, playlist_tracks.items, 0, .Playlist, playlist_id)) std.log.err("failed to play smart playlist {d}", .{playlist_id});
+                        } else if (app.playPlaylist(playlist_id, 0) == null) std.log.err("failed to play playlist {d}", .{playlist_id});
+                    },
                     .play_queue_index => |i| if (i < app.play_queue.items().len) {
                         _ = app.playQueueIndex(i) catch |e| std.log.err("play queue item failed: {}", .{e});
                     },
                     else => runCmd(app, cmd),
                 }
             }
+        }
+
+        if (health_running and health_job.status.load(.acquire) != 1) {
+            health_job.join();
+            health_running = false;
         }
 
         if (scan_running and scan_job.status.load(.acquire) != 1) {
@@ -1519,6 +1851,18 @@ pub fn main() !void {
             // arenas; release this scratch arena before rebuilding each frame.
             _ = query_arena.reset(.free_all);
             fillState(&st, app, &context_cache, album_rows.items, album_tracks.items, artist_detail_tracks.items, genre_detail_tracks.items, playlist_tracks.items, sortLabel(album_sort));
+            const lyric_id = if (st.path.len > 0) app.lib.songIdByPath(st.path) orelse -1 else -1;
+            if (context_cache.lyrics_id != lyric_id) {
+                for (context_cache.lyrics) |line| allocator.free(line.text);
+                if (context_cache.lyrics.len > 0) allocator.free(context_cache.lyrics);
+                context_cache.lyrics = &.{};
+                context_cache.lyrics_id = lyric_id;
+                if (lyric_id >= 0) {
+                    if (lyrics_mod.loadSidecar(allocator, st.path) catch null) |found| context_cache.lyrics = found.lines;
+                }
+            }
+            st.lyrics = context_cache.lyrics;
+            st.active_lyric = (lyrics_mod.Lyrics{ .lines = st.lyrics }).activeLine(st.position);
             st.album_filter = album_search.slice();
             st.album_searching = album_search.active;
             st.library_filter = library_search.slice();
@@ -1540,6 +1884,16 @@ pub fn main() !void {
             st.metadata_editing = metadata_editor.active;
             st.metadata_field = if (metadata_editor.active) metadata_editor.fieldName() else "";
             st.metadata_value = if (metadata_editor.active) metadata_editor.current() else "";
+            var metadata_rows: [MetadataEditor.field_names.len]U.MetadataField = undefined;
+            if (metadata_editor.active) {
+                for (MetadataEditor.field_names, metadata_editor.fields, 0..) |name, field, index| {
+                    metadata_rows[index] = .{ .name = name, .value = field.slice() };
+                }
+                st.metadata_fields = &metadata_rows;
+                st.metadata_active_index = metadata_editor.index;
+            } else {
+                st.metadata_fields = &.{};
+            }
             st.metadata_song_title = "";
             if (metadata_editor.active) {
                 if (app.db.getSongById(metadata_editor.song_id) catch null) |edited_song| {
@@ -1548,21 +1902,34 @@ pub fn main() !void {
             }
             st.settings_music_directory = app.config.getMusicDirectory();
             st.settings_lastfm_enabled = app.config.getLastFmApiKey().len > 0 and app.config.getLastFmSessionKey().len > 0;
+            st.settings_normalization_enabled = app.config.getNormalizationEnabled();
+            st.settings_normalization_album = app.config.getNormalizationPolicy() == .album;
+            st.settings_playback_profile = @tagName(app.config.getPlaybackProfile());
+            st.settings_crossfade_seconds = app.config.getCrossfadeSeconds();
             st.settings_editing = settings_editor.active;
             st.settings_field = if (settings_editor.active) settings_editor.fieldName() else "";
             st.settings_value = if (settings_editor.active) settings_editor.current() else "";
             st.settings_auth_status = auth_status;
             st.settings_auth_url = if (auth_ticket) |ticket| ticket.url else "";
+            st.health_running = health_running;
+            st.health_scanned = health_job.scanned.load(.acquire);
+            const health_status = health_job.status.load(.acquire);
+            if (health_status == 2) health_job.join();
+            st.health_findings = if (health_status == 2) blk: {
+                if (health_job.report) |*report| break :blk report.findings.items;
+                break :blk &.{};
+            } else &.{};
+            st.health_status = if (health_running) "Library health report running (read-only)..." else switch (health_status) {
+                2 => "Health report complete (read-only).",
+                3 => "Health report failed: root/file inaccessible or traversal incomplete; missing-file results withheld.",
+                4 => "Health report cancelled; partial findings discarded.",
+                else => st.health_status,
+            };
             st.row_count = library_view_titles.items.len;
             st.playing_index = null;
             if (app.lib.songIdByPath(st.path)) |current_id| {
                 if (app.lib.indexOfId(current_id)) |full_index| {
-                    for (library_view_indices.items, 0..) |source_index, visible_index| {
-                        if (source_index == full_index) {
-                            st.playing_index = visible_index;
-                            break;
-                        }
-                    }
+                    st.playing_index = U.sortedIndexOf(library_view_indices.items, full_index);
                 }
             }
 
@@ -1572,13 +1939,20 @@ pub fn main() !void {
             // Refresh the spectrum only while visible and only when the audio
             // callback published a newer sample block.
             if (st.screen == .now_playing) {
-                const sequence = app.engine.captureSequence();
-                if (sequence != last_capture_sequence) {
-                    last_capture_sequence = sequence;
-                    const got = app.engine.copyRecentMono(sample_buf.len, &sample_buf);
-                    if (got > 0) {
-                        analyzer.compute(sample_buf[0..got], &raw_bands);
-                        smoother.update(&raw_bands);
+                // Render at 60 Hz, but update the analyzer at 20 Hz. This is
+                // sufficient for a smooth visualizer and leaves more CPU for
+                // terminal drawing and input processing.
+                spectrum_ticks += 1;
+                if (spectrum_ticks >= 3) {
+                    spectrum_ticks = 0;
+                    const sequence = app.engine.captureSequence();
+                    if (sequence != last_capture_sequence) {
+                        last_capture_sequence = sequence;
+                        const got = app.engine.copyRecentMono(sample_buf.len, &sample_buf);
+                        if (got > 0) {
+                            analyzer.compute(sample_buf[0..got], &raw_bands);
+                            smoother.update(&raw_bands);
+                        }
                     }
                 }
                 st.spectrum = smoother.levels[0..];

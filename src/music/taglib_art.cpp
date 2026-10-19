@@ -23,6 +23,7 @@
 
 #include <cctype>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -172,6 +173,34 @@ bool folderCover(const std::string &path, CoverData &out) {
     return false;
 }
 
+std::string normalizedKey(const TagLib::String &key) {
+    std::string value = key.to8Bit(true);
+    std::string out;
+    for (unsigned char c : value)
+        if (std::isalnum(c))
+            out.push_back(static_cast<char>(std::toupper(c)));
+    return out;
+}
+
+bool propertyNumber(const TagLib::PropertyMap &properties, const char *wanted, double &out) {
+    for (auto it = properties.begin(); it != properties.end(); ++it) {
+        if (normalizedKey(it->first) != wanted || it->second.isEmpty())
+            continue;
+        std::string value = it->second.front().to8Bit(true);
+        char *end = nullptr;
+        const double parsed = std::strtod(value.c_str(), &end);
+        if (end == value.c_str() || !std::isfinite(parsed))
+            return false;
+        // ReplayGain gain tags conventionally include the dB suffix.
+        while (*end && std::isspace(static_cast<unsigned char>(*end))) ++end;
+        if (*end && std::string(end) != "dB" && std::string(end) != "DB")
+            return false;
+        out = parsed;
+        return true;
+    }
+    return false;
+}
+
 char *dupStr(const std::string &s) {
     char *p = static_cast<char *>(std::malloc(s.size() + 1));
     if (!p)
@@ -235,6 +264,24 @@ char *forte_extract_album_artist(const char *path) {
     if (values.isEmpty() || values.front().isEmpty())
         return nullptr;
     return dupStr(values.front().to8Bit(true));
+}
+
+int forte_extract_replaygain(const char *path, double *track_gain, int *has_track_gain,
+                             double *track_peak, int *has_track_peak,
+                             double *album_gain, int *has_album_gain,
+                             double *album_peak, int *has_album_peak) {
+    if (!path || !track_gain || !has_track_gain || !track_peak || !has_track_peak ||
+        !album_gain || !has_album_gain || !album_peak || !has_album_peak)
+        return 0;
+    *has_track_gain = *has_track_peak = *has_album_gain = *has_album_peak = 0;
+    TagLib::FileRef f(path);
+    if (f.isNull() || !f.file()) return 0;
+    const TagLib::PropertyMap properties = f.file()->properties();
+    *has_track_gain = propertyNumber(properties, "REPLAYGAINTRACKGAIN", *track_gain);
+    *has_track_peak = propertyNumber(properties, "REPLAYGAINTRACKPEAK", *track_peak);
+    *has_album_gain = propertyNumber(properties, "REPLAYGAINALBUMGAIN", *album_gain);
+    *has_album_peak = propertyNumber(properties, "REPLAYGAINALBUMPEAK", *album_peak);
+    return 1;
 }
 
 unsigned int forte_extract_disc_number(const char *path) {

@@ -26,6 +26,7 @@ pub const Metadata = struct {
     disc_number: i64 = 1,
     year: ?i64,
     duration: i64,
+    replaygain: database.Database.ReplayGain = .{},
 };
 
 pub const ScanResult = struct {
@@ -76,6 +77,11 @@ pub fn scanDirectoryWithOptions(db: *database.Database, backing: std.mem.Allocat
 
     // Every path seen on disk this run (arena-owned, so `seen` keys stay stable).
     var seen = std.StringHashMap(void).init(a);
+    // Download clients commonly stage files as `song.mp3.part`,
+    // `song.mp3.crdownload`, or `song.mp3.tmp`. Keep database rows in any
+    // directory containing such a marker until the final rename is visible;
+    // otherwise a scan during the rename window would delete the real track.
+    var transient_dirs = std.StringHashMap(void).init(a);
     var result = ScanResult{};
 
     // Keep a scan atomic: a traversal or metadata/database failure should not
@@ -83,7 +89,7 @@ pub fn scanDirectoryWithOptions(db: *database.Database, backing: std.mem.Allocat
     try db.begin();
     errdefer db.rollback() catch {};
 
-    try walk(db, a, dir, extractor, &seen, &result, options);
+    try walk(db, a, dir, extractor, &seen, &transient_dirs, &result, options);
     // Never treat an inaccessible/missing root or subtree as a clean scan:
     // deleting all unseen rows would destroy a library merely because a mount
     // is temporarily unavailable.
@@ -94,7 +100,7 @@ pub fn scanDirectoryWithOptions(db: *database.Database, backing: std.mem.Allocat
     // metadata column for large libraries.
     const db_songs = try db.getAllSongPathsWithAllocator(a);
     for (db_songs) |s| {
-        if (!seen.contains(s.path)) {
+        if (!seen.contains(s.path) and !transient_dirs.contains(parentDirectory(s.path))) {
             try db.deleteSongById(s.id);
             result.removed += 1;
         }
@@ -131,7 +137,7 @@ fn recoverMissingCovers(db: *database.Database, a: std.mem.Allocator) !void {
     }
 }
 
-fn walk(db: *database.Database, a: std.mem.Allocator, dir: []const u8, extractor: Extractor, seen: *std.StringHashMap(void), result: *ScanResult, options: ScanOptions) !void {
+fn walk(db: *database.Database, a: std.mem.Allocator, dir: []const u8, extractor: Extractor, seen: *std.StringHashMap(void), transient_dirs: *std.StringHashMap(void), result: *ScanResult, options: ScanOptions) !void {
     var dirbuf: [path_buf_size:0]u8 = undefined;
     const dirz = toSentinel(&dirbuf, dir) orelse return error.PathTooLong;
 
@@ -161,9 +167,11 @@ fn walk(db: *database.Database, a: std.mem.Allocator, dir: []const u8, extractor
         if (std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) continue;
 
         if (c.isDirectory()) {
-            try walk(db, a, cpath, extractor, seen, result, options);
+            try walk(db, a, cpath, extractor, seen, transient_dirs, result, options);
         } else if (hasAudioExtension(base)) {
             try processFile(db, a, cpath, c.size(), c.mtime(), extractor, seen, result, options);
+        } else if (isTransientFilename(base)) {
+            try transient_dirs.put(try a.dupe(u8, parentDirectory(cpath)), {});
         }
     }
 }
@@ -237,11 +245,13 @@ fn persistFile(
     const album_id = try persistMetadata(db, meta, path);
     if (existing) |info| {
         try db.updateSongWithMetadataAndFingerprint(info.id, meta.title, album_id, meta.track, meta.disc_number, meta.comment, meta.duration, file_size, mtime, fingerprint);
+        try db.setSongReplayGain(info.id, meta.replaygain);
         try persistAssociations(db, info.id, album_id, meta);
         return true;
     }
     const new_id = try db.addSongWithMetadata(path, meta.title, album_id, meta.track, meta.comment, meta.duration, meta.disc_number);
     try db.setSongFileStateWithFingerprint(new_id, file_size, mtime, fingerprint);
+    try db.setSongReplayGain(new_id, meta.replaygain);
     try persistAssociations(db, new_id, album_id, meta);
     return false;
 }
@@ -311,8 +321,12 @@ fn persistAssociations(db: *database.Database, song_id: i64, album_id: i64, meta
 /// database consistent with the freshly extracted tags and rebuilds the song's
 /// artist/genre associations without requiring a full library scan.
 pub fn reconcileMetadata(db: *database.Database, a: std.mem.Allocator, song_id: i64, meta: Metadata) !void {
+    try db.begin();
+    errdefer db.rollback() catch {};
+
     const old = (try db.getSongById(song_id)) orelse return error.SongNotFound;
     const album_id = try persistMetadata(db, meta, old.path);
+    if (meta.year) |year| try db.setAlbumYear(album_id, year);
     try db.updateSongWithMetadataAndFingerprint(
         song_id,
         meta.title,
@@ -327,6 +341,7 @@ pub fn reconcileMetadata(db: *database.Database, a: std.mem.Allocator, song_id: 
     );
     try persistAssociations(db, song_id, album_id, meta);
     try db.pruneOrphans();
+    try db.commit();
     _ = a;
 }
 
@@ -352,6 +367,17 @@ fn extractFallback(a: std.mem.Allocator, path: []const u8) !Metadata {
 fn basename(path: []const u8) []const u8 {
     const start = if (std.mem.lastIndexOfAny(u8, path, "/\\")) |i| i + 1 else 0;
     return path[start..];
+}
+
+fn parentDirectory(path: []const u8) []const u8 {
+    return if (std.mem.lastIndexOfAny(u8, path, "/\\")) |i| path[0..i] else "";
+}
+
+fn isTransientFilename(name: []const u8) bool {
+    for ([_][]const u8{ ".part", ".partial", ".crdownload", ".download", ".downloading", ".tmp" }) |suffix| {
+        if (name.len >= suffix.len and std.ascii.eqlIgnoreCase(name[name.len - suffix.len ..], suffix)) return true;
+    }
+    return false;
 }
 
 fn hasAudioExtension(name: []const u8) bool {
@@ -481,8 +507,20 @@ test "scanner: imports files, skips unchanged, removes deleted" {
     try std.testing.expectEqual(@as(usize, 1), r.skipped);
     try std.testing.expectEqual(@as(usize, 0), r.imported);
 
-    // Delete the file -> removed.
+    // A downloader can briefly remove the final name while leaving a staging
+    // file behind. Do not delete the database row during that rename window.
     _ = al.filesystem.removeFilename(song);
+    const partial = "/tmp/forte_scan_test/Album/track1.ogg.part";
+    {
+        var f = al.file.File.open(partial, "w") catch return error.Failed;
+        _ = f.close();
+    }
+    r = try scanDirectory(&db, std.testing.allocator, root, fallback_extractor);
+    try std.testing.expectEqual(@as(usize, 0), r.removed);
+    try std.testing.expectEqual(@as(usize, 1), (try db.getAllSongs()).len);
+
+    // Once the staging marker is gone, a later clean scan removes the row.
+    _ = al.filesystem.removeFilename(partial);
     r = try scanDirectory(&db, std.testing.allocator, root, fallback_extractor);
     try std.testing.expectEqual(@as(usize, 1), r.removed);
     try std.testing.expectEqual(@as(usize, 0), (try db.getAllSongs()).len);

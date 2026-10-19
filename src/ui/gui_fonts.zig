@@ -7,14 +7,20 @@ const config = @import("../core/config.zig");
 
 pub const FontSet = struct {
     body: al.font.Font,
+    small: al.font.Font,
+    nav: al.font.Font,
     heading: al.font.Font,
+    display: al.font.Font,
     mono: al.font.Font,
     mono_bold: al.font.Font,
 
     pub fn load(allocator: std.mem.Allocator) FontSet {
         return .{
-            .body = loadOne(allocator, "fonts/IBMPlexSans-Light.ttf", 18),
-            .heading = loadOne(allocator, "fonts/Kanit-Regular.ttf", 30),
+            .body = loadOne(allocator, "fonts/IBMPlexSans-Light.ttf", 17),
+            .small = loadOne(allocator, "fonts/IBMPlexSans-Light.ttf", 14),
+            .nav = loadOne(allocator, "fonts/IBMPlexSans-Light.ttf", 11),
+            .heading = loadOne(allocator, "fonts/IBMPlexSans-Light.ttf", 28),
+            .display = loadOne(allocator, "fonts/IBMPlexSans-Light.ttf", 40),
             .mono = loadOne(allocator, "fonts/CourierPrime-Regular.ttf", 16),
             .mono_bold = loadOne(allocator, "fonts/CourierPrime-Bold.ttf", 16),
         };
@@ -22,7 +28,10 @@ pub const FontSet = struct {
 
     pub fn deinit(self: *FontSet) void {
         self.body.destroy();
+        self.small.destroy();
+        self.nav.destroy();
         self.heading.destroy();
+        self.display.destroy();
         self.mono.destroy();
         self.mono_bold.destroy();
     }

@@ -16,6 +16,8 @@ pub const Palette = struct {
     title: []const u8,
     accent: []const u8,
     err: []const u8,
+    /// Low-contrast visualization color; intentionally quieter than progress.
+    spectrum: []const u8,
     /// full-line highlight for the selected/playing row (reverse video).
     selected: []const u8,
     bar_fill: []const u8,
@@ -28,11 +30,12 @@ pub fn dark() Palette {
         .normal = "\x1b[0m",
         .dim = "\x1b[2;37m", // dim bright-white: readable on dark
         .bold = "\x1b[1;97m",
-        .title = "\x1b[1;96m", // bright cyan
-        .accent = "\x1b[1;93m", // bright yellow
+        .title = "\x1b[1;97m", // bright white; reserve cyan for active accents
+        .accent = "\x1b[1;96m", // signature cyan
         .err = "\x1b[1;91m",
-        .selected = "\x1b[7;1;97m", // reverse + bold
-        .bar_fill = "\x1b[1;92m", // bright green
+        .spectrum = "\x1b[2;36m", // dim cyan stays behind text and active progress
+        .selected = "\x1b[7;1;97m", // reverse + bold; accent marker distinguishes selection
+        .bar_fill = "\x1b[1;96m", // progress uses the active cyan
         .bar_empty = "\x1b[2;37m",
     };
 }
@@ -43,11 +46,12 @@ pub fn light() Palette {
         .normal = "\x1b[0m",
         .dim = "\x1b[2;30m",
         .bold = "\x1b[1m",
-        .title = "\x1b[1;36m",
-        .accent = "\x1b[1;33m",
+        .title = "\x1b[1;30m",
+        .accent = "\x1b[1;36m",
         .err = "\x1b[1;31m",
+        .spectrum = "\x1b[2;36m",
         .selected = "\x1b[7;1m",
-        .bar_fill = "\x1b[1;32m",
+        .bar_fill = "\x1b[1;36m",
         .bar_empty = "\x1b[2;90m",
     };
 }
@@ -124,4 +128,14 @@ test "parseRgb handles 2-digit groups" {
 test "luminance classifies dark vs light backgrounds" {
     try std.testing.expect(!luminanceIsLight(24, 24, 24)); // dark terminal bg
     try std.testing.expect(luminanceIsLight(240, 240, 240)); // light bg
+}
+
+test "accent and progress colors agree while spectrum stays subdued" {
+    const dark_palette = dark();
+    try std.testing.expectEqualStrings(dark_palette.accent, dark_palette.bar_fill);
+    try std.testing.expect(dark_palette.spectrum.len > 0);
+    try std.testing.expect(!std.mem.eql(u8, dark_palette.spectrum, dark_palette.bar_fill));
+    const light_palette = light();
+    try std.testing.expectEqualStrings(light_palette.accent, light_palette.bar_fill);
+    try std.testing.expect(!std.mem.eql(u8, light_palette.spectrum, light_palette.bar_fill));
 }

@@ -103,6 +103,21 @@ test "pan and speed forwarded to the (fake) stream" {
     try std.testing.expect(engine.isPlaying());
 }
 
+test "normalization is per stream and composes separately with master gain" {
+    var engine = try FakeEngine.create(std.testing.allocator);
+    defer engine.destroy();
+    engine.setGain(0.4);
+    engine.setNormalizationGain(1.7);
+    try std.testing.expectEqual(@as(f32, 0.4), engine.drv.mixer_gain);
+    try engine.playSound("first");
+    try std.testing.expectApproxEqAbs(@as(f32, 1.7), engine.stream.?.gain(), 0.0001);
+    engine.setNormalizationGain(0.75);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), engine.stream.?.gain(), 0.0001);
+    try std.testing.expectEqual(@as(f32, 0.4), engine.drv.mixer_gain);
+    try engine.playSound("second");
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), engine.stream.?.gain(), 0.0001);
+}
+
 test "gain clamps to [0, 1]" {
     var engine = try FakeEngine.create(std.testing.allocator);
     defer engine.destroy();
@@ -125,6 +140,91 @@ test "capture pass-through is a safe no-op on the fake" {
     try std.testing.expectEqual(@as(usize, 0), engine.copyRecentMono(16, &out));
     engine.clearCapture();
     try engine.setSampleBufferCapacity(1024);
+}
+
+test "gapless preload promotes queue successor and crossfades per stream" {
+    var engine = try FakeEngine.create(std.testing.allocator);
+    defer engine.destroy();
+    var queue = PlayQueue.init(std.testing.allocator);
+    defer queue.deinit();
+    try queue.enqueueMany(&.{ 0, 1 });
+    engine.resolve_song = resolveSong;
+    engine.setPlayQueue(&queue);
+    engine.setCrossfadeSecs(2);
+    try engine.playSound("a");
+
+    engine.stream.?.position = 0.5; // duration is 2s; begin preloading
+    engine.update();
+    try std.testing.expect(engine.next_stream != null);
+    try std.testing.expectEqual(@as(?i32, 0), queue.current());
+
+    engine.stream.?.position = 1.0;
+    engine.update();
+    try std.testing.expect(engine.next_stream.?.playing());
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), engine.next_stream.?.gain(), 0.0001);
+
+    engine.stream.?.position = 1.5;
+    engine.update();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), engine.stream.?.gain(), 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), engine.next_stream.?.gain(), 0.0001);
+
+    engine.stream.?.position = 2.0;
+    engine.update();
+    try std.testing.expectEqual(@as(?i32, 1), queue.current());
+    try std.testing.expectEqual(@as(f64, 3.0), engine.getDuration());
+    try std.testing.expect(engine.isPlaying());
+}
+
+test "manual navigation and pause/stop cancel or defer preloaded promotion" {
+    var engine = try FakeEngine.create(std.testing.allocator);
+    defer engine.destroy();
+    var queue = PlayQueue.init(std.testing.allocator);
+    defer queue.deinit();
+    try queue.enqueueMany(&.{ 0, 1, 2 });
+    engine.resolve_song = resolveSong;
+    engine.setPlayQueue(&queue);
+    engine.setCrossfadeSecs(2);
+    try engine.playSound("a");
+    engine.stream.?.position = 0.5;
+    engine.update();
+    try std.testing.expect(engine.next_stream != null);
+
+    engine.pause();
+    engine.stream.?.position = engine.getDuration();
+    engine.update();
+    try std.testing.expectEqual(@as(?i32, 0), queue.current());
+    try std.testing.expect(!engine.next_stream.?.playing());
+
+    engine.resumePlayback();
+    try std.testing.expect(try engine.playNext());
+    try std.testing.expect(engine.next_stream == null);
+    try std.testing.expectEqual(@as(?i32, 1), queue.current());
+    try engine.playPrevious();
+    try std.testing.expectEqual(@as(?i32, 0), queue.current());
+    engine.stop();
+    try engine.handleAudioStreamFinishedFromEvent();
+    try std.testing.expect(!engine.isPlaying());
+}
+
+test "queue edits invalidate preloaded destination; seek cancels overlap" {
+    var engine = try FakeEngine.create(std.testing.allocator);
+    defer engine.destroy();
+    var queue = PlayQueue.init(std.testing.allocator);
+    defer queue.deinit();
+    try queue.enqueueMany(&.{ 0, 1, 2 });
+    engine.resolve_song = resolveSong;
+    engine.setPlayQueue(&queue);
+    engine.setCrossfadeSecs(0);
+    try engine.playSound("a");
+    engine.stream.?.position = 0.5;
+    engine.update();
+    try std.testing.expect(engine.next_stream != null);
+    try queue.moveAt(1, 2);
+    engine.update();
+    try std.testing.expect(engine.next_stream != null);
+    engine.setProgress(0.25);
+    try std.testing.expect(engine.next_stream == null);
+    try std.testing.expectEqual(@as(f64, 0.25), engine.getTime());
 }
 
 test "auto-advance: repeat None stops when queue runs out" {

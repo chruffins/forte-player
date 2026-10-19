@@ -10,6 +10,7 @@ pub const DisplayFlags = struct {
     pub const WINDOWED = c.ALLEGRO_WINDOWED;
     pub const FULLSCREEN = c.ALLEGRO_FULLSCREEN;
     pub const OPENGL = c.ALLEGRO_OPENGL;
+    pub const RESIZABLE = c.ALLEGRO_RESIZABLE;
     pub const FRAMELESS = c.ALLEGRO_FRAMELESS; // == NOFRAME
     pub const NOFRAME = c.ALLEGRO_NOFRAME;
     pub const OPENGL_3_0 = c.ALLEGRO_OPENGL_3_0;

@@ -135,6 +135,13 @@ pub const Library = struct {
     pub fn setFavorite(self: *Library, id: i64, fav: bool) void {
         if (self.songs_by_id.getPtr(id)) |s| s.favorite = @intFromBool(fav);
     }
+
+    pub fn recordPlayed(self: *Library, id: i64, played_at: i64) void {
+        if (self.songs_by_id.getPtr(id)) |s| {
+            s.play_count +%= 1;
+            s.last_played = played_at;
+        }
+    }
 };
 
 test "library: loads songs + path lookup" {

@@ -26,20 +26,29 @@ const Vec = @Vector(W, f32);
 /// fallback so the per-stage twiddle table can live on the stack.
 pub const max_simd_n: usize = 8192;
 
-/// Twiddle factors for a fixed transform size. A stage of length `len` uses
-/// entries spaced by `n / len`, avoiding fresh sin/cos calls on every frame.
+/// Twiddle factors for a fixed transform size. They are stored in stage order
+/// rather than natural-frequency order, so SIMD butterflies can load a
+/// contiguous vector instead of gathering strided scalar entries every frame.
 pub const TwiddleCache = struct {
     n: usize = 0,
-    re: [max_simd_n / 2]f32 = undefined,
-    im: [max_simd_n / 2]f32 = undefined,
+    /// The stages together contain n - 1 entries; max_simd_n leaves room for
+    /// every supported transform size.
+    stage_re: [max_simd_n]f32 = undefined,
+    stage_im: [max_simd_n]f32 = undefined,
 
     pub fn init(n: usize) TwiddleCache {
         std.debug.assert(n >= 2 and n <= max_simd_n and (n & (n - 1)) == 0);
         var out = TwiddleCache{ .n = n };
-        for (0..n / 2) |k| {
-            const phase = -2.0 * std.math.pi * @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(n));
-            out.re[k] = @cos(phase);
-            out.im[k] = @sin(phase);
+        var len: usize = 2;
+        while (len <= n) : (len <<= 1) {
+            const half = len / 2;
+            const base = half - 1;
+            const ang = -2.0 * std.math.pi / @as(f32, @floatFromInt(len));
+            for (0..half) |k| {
+                const phase = ang * @as(f32, @floatFromInt(k));
+                out.stage_re[base + k] = @cos(phase);
+                out.stage_im[base + k] = @sin(phase);
+            }
         }
         return out;
     }
@@ -121,74 +130,72 @@ fn scalarStages(re: []f32, im: []f32) void {
     }
 }
 
-/// SIMD stage loop. Per stage, the `half` twiddles are written contiguously so
-/// `W` butterflies are computed with one vector multiply-add each.
-fn simdStages(re: []f32, im: []f32) void {
-    const n = re.len;
-    // Per-stage twiddle table (<= n/2 entries), on the stack. Caller guarantees
-    // n <= max_simd_n, so n/2 fits.
-    var tw_re: [max_simd_n / 2]f32 = undefined;
-    var tw_im: [max_simd_n / 2]f32 = undefined;
+/// Uncached source: materialize one stage's twiddles in contiguous SIMD order.
+const LocalTwiddles = struct {
+    re: [max_simd_n / 2]f32 = undefined,
+    im: [max_simd_n / 2]f32 = undefined,
 
-    var len: usize = 2;
-    while (len <= n) : (len <<= 1) {
+    inline fn prepare(self: *LocalTwiddles, len: usize) void {
         const half = len / 2;
-
-        // w(k) = exp(-2πi k / len), k in 0..half.
-        const ang = -2.0 * std.math.pi / @as(f32, @floatFromInt(len));
+        const angle = -2.0 * std.math.pi / @as(f32, @floatFromInt(len));
         for (0..half) |k| {
-            const phase = ang * @as(f32, @floatFromInt(k));
-            tw_re[k] = @cos(phase);
-            tw_im[k] = @sin(phase);
-        }
-
-        var i: usize = 0;
-        while (i < n) : (i += len) {
-            const top = i + half; // start of the 'upper' half of this block
-
-            // Vector butterflies: W at a time.
-            var k: usize = 0;
-            while (k + W <= half) : (k += W) {
-                const ure: Vec = re[i + k ..][0..W].*;
-                const uim: Vec = im[i + k ..][0..W].*;
-                const are: Vec = re[top + k ..][0..W].*;
-                const aim: Vec = im[top + k ..][0..W].*;
-                const wre: Vec = tw_re[k..][0..W].*;
-                const wim: Vec = tw_im[k..][0..W].*;
-
-                const vre = are * wre - aim * wim;
-                const vim = are * wim + aim * wre;
-                re[i + k ..][0..W].* = ure + vre;
-                im[i + k ..][0..W].* = uim + vim;
-                re[top + k ..][0..W].* = ure - vre;
-                im[top + k ..][0..W].* = uim - vim;
-            }
-
-            // Scalar tail: the `half % W` remainder (and whole stage if half < W).
-            while (k < half) : (k += 1) {
-                const u_re = re[i + k];
-                const u_im = im[i + k];
-                const a_re = re[top + k];
-                const a_im = im[top + k];
-                const w_re = tw_re[k];
-                const w_im = tw_im[k];
-                const v_re = a_re * w_re - a_im * w_im;
-                const v_im = a_re * w_im + a_im * w_re;
-                re[i + k] = u_re + v_re;
-                im[i + k] = u_im + v_im;
-                re[top + k] = u_re - v_re;
-                im[top + k] = u_im - v_im;
-            }
+            const phase = angle * @as(f32, @floatFromInt(k));
+            self.re[k] = @cos(phase);
+            self.im[k] = @sin(phase);
         }
     }
+
+    inline fn vectorRe(self: *const LocalTwiddles, _: usize, k: usize) Vec {
+        return self.re[k..][0..W].*;
+    }
+    inline fn vectorIm(self: *const LocalTwiddles, _: usize, k: usize) Vec {
+        return self.im[k..][0..W].*;
+    }
+    inline fn scalarRe(self: *const LocalTwiddles, _: usize, k: usize) f32 {
+        return self.re[k];
+    }
+    inline fn scalarIm(self: *const LocalTwiddles, _: usize, k: usize) f32 {
+        return self.im[k];
+    }
+};
+
+/// Cached source: index the same stage-ordered table prepared by Analyzer.init.
+const CachedTwiddles = struct {
+    cache: *const TwiddleCache,
+
+    inline fn prepare(_: CachedTwiddles, _: usize) void {}
+    inline fn vectorRe(self: CachedTwiddles, base: usize, k: usize) Vec {
+        return self.cache.stage_re[base + k ..][0..W].*;
+    }
+    inline fn vectorIm(self: CachedTwiddles, base: usize, k: usize) Vec {
+        return self.cache.stage_im[base + k ..][0..W].*;
+    }
+    inline fn scalarRe(self: CachedTwiddles, base: usize, k: usize) f32 {
+        return self.cache.stage_re[base + k];
+    }
+    inline fn scalarIm(self: CachedTwiddles, base: usize, k: usize) f32 {
+        return self.cache.stage_im[base + k];
+    }
+};
+
+fn simdStages(re: []f32, im: []f32) void {
+    var twiddles = LocalTwiddles{};
+    simdStagesWithSource(re, im, &twiddles);
 }
 
 fn simdStagesCached(re: []f32, im: []f32, cache: *const TwiddleCache) void {
+    simdStagesWithSource(re, im, CachedTwiddles{ .cache = cache });
+}
+
+/// Shared SIMD butterfly traversal; only stage-twiddle sourcing differs.
+fn simdStagesWithSource(re: []f32, im: []f32, twiddles: anytype) void {
     const n = re.len;
     var len: usize = 2;
     while (len <= n) : (len <<= 1) {
         const half = len / 2;
-        const stride = n / len;
+        const stage_base = half - 1;
+        twiddles.prepare(len);
+
         var i: usize = 0;
         while (i < n) : (i += len) {
             const top = i + half;
@@ -198,12 +205,8 @@ fn simdStagesCached(re: []f32, im: []f32, cache: *const TwiddleCache) void {
                 const uim: Vec = im[i + k ..][0..W].*;
                 const are: Vec = re[top + k ..][0..W].*;
                 const aim: Vec = im[top + k ..][0..W].*;
-                var wre: Vec = undefined;
-                var wim: Vec = undefined;
-                inline for (0..W) |lane| {
-                    wre[lane] = cache.re[(k + lane) * stride];
-                    wim[lane] = cache.im[(k + lane) * stride];
-                }
+                const wre = twiddles.vectorRe(stage_base, k);
+                const wim = twiddles.vectorIm(stage_base, k);
                 const vre = are * wre - aim * wim;
                 const vim = are * wim + aim * wre;
                 re[i + k ..][0..W].* = ure + vre;
@@ -216,8 +219,8 @@ fn simdStagesCached(re: []f32, im: []f32, cache: *const TwiddleCache) void {
                 const u_im = im[i + k];
                 const a_re = re[top + k];
                 const a_im = im[top + k];
-                const w_re = cache.re[k * stride];
-                const w_im = cache.im[k * stride];
+                const w_re = twiddles.scalarRe(stage_base, k);
+                const w_im = twiddles.scalarIm(stage_base, k);
                 const v_re = a_re * w_re - a_im * w_im;
                 const v_im = a_re * w_im + a_im * w_re;
                 re[i + k] = u_re + v_re;
@@ -255,6 +258,30 @@ test "fft of silence is silence" {
     fft(&re, &im);
     for (re, im) |r, i| {
         try std.testing.expect(r == 0.0 and i == 0.0);
+    }
+}
+
+test "cached and uncached SIMD paths agree through the maximum size" {
+    const sizes = [_]usize{ 2, 4, 8, 16, 64, 128, 512, 1024, max_simd_n };
+    var prng = std.Random.DefaultPrng.init(0xcace);
+    const rng = prng.random();
+    for (sizes) |n| {
+        var cached_re: [max_simd_n]f32 = undefined;
+        var cached_im: [max_simd_n]f32 = undefined;
+        var plain_re: [max_simd_n]f32 = undefined;
+        var plain_im: [max_simd_n]f32 = undefined;
+        for (0..n) |i| {
+            cached_re[i] = rng.floatNorm(f32);
+            cached_im[i] = rng.floatNorm(f32);
+            plain_re[i] = cached_re[i];
+            plain_im[i] = cached_im[i];
+        }
+
+        const cache = TwiddleCache.init(n);
+        fftWithCache(cached_re[0..n], cached_im[0..n], &cache);
+        fft(plain_re[0..n], plain_im[0..n]);
+        try std.testing.expectEqualSlices(f32, plain_re[0..n], cached_re[0..n]);
+        try std.testing.expectEqualSlices(f32, plain_im[0..n], cached_im[0..n]);
     }
 }
 

@@ -91,7 +91,6 @@ pub fn build(b: *std.Build) void {
     for (system_libs) |lib| root_mod.linkSystemLibrary(lib, .{});
     maybeUseAllegro(b, root_mod, allegro_prefix);
     root_mod.addLibraryPath(.{ .cwd_relative = taglib_lib });
-    root_mod.addIncludePath(.{ .cwd_relative = taglib_include });
     root_mod.linkSystemLibrary("tag_c", .{});
     const exe = b.addExecutable(.{ .name = "forte-player", .root_module = root_mod });
     b.installArtifact(exe);
@@ -120,7 +119,6 @@ pub fn build(b: *std.Build) void {
     for (system_libs) |lib| tui_mod.linkSystemLibrary(lib, .{});
     maybeUseAllegro(b, tui_mod, allegro_prefix);
     tui_mod.addLibraryPath(.{ .cwd_relative = taglib_lib });
-    tui_mod.addIncludePath(.{ .cwd_relative = taglib_include });
     tui_mod.linkSystemLibrary("tag_c", .{});
     const tui_exe = b.addExecutable(.{ .name = "forte-tui", .root_module = tui_mod });
     b.installArtifact(tui_exe);
@@ -134,6 +132,48 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run forte-player");
     run_step.dependOn(&run_cmd.step);
+
+    // ---- Immersive third frontend: Zig app/HUD, wrapped template C renderer ----
+    const world_mod = b.createModule(.{
+        .root_source_file = b.path("src/world_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = imports,
+    });
+    addCppShimRuntime(world_mod, target, taglib_art_obj, libstdcpp, libgcc_s);
+    world_mod.addIncludePath(.{ .cwd_relative = allegro_include });
+    world_mod.addIncludePath(.{ .cwd_relative = "src/music" });
+    world_mod.addIncludePath(.{ .cwd_relative = taglib_include });
+    world_mod.addLibraryPath(.{ .cwd_relative = taglib_lib });
+    world_mod.linkSystemLibrary("tag", .{});
+    world_mod.linkSystemLibrary("tag_c", .{});
+    for (system_libs) |lib| world_mod.linkSystemLibrary(lib, .{});
+    maybeUseAllegro(b, world_mod, allegro_prefix);
+    addWorldRenderer(b, world_mod, target.result.os.tag);
+    const world_exe = b.addExecutable(.{ .name = "forte-world", .root_module = world_mod });
+    b.installArtifact(world_exe);
+    const world_run = b.addSystemCommand(&.{b.getInstallPath(.bin, world_exe.out_filename)});
+    world_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| world_run.addArgs(args);
+    b.step("run-world", "Run the firefly visualizer world").dependOn(&world_run.step);
+    const recording_tests = b.addSystemCommand(&.{ "python3", "-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test_world_recording.py" });
+    b.step("test-recording", "Recording helper tests (Python 3; no display/audio)").dependOn(&recording_tests.step);
+
+    const world_smoke_mod = b.createModule(.{
+        .root_source_file = b.path("src/world_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "allegro", .module = allegro }},
+    });
+    world_smoke_mod.addIncludePath(.{ .cwd_relative = allegro_include });
+    for (system_libs) |lib| world_smoke_mod.linkSystemLibrary(lib, .{});
+    maybeUseAllegro(b, world_smoke_mod, allegro_prefix);
+    addWorldRenderer(b, world_smoke_mod, target.result.os.tag);
+    const world_smoke = b.addExecutable(.{ .name = "forte-world-smoke", .root_module = world_smoke_mod });
+    b.step("test-world", "Real-GPU checkerboard/skybox/firefly smoke test (requires display)")
+        .dependOn(&b.addRunArtifact(world_smoke).step);
 
     // ---- Unit tests: ring buffer + transport (headless, no audio device) ----
     const unit_mod = b.createModule(.{
@@ -151,12 +191,46 @@ pub fn build(b: *std.Build) void {
     for (system_libs) |lib| unit_mod.linkSystemLibrary(lib, .{});
     maybeUseAllegro(b, unit_mod, allegro_prefix);
     unit_mod.addLibraryPath(.{ .cwd_relative = taglib_lib });
-    unit_mod.addIncludePath(.{ .cwd_relative = taglib_include });
     unit_mod.linkSystemLibrary("tag_c", .{});
 
     const unit_tests = b.addTest(.{ .root_module = unit_mod });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+
+    // Opt-in real-OpenGL verification. Not part of headless `test`, and never
+    // starts the music engine or touches user configuration/library data.
+    const gpu_mod = b.createModule(.{
+        .root_source_file = b.path("src/gui_visualizer_smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "allegro", .module = allegro }},
+    });
+    gpu_mod.addIncludePath(.{ .cwd_relative = allegro_include });
+    for (system_libs) |lib| gpu_mod.linkSystemLibrary(lib, .{});
+    maybeUseAllegro(b, gpu_mod, allegro_prefix);
+    const gpu_exe = b.addExecutable(.{ .name = "forte-gpu-smoke", .root_module = gpu_mod });
+    const gpu_run = b.addRunArtifact(gpu_exe);
+    const gpu_step = b.step("test-gpu", "Run the real-OpenGL visualizer smoke test (requires display)");
+    gpu_step.dependOn(&gpu_run.step);
+}
+
+fn addWorldRenderer(b: *std.Build, mod: *std.Build.Module, os: std.Target.Os.Tag) void {
+    mod.addIncludePath(b.path("src/world"));
+    mod.addIncludePath(b.path("vendor/world-template"));
+    mod.addCSourceFiles(.{
+        .files = &.{ "src/world/bridge.c", "vendor/world-template/camera.c", "vendor/world-template/skybox.c" },
+        .flags = &.{"-std=c17"},
+    });
+    switch (os) {
+        .linux => {
+            mod.linkSystemLibrary("GL", .{});
+            mod.linkSystemLibrary("m", .{});
+        },
+        .macos => mod.linkFramework("OpenGL", .{}),
+        .windows => mod.linkSystemLibrary("opengl32", .{}),
+        else => @panic("Visualizer world requires desktop OpenGL on Linux, macOS or Windows"),
+    }
 }
 
 fn addCppShimRuntime(mod: *std.Build.Module, target: std.Build.ResolvedTarget, shim: std.Build.LazyPath, libstdcpp: std.Build.LazyPath, libgcc_s: std.Build.LazyPath) void {

@@ -1,11 +1,9 @@
 //! Impure leaf: interprets `ui_view.Cmd`s onto a terminal framebuffer and
 //! synchronizes only the changed lines to the terminal.
 //!
-//! Cells hold a full UTF-8 character (up to 4 bytes) so unicode in tags
-//! (… , ’ , ‐ ...) renders as single glyphs occupying one column — this is what
-//! stops long/unicode titles from wrapping and producing mojibake/artifacts.
-//! Diff-based redraw (only changed lines) avoids per-frame full-clear flicker;
-//! the cursor is hidden while drawing.
+//! Cells hold UTF-8 text plus terminal display width, so wide characters do not
+//! shift subsequent columns or wrap at the edge. Diff-based redraw avoids
+//! per-frame full-clear flicker; the cursor is hidden while drawing.
 
 const std = @import("std");
 const view = @import("ui_view.zig");
@@ -23,15 +21,17 @@ pub const Style = view.Style;
 pub const Size = struct { w: u16, h: u16 };
 
 const Cell = struct {
-    chars: [4]u8 = .{ ' ', 0, 0, 0 },
+    chars: [16]u8 = .{ ' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
     len: u8 = 1,
+    /// The preceding cell contains a two-column character here.
+    continuation: bool = false,
     style: Style = .normal,
     /// Truecolor foreground/background overrides (for half-block art).
     fg: ?[3]u8 = null,
     bg: ?[3]u8 = null,
 
     fn eql(a: Cell, b: Cell) bool {
-        if (a.len != b.len or a.style != b.style) return false;
+        if (a.len != b.len or a.continuation != b.continuation or a.style != b.style) return false;
         if (!optRgbEql(a.fg, b.fg) or !optRgbEql(a.bg, b.bg)) return false;
         for (0..a.len) |k| if (a.chars[k] != b.chars[k]) return false;
         return true;
@@ -45,7 +45,7 @@ fn optRgbEql(a: ?[3]u8, b: ?[3]u8) bool {
 }
 
 fn blankCell() Cell {
-    return .{ .chars = .{ ' ', 0, 0, 0 }, .len = 1, .style = .normal };
+    return .{ .chars = .{ ' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, .len = 1, .style = .normal };
 }
 
 var g_palette: theme.Palette = theme.dark();
@@ -105,12 +105,42 @@ pub fn restoreRaw() void {
     g_raw_enabled = false;
 }
 
+/// Translate common ANSI cursor keys to the existing vi-style vertical bindings.
+fn decodeInput(bytes: []const u8) ?u8 {
+    if (bytes.len == 1) return bytes[0];
+    if (bytes.len >= 3 and bytes[0] == 0x1b and bytes[1] == '[') {
+        return switch (bytes[bytes.len - 1]) {
+            'A' => 'k',
+            'B' => 'j',
+            'C', 'D' => null,
+            else => null,
+        };
+    }
+    return null;
+}
+
 pub fn pollKey() ?u8 {
     if (!g_raw_enabled) return null;
-    var b: [1]u8 = undefined;
-    const n = cterm.read(0, &b, 1);
-    if (n <= 0) return null;
-    return b[0];
+    var bytes: [16]u8 = undefined;
+    const first = cterm.read(0, &bytes[0], 1);
+    if (first <= 0) return null;
+    if (bytes[0] != 0x1b) return bytes[0];
+
+    // ESC is also a standalone cancel key. Give a terminal a short window to
+    // finish sending an escape sequence before treating it as Escape itself.
+    var len: usize = 1;
+    var tries: usize = 0;
+    while (tries < 20 and len < bytes.len) : (tries += 1) {
+        const n = cterm.read(0, &bytes[len], 1);
+        if (n > 0) {
+            len += @intCast(n);
+            if (len >= 3 and bytes[len - 1] >= 0x40 and bytes[len - 1] <= 0x7e) break;
+        } else {
+            _ = cterm.usleep(1000);
+        }
+    }
+    if (decodeInput(bytes[0..len])) |key| return key;
+    return if (len == 1) 0x1b else null;
 }
 
 fn flushOutput() bool {
@@ -206,6 +236,7 @@ fn styleSgr(s: Style) []const u8 {
         .title => g_palette.title,
         .accent => g_palette.accent,
         .err => g_palette.err,
+        .spectrum => g_palette.spectrum,
         .bar_fill => g_palette.bar_fill,
         .bar_empty => g_palette.bar_empty,
         .selected => g_palette.selected,
@@ -243,22 +274,49 @@ fn blank() void {
     @memset(g_cur, blankCell());
 }
 
-/// Byte length of the UTF-8 character starting at `s[i]` (or 1 for invalid/truncated).
+/// Byte length of a UTF-8 codepoint starting at `i` (1 for invalid/truncated input).
 fn utf8Len(s: []const u8, i: usize) usize {
     if (i >= s.len) return 0;
     const b = s[i];
-    const n: usize = if (b < 0x80) 1 else if (b >= 0xF0) 4 else if (b >= 0xE0) 3 else if (b >= 0xC0) 2 else 1;
+    const n: usize = if (b < 0x80) 1 else if (b >= 0xF0 and b <= 0xF4) 4 else if (b >= 0xE0) 3 else if (b >= 0xC2) 2 else 1;
     if (i + n > s.len) return 1;
+    for (i + 1..i + n) |j| if ((s[j] & 0xc0) != 0x80) return 1;
     return n;
+}
+
+fn codepoint(s: []const u8) u21 {
+    if (s.len == 1) return s[0];
+    const mask: u8 = if (s.len == 2) 0x1f else if (s.len == 3) 0x0f else 0x07;
+    var cp: u21 = @intCast(s[0] & mask);
+    for (s[1..]) |b| cp = (cp << 6) | @as(u21, b & 0x3f);
+    return cp;
+}
+
+/// Approximate wcwidth without depending on the process locale. Combining
+/// marks attach to the previous cell; common East Asian and emoji ranges use 2.
+fn displayWidth(cp: u21) usize {
+    if (cp == 0 or cp < 32 or (cp >= 0x7f and cp < 0xa0)) return 0;
+    if ((cp >= 0x0300 and cp <= 0x036f) or (cp >= 0x1ab0 and cp <= 0x1aff) or
+        (cp >= 0x1dc0 and cp <= 0x1dff) or (cp >= 0x20d0 and cp <= 0x20ff) or
+        (cp >= 0xfe00 and cp <= 0xfe0f) or (cp >= 0xfe20 and cp <= 0xfe2f) or
+        (cp >= 0xe0100 and cp <= 0xe01ef)) return 0;
+    if ((cp >= 0x1100 and cp <= 0x115f) or cp == 0x2329 or cp == 0x232a or
+        (cp >= 0x2e80 and cp <= 0xa4cf and cp != 0x303f) or
+        (cp >= 0xac00 and cp <= 0xd7a3) or (cp >= 0xf900 and cp <= 0xfaff) or
+        (cp >= 0xfe10 and cp <= 0xfe19) or (cp >= 0xfe30 and cp <= 0xfe6f) or
+        (cp >= 0xff00 and cp <= 0xff60) or (cp >= 0xffe0 and cp <= 0xffe6) or
+        (cp >= 0x1f300 and cp <= 0x1faff) or (cp >= 0x20000 and cp <= 0x3fffd)) return 2;
+    return 1;
 }
 
 fn setCell(x: usize, y: usize, chars: []const u8, st: Style) void {
     if (y >= g_h or x >= g_w) return;
     const c = &g_cur[y * g_w + x];
     @memset(&c.chars, 0);
-    const n = @min(chars.len, 4);
+    const n = @min(chars.len, c.chars.len);
     for (0..n) |k| c.chars[k] = chars[k];
     c.len = @intCast(n);
+    c.continuation = false;
     c.style = st;
     c.fg = null;
     c.bg = null;
@@ -269,9 +327,10 @@ fn setCellRgb(x: usize, y: usize, chars: []const u8, st: Style, fg: [3]u8, bg: [
     if (y >= g_h or x >= g_w) return;
     const c = &g_cur[y * g_w + x];
     @memset(&c.chars, 0);
-    const n = @min(chars.len, 4);
+    const n = @min(chars.len, c.chars.len);
     for (0..n) |k| c.chars[k] = chars[k];
     c.len = @intCast(n);
+    c.continuation = false;
     c.style = st;
     c.fg = fg;
     c.bg = bg;
@@ -283,8 +342,26 @@ fn blitStr(x: usize, y: usize, s: []const u8, st: Style) void {
     var i: usize = 0;
     while (i < s.len and col < g_w) {
         const n = utf8Len(s, i);
-        setCell(col, y, s[i .. i + n], st);
-        col += 1;
+        const glyph = s[i .. i + n];
+        const width = displayWidth(codepoint(glyph));
+        if (width == 0) {
+            if (col > x) {
+                const prev = &g_cur[y * g_w + col - 1];
+                if (!prev.continuation and prev.len + n <= prev.chars.len) {
+                    @memcpy(prev.chars[prev.len..][0..n], glyph);
+                    prev.len += @intCast(n);
+                }
+            }
+        } else if (col + width <= g_w) {
+            setCell(col, y, glyph, st);
+            if (width == 2) {
+                const continuation = &g_cur[y * g_w + col + 1];
+                continuation.* = blankCell();
+                continuation.continuation = true;
+                continuation.style = st;
+            }
+            col += width;
+        } else break;
         i += n;
     }
 }
@@ -295,13 +372,46 @@ fn blitBar(x: usize, y: usize, w: usize, frac: f32) void {
     var i: usize = 0;
     while (i < w) : (i += 1) {
         const style: Style = if (i < filled) .bar_fill else .bar_empty;
-        setCell(x + i, y, if (i < filled) "=" else "-", style);
+        setCell(x + i, y, if (i < filled) "━" else "─", style);
     }
 }
 
 fn blitHline(y: usize) void {
     if (y >= g_h) return;
-    for (0..g_w) |x| setCell(x, y, "-", .dim);
+    for (0..g_w) |x| setCell(x, y, "─", .dim);
+}
+
+fn blitFrame(x: usize, y: usize, w: usize, h: usize, style: Style) void {
+    if (w < 2 or h < 2 or x >= g_w or y >= g_h) return;
+    const right = @min(x + w - 1, g_w - 1);
+    const bottom = @min(y + h - 1, g_h - 1);
+    for (x..right + 1) |xx| {
+        setCell(xx, y, if (xx == x) "╭" else if (xx == right) "╮" else "─", style);
+        setCell(xx, bottom, if (xx == x) "╰" else if (xx == right) "╯" else "─", style);
+    }
+    for (y + 1..bottom) |yy| {
+        setCell(x, yy, "│", style);
+        setCell(right, yy, "│", style);
+    }
+}
+
+fn blitBox(x: usize, y: usize, w: usize, h: usize) void {
+    if (w < 2 or h < 2 or x >= g_w or y >= g_h) return;
+    const right = @min(x + w - 1, g_w - 1);
+    const bottom = @min(y + h - 1, g_h - 1);
+    for (y..bottom + 1) |yy| for (x..right + 1) |xx| setCell(xx, yy, " ", .normal);
+    for (x..right + 1) |xx| {
+        setCell(xx, y, "─", .dim);
+        setCell(xx, bottom, "─", .dim);
+    }
+    for (y..bottom + 1) |yy| {
+        setCell(x, yy, "│", .dim);
+        setCell(right, yy, "│", .dim);
+    }
+    setCell(x, y, "╭", .accent);
+    setCell(right, y, "╮", .accent);
+    setCell(x, bottom, "╰", .accent);
+    setCell(right, bottom, "╯", .accent);
 }
 
 /// Half-block art: every cell draws the '▀' glyph with the cell's fg as the
@@ -322,7 +432,9 @@ fn blitRow(y: usize, s: []const u8, selected: bool, playing: bool) void {
     const base: Style = if (selected) .selected else .normal;
     for (0..g_w) |x| setCell(x, y, " ", base);
     if (g_w >= 1) {
-        setCell(0, y, if (playing) ">" else " ", if (playing) .bar_fill else base);
+        const marker: []const u8 = if (playing) "▶" else if (selected) "›" else " ";
+        const marker_style: Style = if (playing or selected) .accent else base;
+        setCell(0, y, marker, marker_style);
         if (g_w >= 2) setCell(1, y, " ", base);
     }
     blitStr(2, y, s, base);
@@ -356,6 +468,7 @@ fn flush() void {
         var cur_bg: ?[3]u8 = null;
         for (0..g_w) |x| {
             const c = g_cur[lo + x];
+            if (c.continuation) continue;
             if (cur_style == null or cur_style.? != c.style or !optRgbEql(cur_fg, c.fg) or !optRgbEql(cur_bg, c.bg)) {
                 cur_style = c.style;
                 cur_fg = c.fg;
@@ -390,7 +503,36 @@ pub fn render(cmds: []const view.Cmd, width: usize, height: usize) void {
         .bar => |b| blitBar(b.x, b.y, @min(b.width, width -| 4), b.frac),
         .row => |r| blitRow(r.y, r.s, r.selected, r.playing),
         .hline => |h| blitHline(h.y),
+        .box => |b| blitBox(b.x, b.y, b.w, b.h),
+        .frame => |f| blitFrame(f.x, f.y, f.w, f.h, f.style),
         .art => |a| blitArt(a.x, a.y, a.w, a.h, a.cells),
     };
     flush();
+}
+
+test "terminal width handles ASCII, combining marks, and wide glyphs" {
+    try std.testing.expectEqual(@as(usize, 1), displayWidth(codepoint("A")));
+    try std.testing.expectEqual(@as(usize, 0), displayWidth(codepoint("\xcc\x81")));
+    try std.testing.expectEqual(@as(usize, 2), displayWidth(codepoint("界")));
+    try std.testing.expectEqual(@as(usize, 2), displayWidth(codepoint("🎵")));
+    try std.testing.expectEqual(@as(usize, 1), utf8Len("\xc3x", 0)); // malformed leading byte fallback
+}
+
+test "blitStr reserves terminal columns for wide glyphs" {
+    ensure(4, 1);
+    blank();
+    blitStr(0, 0, "界e\xcc\x81A", .normal);
+    try std.testing.expectEqualStrings("界", g_cur[0].chars[0..@as(usize, g_cur[0].len)]);
+    try std.testing.expect(g_cur[1].continuation);
+    try std.testing.expectEqualStrings("e\xcc\x81", g_cur[2].chars[0..@as(usize, g_cur[2].len)]);
+    try std.testing.expectEqualStrings("A", g_cur[3].chars[0..@as(usize, g_cur[3].len)]);
+}
+
+test "ANSI cursor keys map to familiar navigation bindings" {
+    try std.testing.expectEqual(@as(?u8, 'k'), decodeInput("\x1b[A"));
+    try std.testing.expectEqual(@as(?u8, 'j'), decodeInput("\x1b[B"));
+    try std.testing.expect(decodeInput("\x1b[C") == null);
+    try std.testing.expect(decodeInput("\x1b[D") == null);
+    try std.testing.expectEqual(@as(?u8, 'q'), decodeInput("q"));
+    try std.testing.expect(decodeInput("\x1b[5~") == null);
 }

@@ -20,6 +20,12 @@ void forte_free_cover(unsigned char *data, char *mime);
 // must be released with forte_free_string().
 char *forte_extract_album_artist(const char *path);
 unsigned int forte_extract_disc_number(const char *path);
+// ReplayGain values in dB / linear amplitude; each presence flag is set only
+// when the corresponding standard tag parses to a finite value.
+int forte_extract_replaygain(const char *path, double *track_gain, int *has_track_gain,
+                             double *track_peak, int *has_track_peak,
+                             double *album_gain, int *has_album_gain,
+                             double *album_peak, int *has_album_peak);
 void forte_free_string(char *value);
 
 // Write common audio tags in-place. Empty strings clear the corresponding tag.

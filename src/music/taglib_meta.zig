@@ -12,6 +12,27 @@ const scanner = @import("scanner.zig");
 const taglib_art = @import("taglib_art.zig");
 
 pub const extractor = scanner.Extractor{ .extract = extract };
+pub const RawTagSignals = struct { title: bool = false, artist: bool = false, album: bool = false };
+
+/// Return raw source tag presence without applying the user-facing fallbacks.
+pub fn rawTagSignals(path: []const u8) ?RawTagSignals {
+    var pathbuf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
+    if (path.len + 1 > pathbuf.len) return null;
+    @memcpy(pathbuf[0..path.len], path);
+    pathbuf[path.len] = 0;
+    const file = c.taglib_file_new(pathbuf[0..path.len :0].ptr) orelse return null;
+    defer c.taglib_file_free(file);
+    const tag = c.taglib_file_tag(file) orelse return null;
+    const title = cstr(c.taglib_tag_title(tag));
+    const artist = cstr(c.taglib_tag_artist(tag));
+    const album = cstr(c.taglib_tag_album(tag));
+    defer c.taglib_tag_free_strings();
+    return .{
+        .title = std.mem.trim(u8, title, " \\t\\r\\n").len > 0,
+        .artist = std.mem.trim(u8, artist, " \\t\\r\\n").len > 0,
+        .album = std.mem.trim(u8, album, " \\t\\r\\n").len > 0,
+    };
+}
 
 fn cstr(p: [*c]u8) []const u8 {
     if (p == null) return "";
@@ -67,6 +88,15 @@ fn extract(a: std.mem.Allocator, path: []const u8) ?scanner.Metadata {
         .disc_number = @intCast(taglib_art.extractDiscNumber(path)),
         .year = if (year > 0) year else null,
         .duration = @intCast(duration),
+        .replaygain = blk: {
+            const rg = taglib_art.extractReplayGain(path) orelse break :blk .{};
+            break :blk .{
+                .track_gain_db = rg.track_gain_db,
+                .track_peak = rg.track_peak,
+                .album_gain_db = rg.album_gain_db,
+                .album_peak = rg.album_peak,
+            };
+        },
     };
     return meta;
 }

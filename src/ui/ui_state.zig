@@ -6,8 +6,29 @@
 
 const std = @import("std");
 const RepeatMode = @import("../music/play_queue.zig").RepeatMode;
+const lyrics_mod = @import("../music/lyrics.zig");
+const health_mod = @import("../music/library_health.zig");
 
 pub const Screen = enum { now_playing, library, albums, album_detail, artists, artist_detail, genres, genre_detail, playlists, playlist_detail, queue, settings };
+
+/// Find a source index in a filtered library view. Filtering preserves source
+/// order, so binary search avoids scanning the entire library every frame just
+/// to highlight the currently playing row.
+pub fn sortedIndexOf(items: []const usize, target: usize) ?usize {
+    var low: usize = 0;
+    var high: usize = items.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (items[mid] < target) {
+            low = mid + 1;
+        } else if (items[mid] > target) {
+            high = mid;
+        } else {
+            return mid;
+        }
+    }
+    return null;
+}
 
 /// A row in the album-detail track list.
 pub const AlbumTrackRow = struct {
@@ -31,8 +52,10 @@ pub const AlbumRow = struct {
 
 pub const ArtistRow = struct { id: i64, name: []const u8, song_count: i64, album_count: i64 };
 pub const GenreRow = struct { id: i64, name: []const u8, song_count: i64 };
-pub const PlaylistRow = struct { id: i64, name: []const u8, description: []const u8 = "", song_count: i64 };
+pub const PlaylistRow = struct { id: i64, name: []const u8, description: []const u8 = "", song_count: i64, is_smart: bool = false, smart_rule: i64 = 0 };
 pub const QueueRow = struct { song_id: i64, title: []const u8, artist: []const u8 = "" };
+pub const MetadataField = struct { name: []const u8, value: []const u8 };
+pub const PlaylistModalMode = enum { save_queue, create, rename, delete };
 
 /// A player operation the UI glue must run against the engine.
 pub const Cmd = union(enum) {
@@ -95,6 +118,8 @@ pub const Action = enum {
     /// Skip back/forward in the current track (reducer picks the step).
     seek_back,
     seek_forward,
+    toggle_help,
+    toggle_context_menu,
 };
 
 pub const State = struct {
@@ -102,6 +127,28 @@ pub const State = struct {
     screen: Screen = .now_playing,
     selection: usize = 0,
     scroll: usize = 0,
+    /// TUI-only overlays. GUI frontends may ignore them.
+    help_visible: bool = false,
+    context_menu_open: bool = false,
+    context_menu_selection: usize = 0,
+    context_menu_song_id: i64 = -1,
+    context_menu_title: []const u8 = "",
+    context_menu_artist: []const u8 = "",
+    context_menu_favorite: bool = false,
+    playlist_modal_open: bool = false,
+    playlist_modal_saved: bool = false,
+    playlist_modal_mode: PlaylistModalMode = .save_queue,
+    playlist_modal_edit_id: i64 = -1,
+    playlist_modal_name: []const u8 = "",
+    playlist_modal_cursor: usize = 0,
+    playlist_modal_status: []const u8 = "",
+    playlist_picker_open: bool = false,
+    playlist_picker_saved: bool = false,
+    playlist_picker_selection: usize = 0,
+    playlist_picker_scroll: usize = 0,
+    playlist_picker_title: []const u8 = "",
+    playlist_picker_artist: []const u8 = "",
+    playlist_picker_status: []const u8 = "",
 
     // ---- playhead snapshot (fed by the frontend each frame) ----
     title: []const u8 = "",
@@ -115,9 +162,12 @@ pub const State = struct {
     shuffle: bool = false,
     repeat_mode: RepeatMode = .None,
     favorite: bool = false,
+    lyrics: []const lyrics_mod.Line = &.{},
+    active_lyric: ?usize = null,
 
     // ---- audio visualizer snapshot ----
-    /// Per-band magnitudes in [0,1] for the TUI spectrum (empty = hidden).
+    /// Per-band magnitudes in [0,1], shared by TUI bars and GUI shaders.
+    /// Empty means the frontend is not displaying a visualizer.
     spectrum: []const f32 = &.{},
 
     // ---- album art snapshot ----
@@ -186,9 +236,15 @@ pub const State = struct {
     queue_count: usize = 0,
     queue_current_index: ?usize = null,
     queue_context_label: []const u8 = "Queue",
+    queue_dragging: bool = false,
+    queue_drop_target: ?usize = null,
 
     // ---- metadata editor snapshot ----
     metadata_editing: bool = false,
+    metadata_status: []const u8 = "",
+    metadata_fields: []const MetadataField = &.{},
+
+    metadata_active_index: usize = 0,
     metadata_field: []const u8 = "",
     metadata_value: []const u8 = "",
     metadata_song_title: []const u8 = "",
@@ -196,6 +252,10 @@ pub const State = struct {
     // ---- settings snapshot ----
     settings_music_directory: []const u8 = "",
     settings_lastfm_enabled: bool = false,
+    settings_normalization_enabled: bool = false,
+    settings_normalization_album: bool = false,
+    settings_playback_profile: []const u8 = "Default",
+    settings_crossfade_seconds: u8 = 0,
     settings_api_key: []const u8 = "",
     settings_shared_secret: []const u8 = "",
     settings_session_key: []const u8 = "",
@@ -206,6 +266,10 @@ pub const State = struct {
     settings_value: []const u8 = "",
     settings_auth_status: []const u8 = "",
     settings_auth_url: []const u8 = "",
+    health_running: bool = false,
+    health_scanned: usize = 0,
+    health_status: []const u8 = "",
+    health_findings: []const health_mod.Finding = &.{},
 
     // ---- background library scan snapshot
     scanning: bool = false,
@@ -329,6 +393,15 @@ pub fn apply(self: *State, action: Action, visible: usize) Cmd {
             const target = self.position + seek_step;
             return .{ .seek = if (self.duration > 0) @min(target, self.duration) else target };
         },
+        .toggle_help => {
+            self.help_visible = !self.help_visible;
+            return .none;
+        },
+        .toggle_context_menu => {
+            self.context_menu_open = !self.context_menu_open;
+            self.context_menu_selection = 0;
+            return .none;
+        },
         .enter => return enter(self),
         .toggle_screen => {
             self.screen = nextScreen(self.screen);
@@ -410,6 +483,8 @@ pub fn keyToAction(key: u8) ?Action {
         'f' => .toggle_favorite,
         '[', ',' => .seek_back,
         ']', '.' => .seek_forward,
+        '?' => .toggle_help,
+        'v' => .toggle_context_menu,
         '\t' => .toggle_screen,
         '1' => .goto_nowplaying,
         '2' => .goto_library,
@@ -478,6 +553,24 @@ test "reducer: seek clamps to track bounds" {
     try std.testing.expectEqual(@as(f64, 15.0), (apply(&st, .seek_forward, 0)).seek);
 }
 
+test "context menu hotkey is mapped and reducer-visible" {
+    var state = State{};
+    try std.testing.expectEqual(Action.toggle_context_menu, keyToAction('v').?);
+    _ = apply(&state, .toggle_context_menu, 0);
+    try std.testing.expect(state.context_menu_open);
+    _ = apply(&state, .toggle_context_menu, 0);
+    try std.testing.expect(!state.context_menu_open);
+}
+
+test "help toggle is mapped and reducer-visible" {
+    var st = State{};
+    try std.testing.expectEqual(Action.toggle_help, keyToAction('?').?);
+    _ = apply(&st, .toggle_help, 10);
+    try std.testing.expect(st.help_visible);
+    _ = apply(&st, .toggle_help, 10);
+    try std.testing.expect(!st.help_visible);
+}
+
 test "keyToAction maps seek keys" {
     try std.testing.expectEqual(Action.seek_back, keyToAction('[').?);
     try std.testing.expectEqual(Action.seek_back, keyToAction(',').?);
@@ -536,6 +629,14 @@ test "reducer: toggle_screen cycles through library browsers" {
     try std.testing.expectEqual(Screen.genres, st.screen);
     _ = apply(&st, .toggle_screen, 10);
     try std.testing.expectEqual(Screen.playlists, st.screen);
+}
+
+test "sortedIndexOf finds source indices in filtered order" {
+    const indices = [_]usize{ 0, 3, 8, 21 };
+    try std.testing.expectEqual(@as(?usize, 2), sortedIndexOf(&indices, 8));
+    try std.testing.expectEqual(@as(?usize, 0), sortedIndexOf(&indices, 0));
+    try std.testing.expect(sortedIndexOf(&indices, 9) == null);
+    try std.testing.expect(sortedIndexOf(&.{}, 0) == null);
 }
 
 test "reducer: goto_* set the screen directly" {

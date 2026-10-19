@@ -18,17 +18,20 @@ the contracts that keep the GUI framework maintainable.
   - **input** (pure mapping of raw events -> semantic actions)
   - **render** (Allegro) — draw the layout
 
-The GUI deliberately does not mirror the old retained drawable tree. A frame is
-an immutable command stream: `ui_view` emits it, and each frontend interprets
-it. Allegro events are mapped to semantic actions at the edge, then reduced by
-`ui_state` and executed by the application adapter. This avoids per-widget
-allocations, virtual drawables, UV objects, and callback lifetime graphs. The
-Allegro edge also performs bounded coordinate hit testing for list rows and the
-progress bar, including pointer capture for seek and scrollbar dragging,
-while local cover art is decoded once per song change into the same `Art`
-snapshot consumed by the TUI. Reusable behavior corresponding to the C++
-buttons, textboxes, sliders, scroll frames, alignment, and UV geometry lives in
-pure `gui_framework.zig` rather than callback-owning drawable objects.
+The GUI deliberately does not mirror the old retained drawable tree. Frontends
+share semantic `ui_state` snapshots and reducer operations, not presentation.
+The TUI consumes the terminal-cell command stream from `ui_view`; the GUI draws
+native pixel-space geometry from `gui_layout`. Its input uses those same bounds,
+including the same fractional scroll offset, instead of translating terminal rows.
+
+Allegro events map to semantic actions at the edge, then `ui_state` and the
+application adapter execute player operations. No per-widget allocation or
+callback ownership is hidden in the layout. Pure `gui_framework` models provide
+Unicode editing, image placement, sliders, scrolling, clipped input targets,
+pointer capture, and focus traversal. `gui_render` nests clips and only draws
+visible list rows. Dialog geometry keeps fields and footer buttons bounded even
+in compact windows. See `GUI_PLAN.md` for the native GUI contracts and remaining
+polish.
 
 ## Structure (under `src/ui/`)
 
@@ -36,20 +39,23 @@ pure `gui_framework.zig` rather than callback-owning drawable objects.
 src/ui/
   ui.zig          # module root, re-exports the public surface
   DESIGN.md       # this file
-  gui_input.zig   # pure pixel/cell hit testing
-  gui_layout.zig  # responsive shell geometry
+  gui_input.zig   # pure pixel-space hit testing
+  gui_layout.zig  # responsive gallery/inspector/table/form/dialog geometry
   gui_framework.zig # pure UV, text, slider, scroll, and event models
-  gui_render.zig  # Allegro command-stream interpreter
+  gui_render.zig  # native Allegro renderer
   gui_fonts.zig   # font resources and packaged asset fallback
+  gui_artwork.zig # bounded thumbnail cache and memory-only decode worker
+  gui_visualizer.zig # display-owned single-rectangle GPU renderer
   gui_jobs.zig    # asynchronous scan/auth workers
   ui_state.zig    # shared semantic state and reducer
-  ui_view.zig     # shared typed draw commands
+  ui_view.zig     # terminal-cell typed draw commands
+  gui_regression_test.zig # native layout/input regression coverage
   render.zig      # small Allegro primitive helpers
 ```
 
 `gui_layout.zig`, `gui_framework.zig`, `gui_input.zig`, `ui_state.zig`, and
 `ui_view.zig` stay headless-testable. Only `gui_render.zig`, `gui_fonts.zig`,
-and `render.zig` import Allegro directly.
+`gui_artwork.zig`, `gui_visualizer.zig`, and `render.zig` import Allegro directly.
 
 ## Album view contract
 
@@ -65,8 +71,15 @@ whose geometry changes when cover art arrives:
 - Cover state is explicit (`none`, `loading`, `ready`, `unavailable`) for Now
   Playing only.
 
-This keeps navigation predictable, avoids asynchronous art changing album
-geometry, and leaves album browsing cheap to render.
+This keeps terminal navigation predictable and album browsing cheap to render.
+
+The GUI instead lands in an artwork grid, with stable square image slots and
+labels beneath. Art publication never changes card geometry. Album detail has
+an artwork/metadata hero and a separate track table. A memory-only worker
+produces bounded thumbnails; the frontend uploads them on ticks and the renderer
+only looks them up. Short viewports use compact artwork rows rather than clipping
+a huge cover across the entire viewport. The collapsible Now Playing inspector
+shares playback/queue/lyrics snapshots, not the TUI's presentation.
 
 ## Testing
 

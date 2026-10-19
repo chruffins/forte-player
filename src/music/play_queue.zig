@@ -9,12 +9,22 @@ const std = @import("std");
 pub const RepeatMode = enum { None, All, One };
 pub const PlaybackContextType = enum { Individual, Album, Playlist, Artist, Genre };
 
+/// Optional library signals used to make shuffle feel less repetitive.
+pub const ShuffleMetadata = struct {
+    artist_id: i64 = -1,
+    album_id: i64 = -1,
+    play_count: i64 = 0,
+    last_played: i64 = -1,
+    favorite: bool = false,
+};
+
 pub const PlayQueue = struct {
     allocator: std.mem.Allocator,
     song_ids: std.ArrayList(i32) = .{ .items = &.{}, .capacity = 0 },
     /// Stack of indices actually played, for reverse navigation.
     played_indices: std.ArrayList(usize) = .{ .items = &.{}, .capacity = 0 },
     shuffle_order: std.ArrayList(usize) = .{ .items = &.{}, .capacity = 0 },
+    shuffle_metadata: std.AutoHashMap(i32, ShuffleMetadata),
 
     current_index: usize = 0,
     shuffle_pos: usize = 0,
@@ -65,6 +75,7 @@ pub const PlayQueue = struct {
         std.Io.Threaded.global_single_threaded.io().random(std.mem.asBytes(&seed));
         return .{
             .allocator = allocator,
+            .shuffle_metadata = std.AutoHashMap(i32, ShuffleMetadata).init(allocator),
             .seed = seed,
         };
     }
@@ -73,11 +84,26 @@ pub const PlayQueue = struct {
         self.song_ids.deinit(self.allocator);
         self.played_indices.deinit(self.allocator);
         self.shuffle_order.deinit(self.allocator);
+        self.shuffle_metadata.deinit();
     }
 
-    fn rng(self: *const PlayQueue) std.Random {
-        var prng = std.Random.DefaultPrng.init(self.seed);
-        return prng.random();
+    pub fn setShuffleMetadata(self: *PlayQueue, song_id: i32, metadata: ShuffleMetadata) !void {
+        try self.shuffle_metadata.put(song_id, metadata);
+    }
+
+    pub fn clearShuffleMetadata(self: *PlayQueue) void {
+        self.shuffle_metadata.clearRetainingCapacity();
+    }
+
+    pub fn recordShufflePlay(self: *PlayQueue, song_id: i32, played_at: i64) void {
+        if (self.shuffle_metadata.getPtr(song_id)) |metadata| {
+            metadata.play_count +%= 1;
+            metadata.last_played = played_at;
+        }
+    }
+
+    pub fn setShuffleFavorite(self: *PlayQueue, song_id: i32, favorite: bool) void {
+        if (self.shuffle_metadata.getPtr(song_id)) |metadata| metadata.favorite = favorite;
     }
 
     pub fn cursor(self: *const PlayQueue) Cursor {
@@ -215,20 +241,85 @@ pub const PlayQueue = struct {
         self.syncShufflePos();
     }
 
+    fn shuffleWeight(self: *const PlayQueue, song_id: i32, previous_id: i32, latest_played: i64) f64 {
+        const metadata = self.shuffle_metadata.get(song_id) orelse return 1.0;
+        var weight: f64 = 1.0;
+        if (metadata.last_played < 0) {
+            weight = 1.35;
+        } else {
+            const age_seconds = @max(@as(i64, 0), latest_played - metadata.last_played);
+            const age_days = @as(f64, @floatFromInt(age_seconds)) / 86400.0;
+            weight = 0.30 + 0.70 * (age_days / (age_days + 21.0));
+        }
+        const plays = @as(f64, @floatFromInt(@max(metadata.play_count, 0)));
+        weight *= 0.55 + 0.45 / (1.0 + @sqrt(plays));
+        if (metadata.favorite) weight *= 1.4;
+
+        if (self.shuffle_metadata.get(previous_id)) |previous_metadata| {
+            if (metadata.album_id >= 0 and metadata.album_id == previous_metadata.album_id) {
+                weight *= 0.06;
+            } else if (metadata.artist_id >= 0 and metadata.artist_id == previous_metadata.artist_id) {
+                weight *= 0.18;
+            }
+        }
+        return @max(weight, 0.001);
+    }
+
     fn rebuildShuffleOrder(self: *PlayQueue) !void {
         const n = self.song_ids.items.len;
         self.shuffle_order.clearRetainingCapacity();
         self.shuffle_pos = 0;
         if (n == 0) return;
 
-        var others: std.ArrayList(usize) = .{ .items = &.{}, .capacity = 0 };
-        defer others.deinit(self.allocator);
-        for (0..n) |i| {
-            if (i != self.current_index) try others.append(self.allocator, i);
+        var latest_played: i64 = -1;
+        for (self.song_ids.items) |id| {
+            if (self.shuffle_metadata.get(id)) |metadata| latest_played = @max(latest_played, metadata.last_played);
         }
-        if (others.items.len != 0) self.rng().shuffleWithIndex(usize, others.items, usize);
+
+        var remaining: std.ArrayList(usize) = .{ .items = &.{}, .capacity = 0 };
+        defer remaining.deinit(self.allocator);
+        for (0..n) |i| {
+            if (i != self.current_index) try remaining.append(self.allocator, i);
+        }
         try self.shuffle_order.append(self.allocator, self.current_index);
-        try self.shuffle_order.appendSlice(self.allocator, others.items);
+
+        // Weighted selection with local diversity penalties: recently played
+        // and repeatedly played songs drift later, favorites get a modest lift,
+        // and adjacent tracks from the same artist/album become less likely.
+        var prng = std.Random.DefaultPrng.init(self.seed);
+        const random = prng.random();
+        var previous_id = self.song_ids.items[self.current_index];
+        while (remaining.items.len > 0) {
+            // A random candidate window keeps the greedy diversity pass bounded
+            // for large libraries while still considering every queue item as
+            // the window moves through the remaining pool.
+            var sample_positions: [32]usize = undefined;
+            const sample_count = @min(remaining.items.len, sample_positions.len);
+            var total_weight: f64 = 0;
+            for (0..sample_count) |sample_index| {
+                const pos = if (remaining.items.len <= sample_positions.len)
+                    sample_index
+                else
+                    random.uintLessThan(usize, remaining.items.len);
+                sample_positions[sample_index] = pos;
+                total_weight += self.shuffleWeight(self.song_ids.items[remaining.items[pos]], previous_id, latest_played);
+            }
+            var pick = random.float(f64) * total_weight;
+            var selected_pos = sample_positions[sample_count - 1];
+            for (sample_positions[0..sample_count]) |pos| {
+                pick -= self.shuffleWeight(self.song_ids.items[remaining.items[pos]], previous_id, latest_played);
+                if (pick <= 0) {
+                    selected_pos = pos;
+                    break;
+                }
+            }
+            const selected_index = remaining.items[selected_pos];
+            remaining.items[selected_pos] = remaining.items[remaining.items.len - 1];
+            remaining.items.len -= 1;
+            try self.shuffle_order.append(self.allocator, selected_index);
+            previous_id = self.song_ids.items[selected_index];
+        }
+        self.seed = prng.next();
     }
 
     pub fn enqueue(self: *PlayQueue, song_id: i32) !void {
@@ -623,6 +714,26 @@ test "queue: shuffle keeps current first, all ids present" {
     }
     try std.testing.expectEqual(@as(usize, 5), count);
     for (seen) |s| try std.testing.expect(s);
+}
+
+test "smart shuffle weights recent plays, favorites, and artist diversity" {
+    var q = PlayQueue.init(std.testing.allocator);
+    defer q.deinit();
+    const year: i64 = 365 * 24 * 60 * 60;
+    const latest = year;
+    try q.setShuffleMetadata(1, .{ .artist_id = 7, .album_id = 70 });
+    try q.setShuffleMetadata(2, .{ .artist_id = 8, .album_id = 80, .play_count = 1, .last_played = latest });
+    try q.setShuffleMetadata(3, .{ .artist_id = 8, .album_id = 81, .play_count = 1, .last_played = 0 });
+    try q.setShuffleMetadata(4, .{ .artist_id = 8, .album_id = 82, .play_count = 1, .last_played = 0, .favorite = true });
+    try q.setShuffleMetadata(5, .{ .artist_id = 7, .album_id = 71, .play_count = 1, .last_played = 0 });
+
+    const recently_played = q.shuffleWeight(2, 1, latest);
+    const older = q.shuffleWeight(3, 1, latest);
+    const favorite = q.shuffleWeight(4, 1, latest);
+    const repeated_artist = q.shuffleWeight(5, 1, latest);
+    try std.testing.expect(recently_played < older);
+    try std.testing.expect(favorite > older);
+    try std.testing.expect(repeated_artist < older);
 }
 
 test "queue: manual selection resets history and next follows selected song" {

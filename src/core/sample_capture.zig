@@ -9,6 +9,8 @@ const std = @import("std");
 const al = @import("allegro");
 
 pub const SampleCapture = struct {
+    const AtomicSample = std.atomic.Value(u32);
+
     allocator: std.mem.Allocator,
     control_mutex: al.threads.Mutex,
 
@@ -21,17 +23,23 @@ pub const SampleCapture = struct {
     /// Interleaved channel count (configured before playback starts).
     channels: usize = 2,
 
-    buf: []f32,
+    // Atomic bit patterns avoid a formal reader/writer race while retaining
+    // the sequence-lock retry behavior for coherent windows.
+    buf: []AtomicSample,
     capacity: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     write_pos: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     size: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     write_sequence: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn init(allocator: std.mem.Allocator, capacity: usize) !SampleCapture {
+        var control_mutex = try al.threads.Mutex.create();
+        errdefer control_mutex.destroy();
+        const buf = try allocator.alloc(AtomicSample, capacity);
+        for (buf) |*sample| sample.* = AtomicSample.init(0);
         return .{
             .allocator = allocator,
-            .control_mutex = try al.threads.Mutex.create(),
-            .buf = try allocator.alloc(f32, capacity),
+            .control_mutex = control_mutex,
+            .buf = buf,
             .capacity = std.atomic.Value(usize).init(capacity),
         };
     }
@@ -86,12 +94,13 @@ pub const SampleCapture = struct {
         self.enabled.store(false, .release);
         self.waitForAccess();
 
-        const new_buf = self.allocator.alloc(f32, sample_count) catch |err| {
+        const new_buf = self.allocator.alloc(AtomicSample, sample_count) catch |err| {
             self.admission_closed.store(false, .release);
             self.enabled.store(was_enabled, .release);
             self.control_mutex.unlock();
             return err;
         };
+        for (new_buf) |*sample| sample.* = AtomicSample.init(0);
         self.allocator.free(self.buf);
         self.buf = new_buf;
         self.capacity.store(sample_count, .release);
@@ -145,7 +154,13 @@ pub const SampleCapture = struct {
             const count = @min(@min(max_samples, out.len), size_before);
             const write_before = self.write_pos.load(.acquire);
             const start = (write_before + self.buf.len - count) % self.buf.len;
-            for (0..count) |i| out[i] = self.buf[(start + i) % self.buf.len];
+            var index = start;
+            for (0..count) |i| {
+                const bits = self.buf[index].load(.monotonic);
+                out[i] = @as(f32, @bitCast(bits));
+                index += 1;
+                if (index == self.buf.len) index = 0;
+            }
             const sequence_after = self.write_sequence.load(.acquire);
             if (sequence_before == sequence_after and (sequence_after & 1) == 0 and size_before == self.size.load(.acquire) and write_before == self.write_pos.load(.acquire)) return count;
         }
@@ -174,7 +189,13 @@ pub const SampleCapture = struct {
             for (0..frame_count) |frame| {
                 var sum: f32 = 0.0;
                 const frame_start = (start + frame * channel_count) % self.buf.len;
-                for (0..channel_count) |ch| sum += self.buf[(frame_start + ch) % self.buf.len];
+                var sample_index = frame_start;
+                for (0..channel_count) |_| {
+                    const bits = self.buf[sample_index].load(.monotonic);
+                    sum += @as(f32, @bitCast(bits));
+                    sample_index += 1;
+                    if (sample_index == self.buf.len) sample_index = 0;
+                }
                 out[frame] = sum / @as(f32, @floatFromInt(channel_count));
             }
             const sequence_after = self.write_sequence.load(.acquire);
@@ -203,8 +224,12 @@ pub const SampleCapture = struct {
         var write_pos = self.write_pos.load(.monotonic);
         var size = self.size.load(.monotonic);
         for (samples) |s| {
-            self.buf[write_pos] = @as(f32, @floatFromInt(s)) / 32768.0;
-            write_pos = (write_pos + 1) % capacity;
+            const value = @as(f32, @floatFromInt(s)) / 32768.0;
+            self.buf[write_pos].store(@as(u32, @bitCast(value)), .monotonic);
+            // This callback runs for every audio sample. Avoid a division in
+            // the hot ring-buffer path; capacity is always positive here.
+            write_pos += 1;
+            if (write_pos == capacity) write_pos = 0;
             if (size < capacity) size += 1;
         }
         self.write_pos.store(write_pos, .release);

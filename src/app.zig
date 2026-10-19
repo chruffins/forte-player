@@ -17,12 +17,14 @@ const allegro_init = @import("core/allegro_init.zig");
 const config_mod = @import("core/config.zig");
 const RealEngine = @import("core/music_engine.zig").RealEngine;
 const PlayQueue = @import("music/play_queue.zig").PlayQueue;
+const ShuffleMetadata = @import("music/play_queue.zig").ShuffleMetadata;
 const RepeatMode = @import("music/play_queue.zig").RepeatMode;
 const PlaybackContextType = @import("music/play_queue.zig").PlaybackContextType;
 const db_mod = @import("music/database.zig");
 const lib_mod = @import("music/library.zig");
 const scanner = @import("music/scanner.zig");
 const taglib_meta = @import("music/taglib_meta.zig");
+const loudness = @import("music/loudness.zig");
 
 /// Current wall-clock time in unix seconds (std.Io.Clock; no C imports).
 fn unixSeconds() i64 {
@@ -37,12 +39,24 @@ pub const SongChangedFn = *const fn (ctx: *anyopaque, path: [:0]const u8) void;
 pub const EngineCtx = struct {
     lib: *lib_mod.Library,
     db: *db_mod.Database,
+    play_queue: *PlayQueue,
     /// The currently-playing path, kept in sync on every song change.
     current_path: *[:0]const u8,
     has_current_path: *bool,
     engine: *RealEngine,
+    config: *config_mod.Config,
     user: ?*anyopaque = null,
     song_changed: ?SongChangedFn = null,
+
+    fn applyNormalization(self: *EngineCtx, id: i64) void {
+        const measurement = self.db.getSongReplayGain(id) catch null orelse loudness.Measurement{};
+        self.engine.setNormalizationGain(loudness.effectiveGain(
+            measurement,
+            self.config.getNormalizationEnabled(),
+            self.config.getNormalizationPolicy(),
+            0.98,
+        ));
+    }
 };
 
 fn resolveSong(id: i32, ctx: *anyopaque) ?[:0]const u8 {
@@ -83,12 +97,44 @@ fn restoreSavedQueue(queue: *PlayQueue, lib: *lib_mod.Library, config: *const co
     queue.setShuffled(config.getInt("queue", "shuffle", 0) != 0) catch {};
 }
 
+fn populateShuffleMetadata(queue: *PlayQueue, lib: *lib_mod.Library, db: *db_mod.Database, allocator: std.mem.Allocator) !void {
+    queue.clearShuffleMetadata();
+    var album_artist = std.AutoHashMap(i64, i64).init(allocator);
+    defer album_artist.deinit();
+    for (lib.order.items) |song_id| {
+        if (song_id < std.math.minInt(i32) or song_id > std.math.maxInt(i32)) continue;
+        const song = lib.getSongById(song_id) orelse continue;
+        var artist_id: i64 = -1;
+        if (song.album_id >= 0) {
+            if (album_artist.get(song.album_id)) |cached| {
+                artist_id = cached;
+            } else {
+                artist_id = if (try db.getAlbumById(song.album_id)) |album| album.artist_id else -1;
+                try album_artist.put(song.album_id, artist_id);
+            }
+        }
+        try queue.setShuffleMetadata(@intCast(song_id), .{
+            .artist_id = artist_id,
+            .album_id = song.album_id,
+            .play_count = song.play_count,
+            .last_played = song.last_played,
+            .favorite = song.favorite != 0,
+        });
+    }
+}
+
 fn onSongChanged(path: [:0]const u8, ctx: *anyopaque) void {
     const p: *EngineCtx = @ptrCast(@alignCast(ctx));
     p.current_path.* = path;
     p.has_current_path.* = true;
     if (p.lib.songIdByPath(path)) |id| {
-        p.db.markPlayed(@intCast(id), unixSeconds()) catch |e| std.log.err("failed to record play for song {d}: {}", .{ id, e });
+        const played_at = unixSeconds();
+        p.db.markPlayed(@intCast(id), played_at) catch |e| std.log.err("failed to record play for song {d}: {}", .{ id, e });
+        p.lib.recordPlayed(id, played_at);
+        if (id >= std.math.minInt(i32) and id <= std.math.maxInt(i32)) p.play_queue.recordShufflePlay(@intCast(id), played_at);
+        p.applyNormalization(id);
+    } else {
+        p.engine.setNormalizationGain(1.0);
     }
     if (p.song_changed) |cb| {
         if (p.user) |u| cb(u, path);
@@ -166,6 +212,7 @@ pub const App = struct {
         self.play_queue = PlayQueue.init(allocator);
         var qi: usize = 0;
         while (qi < self.lib.count()) : (qi += 1) try self.play_queue.enqueue(@intCast(self.lib.songIdAt(qi)));
+        try populateShuffleMetadata(&self.play_queue, self.lib, &self.db, allocator);
         restoreSavedQueue(&self.play_queue, self.lib, &config, allocator);
 
         self.config = config;
@@ -173,12 +220,15 @@ pub const App = struct {
         self.ctx = .{
             .lib = self.lib,
             .db = &self.db,
+            .play_queue = &self.play_queue,
             .current_path = &self.current_path,
             .has_current_path = &self.has_current_path,
             .engine = self.engine,
+            .config = &self.config,
             .user = user,
             .song_changed = song_changed,
         };
+        self.engine.setCrossfadeSecs(@floatFromInt(self.config.getCrossfadeSeconds()));
         self.engine.setPlayQueue(&self.play_queue);
         self.engine.resolve_song = resolveSong;
         self.engine.on_song_changed = onSongChanged;
@@ -210,6 +260,34 @@ pub const App = struct {
         restoreSavedQueue(&self.play_queue, self.lib, &self.config, self.allocator);
     }
 
+    /// Reload the in-memory library after on-disk tag edits, preserving the
+    /// current stream path and refreshing the queue's smart-shuffle metadata.
+    pub fn reloadLibrary(self: *App) !void {
+        var previous_path: ?[]u8 = null;
+        if (self.has_current_path) previous_path = try self.allocator.dupe(u8, self.current_path);
+        defer if (previous_path) |path| self.allocator.free(path);
+        try self.lib.load(&self.db);
+        try populateShuffleMetadata(&self.play_queue, self.lib, &self.db, self.allocator);
+        self.has_current_path = false;
+        if (previous_path) |path| if (self.lib.songIdByPath(path)) |id| {
+            if (self.lib.songPath(id)) |current| {
+                self.current_path = current;
+                self.has_current_path = true;
+            }
+        };
+    }
+
+    /// Re-apply settings to the current stream after a normalization preference changes.
+    pub fn refreshNormalization(self: *App) void {
+        if (self.has_current_path) {
+            if (self.lib.songIdByPath(self.current_path)) |id| {
+                self.ctx.applyNormalization(id);
+                return;
+            }
+        }
+        self.engine.setNormalizationGain(1.0);
+    }
+
     pub fn saveConfig(self: *App) void {
         const path = config_mod.configFilePath(self.allocator) catch |e| {
             std.log.err("config path failed: {}", .{e});
@@ -224,6 +302,7 @@ pub const App = struct {
     pub fn finishRescan(self: *App, result: scanner.ScanResult, previous_path: []const u8) !void {
         self.engine.stop();
         try self.lib.load(&self.db);
+        try populateShuffleMetadata(&self.play_queue, self.lib, &self.db, self.allocator);
         // Library.load resets the arena that backs current_path. Do not expose
         // the old slice while deciding whether the previous track survived.
         self.has_current_path = false;

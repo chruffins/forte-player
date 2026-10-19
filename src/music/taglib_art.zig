@@ -28,6 +28,37 @@ pub const Metadata = struct {
 
 pub const WriteError = error{ PathTooLong, TagLibSaveFailed };
 
+pub const ReplayGain = struct {
+    track_gain_db: ?f64 = null,
+    track_peak: ?f64 = null,
+    album_gain_db: ?f64 = null,
+    album_peak: ?f64 = null,
+};
+
+/// Read standard ReplayGain tags through TagLib's format-independent property map.
+/// Missing files/tags are represented as null values (unity in playback).
+pub fn extractReplayGain(path: []const u8) ?ReplayGain {
+    var pathbuf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
+    if (path.len + 1 > pathbuf.len) return null;
+    @memcpy(pathbuf[0..path.len], path);
+    pathbuf[path.len] = 0;
+    var tg: f64 = 0;
+    var tp: f64 = 0;
+    var ag: f64 = 0;
+    var ap: f64 = 0;
+    var htg: c_int = 0;
+    var htp: c_int = 0;
+    var hag: c_int = 0;
+    var hap: c_int = 0;
+    if (c.forte_extract_replaygain(pathbuf[0..path.len :0].ptr, &tg, &htg, &tp, &htp, &ag, &hag, &ap, &hap) != 1) return null;
+    return .{
+        .track_gain_db = if (htg != 0) tg else null,
+        .track_peak = if (htp != 0) tp else null,
+        .album_gain_db = if (hag != 0) ag else null,
+        .album_peak = if (hap != 0) ap else null,
+    };
+}
+
 pub fn extractDiscNumber(path: []const u8) u32 {
     var pathbuf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
     if (path.len + 1 > pathbuf.len) return 1;

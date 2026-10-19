@@ -69,6 +69,8 @@ pub const WidgetSpec = struct {
     visible: bool = true,
     enabled: bool = true,
     focusable: bool = false,
+    /// Parent viewport in pixel space. Off-screen widgets cannot receive input.
+    clip: ?ui.Rect = null,
 
     pub fn bounds(self: WidgetSpec, width: f32, height: f32) ui.Rect {
         const pos = self.position.resolve(width, height);
@@ -77,7 +79,9 @@ pub const WidgetSpec = struct {
     }
 
     pub fn hitTest(self: WidgetSpec, width: f32, height: f32, x: f32, y: f32) bool {
-        return self.visible and self.enabled and self.bounds(width, height).contains(x, y);
+        if (!self.visible or !self.enabled) return false;
+        if (self.clip) |clip| if (!containsPoint(clip, x, y)) return false;
+        return containsPoint(self.bounds(width, height), x, y);
     }
 };
 
@@ -175,6 +179,7 @@ pub const TextInput = struct {
     storage: [512]u8 = undefined,
     len: usize = 0,
     cursor: usize = 0,
+    truncated: bool = false,
 
     pub fn text(self: *const TextInput) []const u8 {
         return self.storage[0..self.len];
@@ -182,8 +187,9 @@ pub const TextInput = struct {
 
     pub fn setText(self: *TextInput, value: []const u8) void {
         self.len = @min(value.len, self.storage.len);
+        while (self.len > 0 and !std.unicode.utf8ValidateSlice(value[0..self.len])) self.len -= 1;
+        self.truncated = self.len < value.len;
         @memcpy(self.storage[0..self.len], value[0..self.len]);
-        while (self.len > 0 and isUtf8Continuation(self.storage[self.len - 1])) self.len -= 1;
         self.cursor = self.len;
     }
 
@@ -205,6 +211,7 @@ pub const TextInput = struct {
         @memmove(self.storage[start .. self.len - (self.cursor - start)], self.storage[self.cursor..self.len]);
         self.len -= self.cursor - start;
         self.cursor = start;
+        if (self.len == 0) self.truncated = false;
         return true;
     }
 
@@ -213,6 +220,7 @@ pub const TextInput = struct {
         const end_pos = nextBoundary(self.storage[0..self.len], self.cursor);
         @memmove(self.storage[self.cursor .. self.len - (end_pos - self.cursor)], self.storage[end_pos..self.len]);
         self.len -= end_pos - self.cursor;
+        if (self.len == 0) self.truncated = false;
         return true;
     }
 
@@ -287,6 +295,7 @@ pub const Event = union(enum) {
     wheel: struct { x: f32, y: f32, delta: f32 },
     focus_next,
     focus_previous,
+    cancel,
 };
 
 pub const EventResult = struct {
@@ -336,15 +345,17 @@ pub const Dispatcher = struct {
             .mouse_move => |mouse| {
                 const target = self.targetAt(width, height, mouse.x, mouse.y);
                 self.hovered = if (target) |t| t.id else null;
-                return .{ .handled = target != null, .target = self.hovered };
+                return .{ .handled = target != null or self.pressed != null, .target = self.pressed orelse self.hovered };
             },
             .mouse_down => |mouse| {
+                if (mouse.button != 1) return .{};
                 const target = self.targetAt(width, height, mouse.x, mouse.y) orelse return .{};
                 self.pressed = target.id;
                 if (target.spec.focusable) self.focused = target.id;
                 return .{ .handled = true, .target = target.id };
             },
             .mouse_up => |mouse| {
+                if (mouse.button != 1) return .{};
                 const target = self.targetAt(width, height, mouse.x, mouse.y);
                 const pressed = self.pressed;
                 self.pressed = null;
@@ -357,10 +368,15 @@ pub const Dispatcher = struct {
             .focus_next, .focus_previous => {
                 if (self.count == 0) return .{};
                 const forward = event == .focus_next;
-                var start: usize = if (self.focused) |id| blk: {
-                    for (self.targets, 0..) |target, index| if (target.id == id) break :blk index;
-                    break :blk 0;
-                } else if (forward) 0 else self.count - 1;
+                var start: usize = if (forward) 0 else self.count - 1;
+                if (self.focused) |id| {
+                    for (self.targets[0..self.count], 0..) |target, index| {
+                        if (target.id == id) {
+                            start = if (forward) (index + 1) % self.count else (index + self.count - 1) % self.count;
+                            break;
+                        }
+                    }
+                }
                 var attempts: usize = 0;
                 while (attempts < self.count) : (attempts += 1) {
                     if (self.targets[start].spec.visible and self.targets[start].spec.enabled and self.targets[start].spec.focusable) {
@@ -371,9 +387,19 @@ pub const Dispatcher = struct {
                 }
                 return .{};
             },
+            .cancel => {
+                self.pressed = null;
+                self.hovered = null;
+                return .{};
+            },
         }
     }
 };
+
+/// Half-open bounds reject zero-sized controls and shared-edge double hits.
+pub fn containsPoint(r: ui.Rect, x: f32, y: f32) bool {
+    return r.w > 0 and r.h > 0 and x >= r.x and y >= r.y and x < r.right() and y < r.bottom();
+}
 
 test "image placement preserves aspect ratio and alignment" {
     const box = ui.Rect{ .x = 10, .y = 20, .w = 300, .h = 200 };
@@ -408,6 +434,16 @@ test "text input edits Unicode at codepoint boundaries" {
     input.home();
     try std.testing.expect(input.deleteForward());
     try std.testing.expectEqualStrings("b", input.text());
+
+    var long: [512]u8 = @splat('a');
+    long[510] = 0xe2;
+    long[511] = 0x82;
+    input.setText(&long);
+    try std.testing.expectEqual(@as(usize, 510), input.text().len);
+    try std.testing.expect(input.truncated);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(input.text()));
+    while (input.backspace()) {}
+    try std.testing.expect(!input.truncated);
 }
 
 test "UV resolves normalized plus pixel coordinates" {

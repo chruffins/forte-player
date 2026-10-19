@@ -122,6 +122,7 @@ pub const FakeStream = struct {
     length_secs: f64 = 100.0,
     pan: f32 = 0.0,
     speed: f32 = 1.0,
+    gain_value: f32 = 1.0,
 
     pub fn destroy(_: *FakeStream) void {}
     pub fn setPlaying(self: *FakeStream, v: bool) bool {
@@ -130,6 +131,13 @@ pub const FakeStream = struct {
     }
     pub fn playing(self: *const FakeStream) bool {
         return self.is_playing;
+    }
+    pub fn setGain(self: *FakeStream, v: f32) bool {
+        self.gain_value = v;
+        return true;
+    }
+    pub fn gain(self: *const FakeStream) f32 {
+        return self.gain_value;
     }
     pub fn setPan(self: *FakeStream, v: f32) bool {
         self.pan = v;
@@ -155,6 +163,7 @@ pub const FakeStream = struct {
 /// (play/pause/seek/status). No audio device, no capture.
 pub const FakeDriver = struct {
     pub const Stream = FakeStream;
+    mixer_gain: f32 = 1.0,
 
     pub fn init(_: std.mem.Allocator) !FakeDriver {
         return .{};
@@ -173,7 +182,9 @@ pub const FakeDriver = struct {
         return null; // no real event source in the fake
     }
 
-    pub fn setGain(_: *FakeDriver, _: f32) void {}
+    pub fn setGain(self: *FakeDriver, gain: f32) void {
+        self.mixer_gain = gain;
+    }
 
     pub fn setSampleBufferCapacity(_: *FakeDriver, _: usize) !void {}
     pub fn enableCapture(_: *FakeDriver, _: bool) void {}

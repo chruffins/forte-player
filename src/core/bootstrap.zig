@@ -16,6 +16,8 @@ pub const Handlers = struct {
 
     /// Called once after the display is successfully created.
     on_init_display: ?*const fn (ctx: *anyopaque, display: *al.Display) void = null,
+    /// Release frontend GPU resources while their display context still exists.
+    on_deinit_display: ?*const fn (ctx: *anyopaque) void = null,
     /// Called every timer tick (approx `Options.tick_interval_secs`).
     on_tick: ?*const fn (ctx: *anyopaque) void = null,
     /// Called every frame to draw; bootstrap flips the display afterwards.
@@ -25,6 +27,8 @@ pub const Handlers = struct {
     on_key_down: ?*const fn (ctx: *anyopaque, key: al.KeyCode) void = null,
     on_key_char: ?*const fn (ctx: *anyopaque, codepoint: u32) void = null,
     on_key_up: ?*const fn (ctx: *anyopaque, key: al.KeyCode) void = null,
+    /// Cancel frontend pointer capture when focus leaves the window.
+    on_focus_lost: ?*const fn (ctx: *anyopaque) void = null,
     on_mouse_motion: ?*const fn (ctx: *anyopaque, x: f32, y: f32) void = null,
     /// Called for wheel motion; `dz` follows Allegro's wheel direction.
     on_mouse_wheel: ?*const fn (ctx: *anyopaque, x: f32, y: f32, dz: i32) void = null,
@@ -39,6 +43,9 @@ pub const Options = struct {
     width: i32 = 960,
     height: i32 = 600,
     title: [:0]const u8 = "forte-player",
+    resizable: bool = false,
+    /// Request desktop OpenGL shaders; retry an ordinary display if unavailable.
+    programmable_pipeline: bool = false,
     tick_interval_secs: f64 = 1.0 / 60.0,
     /// When set, quit after this many ticks.
     max_ticks: ?u64 = null,
@@ -51,10 +58,21 @@ pub const Options = struct {
 /// optional: on a headless box we degrade to a timer + input loop.
 pub fn run(queue: *al.EventQueue, options: Options, handlers: Handlers) !void {
     var display: ?al.Display = null;
-    const created = al.Display.create(options.width, options.height) catch null;
+    const original_flags = al.Display.getNewFlags();
+    var flags = original_flags | al.DisplayFlags.WINDOWED;
+    if (options.resizable) flags |= al.DisplayFlags.RESIZABLE;
+    if (options.programmable_pipeline) flags |= al.DisplayFlags.OPENGL | al.DisplayFlags.PROGRAMMABLE_PIPELINE;
+    al.Display.setNewFlags(flags);
+    const created = al.Display.create(options.width, options.height) catch fallback: {
+        if (!options.programmable_pipeline) break :fallback null;
+        std.log.warn("programmable display unavailable; trying ordinary GUI", .{});
+        al.Display.setNewFlags(flags & ~(al.DisplayFlags.OPENGL | al.DisplayFlags.PROGRAMMABLE_PIPELINE));
+        break :fallback al.Display.create(options.width, options.height) catch null;
+    };
+    al.Display.setNewFlags(original_flags);
     if (created != null) {
         display = created.?;
-        al.Display.setNewWindowTitle(options.title);
+        display.?.setWindowTitle(options.title);
         queue.registerDisplay(&display.?);
         if (handlers.on_init_display) |h| h(handlers.ctx, &display.?);
     } else {
@@ -63,6 +81,7 @@ pub fn run(queue: *al.EventQueue, options: Options, handlers: Handlers) !void {
     defer if (display) |*d| {
         // Do not leave the queue holding a display source after the display is
         // destroyed; callers may continue using the queue after run returns.
+        if (handlers.on_deinit_display) |h| h(handlers.ctx);
         queue.unregisterDisplay(d);
         d.destroy();
     };
@@ -105,9 +124,23 @@ pub fn run(queue: *al.EventQueue, options: Options, handlers: Handlers) !void {
                 // cadence signal, so collapse the contiguous backlog and draw
                 // the newest state once.
                 var queued: al.Event = undefined;
-                while (queue.peekNextEvent(&queued) and al.eventType(queued) == .timer) {
-                    _ = queue.getNextEvent(&queued);
+                while (queue.peekNextEvent(&queued)) {
+                    switch (al.eventType(queued)) {
+                        .timer => _ = queue.getNextEvent(&queued),
+                        // A swap on the old drawable can block behind the WM's
+                        // resize handshake. Acknowledge pending resizes before
+                        // drawing, not after one more stale-size frame.
+                        .display_resize => {
+                            _ = queue.getNextEvent(&queued);
+                            if (display) |*d| _ = d.acknowledgeResize();
+                        },
+                        else => break,
+                    }
                 }
+                // Drain queued input/completion events before swapping. A
+                // resize may sit behind one of them; waiting for the next fresh
+                // timer avoids blocking on an unacknowledged drawable.
+                if (queue.peekNextEvent(&queued)) continue;
                 ticks += 1;
                 if (handlers.on_tick) |h| h(handlers.ctx);
                 if (handlers.on_render) |h| {
@@ -129,6 +162,9 @@ pub fn run(queue: *al.EventQueue, options: Options, handlers: Handlers) !void {
             .display_close => {
                 const quit = if (handlers.on_display_close) |h| h(handlers.ctx) else true;
                 if (quit) break;
+            },
+            .display_switch_out => {
+                if (handlers.on_focus_lost) |h| h(handlers.ctx);
             },
             .display_resize => {
                 if (display) |*d| {

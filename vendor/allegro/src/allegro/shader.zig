@@ -3,6 +3,7 @@ const c = @import("c");
 const Color = @import("color.zig").Color;
 const Transform = @import("transform.zig").Transform;
 const Bitmap = @import("graphics.zig").Bitmap;
+const uniform = @import("shader_uniform.zig");
 
 pub const ShaderError = error{ CreateFailed, BuildFailed };
 
@@ -27,7 +28,7 @@ pub const Type = struct {
 pub const Shader = struct {
     shader: *c.ALLEGRO_SHADER,
 
-    pub fn create(platform: c_int) !Shader {
+    pub fn create(platform: c.ALLEGRO_SHADER_PLATFORM) !Shader {
         const s = c.al_create_shader(platform) orelse return ShaderError.CreateFailed;
         return .{ .shader = s };
     }
@@ -70,13 +71,13 @@ pub const Shader = struct {
         return if (s) |ptr| Shader{ .shader = ptr } else null;
     }
 
-    pub fn getPlatform(self: *Shader) c_int {
+    pub fn getPlatform(self: *Shader) c.ALLEGRO_SHADER_PLATFORM {
         return c.al_get_shader_platform(self.shader);
     }
 
     /// The default shader source for a given platform and stage (for building
     /// minimal shaders that you extend).
-    pub fn getDefaultSource(platform: c_int, stage: c_int) ?[:0]const u8 {
+    pub fn getDefaultSource(platform: c.ALLEGRO_SHADER_PLATFORM, stage: c.ALLEGRO_SHADER_TYPE) ?[:0]const u8 {
         const s = c.al_get_default_shader_source(platform, stage);
         return if (s == null) null else std.mem.span(s);
     }
@@ -108,11 +109,13 @@ pub const Shader = struct {
     }
 
     pub fn setIntVector(name: [:0]const u8, numComponents: i32, values: []const i32) bool {
-        return c.al_set_shader_int_vector(name.ptr, numComponents, values.ptr, @intCast(values.len));
+        const count = uniform.vectorCount(numComponents, values.len) orelse return false;
+        return c.al_set_shader_int_vector(name.ptr, numComponents, values.ptr, count);
     }
 
     pub fn setFloatVector(name: [:0]const u8, numComponents: i32, values: []const f32) bool {
-        return c.al_set_shader_float_vector(name.ptr, numComponents, values.ptr, @intCast(values.len));
+        const count = uniform.vectorCount(numComponents, values.len) orelse return false;
+        return c.al_set_shader_float_vector(name.ptr, numComponents, values.ptr, count);
     }
 };
 

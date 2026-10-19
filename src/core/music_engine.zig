@@ -44,6 +44,15 @@ pub fn MusicEngine(comptime Drv: type) type {
 
         // 'No song loaded' is the one genuinely-absent field.
         stream: ?Stream = null,
+        /// A decoded, attached successor kept ready before the current stream ends.
+        next_stream: ?Stream = null,
+        next_queue_index: ?usize = null,
+        next_path: ?[:0]const u8 = null,
+        next_queue_revision: u64 = 0,
+        crossfade_secs: f64 = 0.0,
+        crossfade_elapsed: f64 = 0.0,
+        paused: bool = false,
+        previous_update_time: f64 = 0.0,
 
         /// Optional external queue the current stream's event source registers onto.
         event_queue: ?*al.events.EventQueue = null,
@@ -57,6 +66,7 @@ pub fn MusicEngine(comptime Drv: type) type {
         time: f64 = 0.0,
         duration: f64 = 0.0,
         gain: f32 = 1.0,
+        normalization_gain: f32 = 1.0,
 
         /// Optional play queue (not owned) that drives next/previous/auto-advance.
         queue: ?*PlayQueue = null,
@@ -98,6 +108,7 @@ pub fn MusicEngine(comptime Drv: type) type {
             const allocator = self.allocator;
             self.unregisterStreamSource();
             if (self.stream) |*s| s.destroy();
+            if (self.next_stream) |*s| s.destroy();
             self.drv.deinit();
             allocator.destroy(self.drv);
             allocator.destroy(self);
@@ -112,13 +123,16 @@ pub fn MusicEngine(comptime Drv: type) type {
             // later control (resume/next/prev) a no-op.
             var stream = try self.drv.load(path);
             errdefer stream.destroy();
+            _ = stream.setGain(self.normalization_gain);
 
+            self.discardPreloaded();
             self.unregisterStreamSource();
             if (self.stream) |*old| old.destroy();
             self.stream = null;
 
             self.time = 0.0;
             self.duration = stream.lengthSecs();
+            self.paused = false;
 
             _ = stream.setPlaying(true);
 
@@ -134,14 +148,22 @@ pub fn MusicEngine(comptime Drv: type) type {
         }
 
         pub fn pause(self: *Self) void {
+            self.paused = true;
             if (self.stream) |*s| _ = s.setPlaying(false);
+            if (self.next_stream) |*s| _ = s.setPlaying(false);
         }
 
         pub fn resumePlayback(self: *Self) void {
+            self.paused = false;
             if (self.stream) |*s| _ = s.setPlaying(true);
+            if (self.crossfade_elapsed > 0) {
+                if (self.next_stream) |*s| _ = s.setPlaying(true);
+            }
         }
 
         pub fn stop(self: *Self) void {
+            self.paused = false;
+            self.discardPreloaded();
             self.unregisterStreamSource();
             if (self.stream) |*s| {
                 _ = s.setPlaying(false);
@@ -163,6 +185,20 @@ pub fn MusicEngine(comptime Drv: type) type {
             self.drv.setGain(self.gain);
         }
 
+        /// Set the normalized per-stream multiplier. Peak limiting and metadata
+        /// fallback are computed by loudness.zig before this reaches the engine.
+        pub fn setNormalizationGain(self: *Self, value: f32) void {
+            self.normalization_gain = if (std.math.isFinite(value)) @max(0.0, @min(value, 16.0)) else 1.0;
+            if (self.stream) |*stream| _ = stream.setGain(self.normalization_gain);
+        }
+
+        /// Configure a linear per-stream crossfade. Zero disables overlap while
+        /// retaining gapless successor preloading.
+        pub fn setCrossfadeSecs(self: *Self, seconds: f64) void {
+            self.crossfade_secs = if (std.math.isFinite(seconds)) @max(0.0, @min(seconds, 30.0)) else 0.0;
+            self.discardPreloaded();
+        }
+
         pub fn getGain(self: *const Self) f32 {
             return self.gain;
         }
@@ -181,10 +217,22 @@ pub fn MusicEngine(comptime Drv: type) type {
 
         /// Poll the stream position. Mirrors `MusicEngine::update()`.
         pub fn update(self: *Self) void {
-            if (self.stream) |*s| self.time = s.positionSecs();
+            const s = if (self.stream) |*current| current else return;
+            self.time = s.positionSecs();
+            if (self.next_stream != null) if (self.queue) |queue| {
+                if (queue.revision() != self.next_queue_revision) self.discardPreloaded();
+            };
+            self.preloadNext();
+            if (!self.paused and self.next_stream != null and self.crossfade_secs > 0 and self.duration > 0 and self.time >= self.duration - self.crossfade_secs) {
+                self.advanceCrossfade();
+            }
+            if (!self.paused and self.time >= self.duration and self.duration > 0) {
+                self.promotePreloaded() catch {};
+            }
         }
 
         pub fn setProgress(self: *Self, position: f64) void {
+            self.discardPreloaded();
             if (self.stream) |*s| {
                 _ = s.seekSecs(position);
                 self.time = position;
@@ -211,9 +259,93 @@ pub fn MusicEngine(comptime Drv: type) type {
             self.drv.clearCapture();
         }
 
+        fn discardPreloaded(self: *Self) void {
+            if (self.next_stream) |*stream| {
+                _ = stream.setPlaying(false);
+                stream.destroy();
+                self.next_stream = null;
+            }
+            self.next_queue_index = null;
+            self.next_path = null;
+            self.next_queue_revision = 0;
+            self.crossfade_elapsed = 0;
+        }
+
+        fn preloadNext(self: *Self) void {
+            if (self.next_stream != null or self.stream == null or self.queue == null) return;
+            const q = self.queue.?;
+            if (q.size() == 0) return;
+            const saved = q.cursor();
+            const attempts = q.size();
+            var attempt: usize = 0;
+            while (attempt < attempts) : (attempt += 1) {
+                const id = (q.next() catch break) orelse break;
+                const index = q.currentIndex();
+                const path = self.resolveSongPath(id) orelse continue;
+                var candidate = self.drv.load(path) catch continue;
+                _ = candidate.setGain(0.0);
+                _ = candidate.setPlaying(false);
+                self.next_stream = candidate;
+                self.next_queue_index = index;
+                self.next_path = path;
+                q.restore(saved);
+                self.next_queue_revision = q.revision();
+                return;
+            }
+            q.restore(saved);
+        }
+
+        fn advanceCrossfade(self: *Self) void {
+            const next = if (self.next_stream) |*stream| stream else return;
+            const delta = if (self.previous_update_time > 0) @max(0.0, self.time - self.previous_update_time) else 0.0;
+            self.previous_update_time = self.time;
+            self.crossfade_elapsed += delta;
+            const progress = @as(f32, @floatCast(@min(1.0, self.crossfade_elapsed / @max(0.001, @min(self.crossfade_secs, self.duration)))));
+            if (!next.playing()) _ = next.setPlaying(true);
+            if (self.stream) |*current| _ = current.setGain(self.normalization_gain * (1.0 - progress));
+            _ = next.setGain(self.normalization_gain * progress);
+        }
+
+        fn promotePreloaded(self: *Self) !void {
+            if (self.next_stream == null) {
+                try self.handleAudioStreamFinished();
+                return;
+            }
+            const q = self.queue;
+            const index = self.next_queue_index;
+            const path = self.next_path;
+            if (self.on_song_finished) |cb| cb(@ptrCast(self));
+            if (q) |queue| if (index) |target| try queue.commitIndex(target);
+            self.unregisterStreamSource();
+            if (self.stream) |*old| {
+                _ = old.setPlaying(false);
+                old.destroy();
+            }
+            self.stream = self.next_stream;
+            self.next_stream = null;
+            self.next_queue_index = null;
+            self.next_path = null;
+            self.next_queue_revision = 0;
+            self.time = 0;
+            self.previous_update_time = 0;
+            self.crossfade_elapsed = 0;
+            const stream = if (self.stream) |*active| active else return;
+            self.duration = stream.lengthSecs();
+            _ = stream.setGain(self.normalization_gain);
+            _ = stream.setPlaying(true);
+            if (self.event_queue) |queue| {
+                if (self.drv.streamEventSource(stream)) |source| {
+                    self.stream_event_source = source;
+                    if (self.stream_event_source) |*source_mut| queue.registerSource(source_mut);
+                }
+            }
+            if (self.on_song_changed) |cb| if (path) |new_path| cb(new_path, self.user_context orelse @ptrCast(self));
+        }
+
         // ---- Queue / repeat / auto-advance ----
 
         pub fn setPlayQueue(self: *Self, queue: ?*PlayQueue) void {
+            self.discardPreloaded();
             self.queue = queue;
         }
 
@@ -270,6 +402,17 @@ pub fn MusicEngine(comptime Drv: type) type {
         /// repeat mode (One replays the current track; All wraps; None stops when
         /// the queue runs out). The real app calls this when the audio stream
         /// finishes; tests drive it directly.
+        pub fn handleAudioStreamFinishedFromEvent(self: *Self) !void {
+            // Completion events can outlive a stream after promotion or stop.
+            // Ignore them while playback is paused, absent, or still active.
+            if (self.paused or self.stream == null or self.isPlaying()) return;
+            if (self.next_stream != null) {
+                try self.promotePreloaded();
+            } else {
+                try self.handleAudioStreamFinished();
+            }
+        }
+
         pub fn handleAudioStreamFinished(self: *Self) !void {
             if (self.on_song_finished) |cb| cb(@ptrCast(self));
 

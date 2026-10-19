@@ -10,6 +10,14 @@ test {
 }
 
 test {
+    _ = @import("music/loudness.zig");
+}
+
+test {
+    _ = @import("music/lyrics.zig");
+}
+
+test {
     _ = @import("core/config.zig");
 }
 
@@ -31,6 +39,7 @@ test {
 
 test {
     _ = @import("dsp/spectrum.zig");
+    _ = @import("dsp/vocal_presence.zig");
 }
 
 test {
@@ -64,6 +73,10 @@ test {
 }
 
 test {
+    _ = @import("music/library_health.zig");
+}
+
+test {
     _ = @import("music/metadata_edit.zig");
 }
 
@@ -73,6 +86,7 @@ test {
 
 test {
     _ = @import("ui/ui_view.zig");
+    _ = @import("ui/tui_render.zig");
 }
 
 test {
@@ -93,6 +107,12 @@ test {
 
 test {
     _ = @import("ui/gui_framework.zig");
+    _ = @import("ui/gui_regression_test.zig");
+    _ = @import("ui/gui_visualizer.zig");
+    _ = @import("ui/gui_artwork.zig");
+    _ = @import("ui/gui_gallery_test.zig");
+    _ = @import("world/model.zig");
+    _ = @import("allegro").shader;
 }
 
 test {

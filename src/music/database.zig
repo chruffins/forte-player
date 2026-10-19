@@ -11,7 +11,7 @@ const entity = @import("entity.zig");
 
 /// Increment when scanner metadata interpretation changes and existing rows
 /// must be re-extracted.
-pub const current_metadata_version: i64 = 4;
+pub const current_metadata_version: i64 = 5;
 const current_metadata_version_sql = std.fmt.comptimePrint("{d}", .{current_metadata_version});
 
 const schema = [_][]const u8{
@@ -31,6 +31,10 @@ const schema = [_][]const u8{
     \\  file_fingerprint INTEGER DEFAULT -1,
     \\  file_size INTEGER,
     \\  file_mtime_ticks INTEGER,
+    \\  replaygain_track_gain REAL,
+    \\  replaygain_track_peak REAL,
+    \\  replaygain_album_gain REAL,
+    \\  replaygain_album_peak REAL,
     \\  FOREIGN KEY(album_id) REFERENCES albums(id) ON DELETE CASCADE);
     ,
     \\CREATE TABLE IF NOT EXISTS artists (
@@ -63,7 +67,10 @@ const schema = [_][]const u8{
     \\  name TEXT NOT NULL,
     \\  picture_path TEXT,
     \\  desc TEXT,
-    \\  created_at INTEGER);
+    \\  created_at INTEGER,
+    \\  smart_rule INTEGER,
+    \\  smart_value TEXT,
+    \\  smart_limit INTEGER);
     ,
     \\CREATE TABLE IF NOT EXISTS album_artists (
     \\  album_id INTEGER NOT NULL,
@@ -161,9 +168,16 @@ pub const Database = struct {
         // scan re-extracts them even when their file fingerprint is unchanged.
         try self.ensureColumn("songs", "metadata_version", "ALTER TABLE songs ADD COLUMN metadata_version INTEGER DEFAULT 0;");
         try self.ensureColumn("songs", "file_fingerprint", "ALTER TABLE songs ADD COLUMN file_fingerprint INTEGER DEFAULT -1;");
+        try self.ensureColumn("songs", "replaygain_track_gain", "ALTER TABLE songs ADD COLUMN replaygain_track_gain REAL;");
+        try self.ensureColumn("songs", "replaygain_track_peak", "ALTER TABLE songs ADD COLUMN replaygain_track_peak REAL;");
+        try self.ensureColumn("songs", "replaygain_album_gain", "ALTER TABLE songs ADD COLUMN replaygain_album_gain REAL;");
+        try self.ensureColumn("songs", "replaygain_album_peak", "ALTER TABLE songs ADD COLUMN replaygain_album_peak REAL;");
         try self.ensureColumn("albums", "album_group_key", "ALTER TABLE albums ADD COLUMN album_group_key TEXT NOT NULL DEFAULT '';");
         try self.migrateAlbumIdentityConstraint();
         try self.ensureColumn("playlists", "created_at", "ALTER TABLE playlists ADD COLUMN created_at INTEGER;");
+        try self.ensureColumn("playlists", "smart_rule", "ALTER TABLE playlists ADD COLUMN smart_rule INTEGER;");
+        try self.ensureColumn("playlists", "smart_value", "ALTER TABLE playlists ADD COLUMN smart_value TEXT;");
+        try self.ensureColumn("playlists", "smart_limit", "ALTER TABLE playlists ADD COLUMN smart_limit INTEGER;");
     }
 
     /// Rebuild the small relational core when upgrading from the original
@@ -214,8 +228,8 @@ pub const Database = struct {
             .{},
         );
         try self.raw.exec(
-            "INSERT INTO songs(id, song_path, title, album_id, track, comment, duration, disc_number, play_count, last_played, favorite, metadata_version, file_fingerprint, file_size, file_mtime_ticks) " ++
-                "SELECT id, song_path, title, album_id, track, comment, duration, disc_number, play_count, last_played, favorite, metadata_version, file_fingerprint, file_size, file_mtime_ticks FROM songs_old;",
+            "INSERT INTO songs(id, song_path, title, album_id, track, comment, duration, disc_number, play_count, last_played, favorite, metadata_version, file_fingerprint, file_size, file_mtime_ticks, replaygain_track_gain, replaygain_track_peak, replaygain_album_gain, replaygain_album_peak) " ++
+                "SELECT id, song_path, title, album_id, track, comment, duration, disc_number, play_count, last_played, favorite, metadata_version, file_fingerprint, file_size, file_mtime_ticks, replaygain_track_gain, replaygain_track_peak, replaygain_album_gain, replaygain_album_peak FROM songs_old;",
             .{},
             .{},
         );
@@ -464,6 +478,18 @@ pub const Database = struct {
             null;
     }
 
+    /// Bounded source for the GUI thumbnail worker. Reject oversized blobs in
+    /// SQL rather than allocating them and checking after the copy.
+    pub fn getAlbumThumbnailSource(self: *Database, allocator: std.mem.Allocator, album_id: i64, limit: usize) !?AlbumCover {
+        var stmt = try self.raw.prepareDynamic(
+            "SELECT COALESCE(cover_art_mime, ''), cover_art_block FROM albums WHERE id=? AND length(cover_art_block)>0 AND length(cover_art_block)<=?;",
+        );
+        defer stmt.deinit();
+        const Row = struct { mime: []const u8, bytes: []const u8 };
+        const row = try stmt.oneAlloc(Row, allocator, .{}, .{ album_id, limit });
+        return if (row) |r| .{ .mime = r.mime, .bytes = r.bytes } else null;
+    }
+
     // ---- artist / genre browsing ----
 
     pub const ArtistListing = struct {
@@ -630,17 +656,132 @@ pub const Database = struct {
         return list.toOwnedSlice(allocator);
     }
 
+    fn getTrackListingsWithQuery(self: *Database, allocator: std.mem.Allocator, comptime query: []const u8, id: i64) ![]TrackListing {
+        var stmt = try self.raw.prepareDynamic(query);
+        defer stmt.deinit();
+        var iter = try stmt.iteratorAlloc(TrackListing, allocator, .{id});
+        var list = std.ArrayList(TrackListing){ .items = &.{}, .capacity = 0 };
+        defer list.deinit(allocator);
+        while (try iter.nextAlloc(allocator, .{})) |row| try list.append(allocator, row);
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// Detail rows with their display artist resolved in the same SQL query.
+    /// These projections replace the old per-song getSongContext calls in the
+    /// GUI and TUI detail loaders.
+    pub fn getTrackListingsByAlbumWithAllocator(self: *Database, allocator: std.mem.Allocator, album_id: i64) ![]TrackListing {
+        return self.getTrackListingsWithQuery(allocator, "SELECT songs.id AS id, COALESCE(songs.title, '') AS title, " ++
+            "COALESCE(GROUP_CONCAT(sa_artist.name, '; '), album_artist.name, '') AS artist, " ++
+            "COALESCE(songs.track, 0) AS track, COALESCE(songs.disc_number, 1) AS disc_number, " ++
+            "COALESCE(songs.duration, 0) AS duration " ++
+            "FROM songs JOIN albums ON albums.id=songs.album_id " ++
+            "JOIN artists album_artist ON album_artist.id=albums.artist_id " ++
+            "LEFT JOIN song_artists sa ON sa.song_id=songs.id " ++
+            "LEFT JOIN artists sa_artist ON sa_artist.id=sa.artist_id " ++
+            "WHERE songs.album_id=? " ++
+            "GROUP BY songs.id, songs.title, songs.track, songs.disc_number, songs.duration, album_artist.name " ++
+            "ORDER BY songs.disc_number, songs.track, songs.id;", album_id);
+    }
+
+    pub fn getTrackListingsByArtistWithAllocator(self: *Database, allocator: std.mem.Allocator, artist_id: i64) ![]TrackListing {
+        return self.getTrackListingsWithQuery(allocator, "SELECT songs.id AS id, COALESCE(songs.title, '') AS title, " ++
+            "COALESCE(GROUP_CONCAT(sa_artist.name, '; '), album_artist.name, '') AS artist, " ++
+            "COALESCE(songs.track, 0) AS track, COALESCE(songs.disc_number, 1) AS disc_number, " ++
+            "COALESCE(songs.duration, 0) AS duration " ++
+            "FROM songs " ++
+            "JOIN (SELECT artist_id, song_id FROM song_artists " ++
+            "UNION SELECT a.artist_id, s.id FROM albums a JOIN songs s ON s.album_id=a.id " ++
+            "UNION SELECT aa.artist_id, s.id FROM album_artists aa JOIN songs s ON s.album_id=aa.album_id) artist_songs " ++
+            "ON artist_songs.song_id=songs.id " ++
+            "JOIN albums ON albums.id=songs.album_id " ++
+            "JOIN artists album_artist ON album_artist.id=albums.artist_id " ++
+            "LEFT JOIN song_artists sa ON sa.song_id=songs.id " ++
+            "LEFT JOIN artists sa_artist ON sa_artist.id=sa.artist_id " ++
+            "WHERE artist_songs.artist_id=? " ++
+            "GROUP BY songs.id, songs.title, songs.track, songs.disc_number, songs.duration, album_artist.name " ++
+            "ORDER BY songs.disc_number, songs.track, songs.id;", artist_id);
+    }
+
+    pub fn getTrackListingsByGenreWithAllocator(self: *Database, allocator: std.mem.Allocator, genre_id: i64) ![]TrackListing {
+        return self.getTrackListingsWithQuery(allocator, "SELECT songs.id AS id, COALESCE(songs.title, '') AS title, " ++
+            "COALESCE(GROUP_CONCAT(sa_artist.name, '; '), album_artist.name, '') AS artist, " ++
+            "COALESCE(songs.track, 0) AS track, COALESCE(songs.disc_number, 1) AS disc_number, " ++
+            "COALESCE(songs.duration, 0) AS duration " ++
+            "FROM songs JOIN song_genres sg ON sg.song_id=songs.id " ++
+            "JOIN albums ON albums.id=songs.album_id " ++
+            "JOIN artists album_artist ON album_artist.id=albums.artist_id " ++
+            "LEFT JOIN song_artists sa ON sa.song_id=songs.id " ++
+            "LEFT JOIN artists sa_artist ON sa_artist.id=sa.artist_id " ++
+            "WHERE sg.genre_id=? " ++
+            "GROUP BY songs.id, songs.title, songs.track, songs.disc_number, songs.duration, album_artist.name " ++
+            "ORDER BY songs.disc_number, songs.track, songs.id;", genre_id);
+    }
+
     // ---- playlists ----
+
+    pub const SmartRule = enum(i64) { favorites = 1, most_played = 2, recently_played = 3, artist = 4, genre = 5, short_tracks = 6 };
 
     pub const PlaylistListing = struct {
         id: i64,
         name: []const u8,
         description: []const u8 = "",
         song_count: i64,
+        is_smart: bool = false,
+        smart_rule: i64 = 0,
     };
 
     pub fn createPlaylist(self: *Database, name: []const u8) !i64 {
         return self.createPlaylistWithDescription(name, "");
+    }
+
+    /// Create a persisted smart-list definition. Rules are a closed enum and
+    /// values are always bound as SQL parameters; limit is clamped to 1..500.
+    pub fn createSmartPlaylist(self: *Database, name: []const u8, rule: SmartRule, value: []const u8, limit: i64) !i64 {
+        const bounded_limit = @max(1, @min(limit, 500));
+        try self.raw.exec("INSERT INTO playlists(name, desc, created_at, smart_rule, smart_value, smart_limit) VALUES(?, 'Smart playlist', strftime('%s','now'), ?, ?, ?);", .{}, .{ name, @intFromEnum(rule), value, bounded_limit });
+        return self.lastId();
+    }
+
+    const SmartDefinition = struct { rule: i64, value: []const u8, limit: i64 };
+
+    fn getSmartDefinition(self: *Database, playlist_id: i64) !?SmartDefinition {
+        const Row = struct { rule: ?i64, value: []const u8, limit: ?i64 };
+        var stmt = try self.raw.prepareDynamic("SELECT smart_rule AS rule, COALESCE(smart_value, '') AS value, smart_limit AS \"limit\" FROM playlists WHERE id=?;");
+        defer stmt.deinit();
+        var iter = try stmt.iteratorAlloc(Row, self.allocator, .{playlist_id});
+        const row = try iter.nextAlloc(self.allocator, .{}) orelse return null;
+        if (row.rule == null) return null;
+        return .{ .rule = row.rule.?, .value = row.value, .limit = @max(1, @min(row.limit orelse 100, 500)) };
+    }
+
+    pub fn isSmartPlaylist(self: *Database, playlist_id: i64) bool {
+        return (self.getSmartDefinition(playlist_id) catch null) != null;
+    }
+
+    /// Evaluate a smart list live. SQL shape and ordering are fixed; rule and
+    /// value inputs are bound parameters. IDs are a detail/enqueue snapshot.
+    pub fn getTrackListingsBySmartPlaylistWithAllocator(self: *Database, allocator: std.mem.Allocator, playlist_id: i64) ![]TrackListing {
+        const definition = (try self.getSmartDefinition(playlist_id)) orelse return error.NotSmartPlaylist;
+        if (definition.rule < 1 or definition.rule > 6) return error.InvalidSmartRule;
+        const rule = definition.rule;
+        const query = "SELECT s.id AS id, COALESCE(s.title, '') AS title, " ++
+            "COALESCE(GROUP_CONCAT(sa_artist.name, '; '), album_artist.name, '') AS artist, " ++
+            "COALESCE(s.track, 0) AS track, COALESCE(s.disc_number, 1) AS disc_number, COALESCE(s.duration, 0) AS duration " ++
+            "FROM songs s JOIN albums al ON al.id=s.album_id JOIN artists album_artist ON album_artist.id=al.artist_id " ++
+            "LEFT JOIN song_artists sa ON sa.song_id=s.id LEFT JOIN artists sa_artist ON sa_artist.id=sa.artist_id " ++
+            "WHERE ((?=1 AND s.favorite=1) OR (?=2 AND s.play_count>0) OR (?=3 AND s.last_played IS NOT NULL) " ++
+            "OR (?=4 AND EXISTS (SELECT 1 FROM song_artists x JOIN artists a ON a.id=x.artist_id WHERE x.song_id=s.id AND a.name=?)) " ++
+            "OR (?=5 AND EXISTS (SELECT 1 FROM song_genres x JOIN genres g ON g.id=x.genre_id WHERE x.song_id=s.id AND g.name=?)) " ++
+            "OR (?=6 AND s.duration>0 AND s.duration<=?)) " ++
+            "GROUP BY s.id, s.title, s.track, s.disc_number, s.duration, album_artist.name " ++
+            "ORDER BY CASE WHEN ?=2 THEN s.play_count END DESC, CASE WHEN ?=3 THEN s.last_played END DESC, s.title COLLATE NOCASE, s.id LIMIT ?;";
+        var stmt = try self.raw.prepareDynamic(query);
+        defer stmt.deinit();
+        var iter = try stmt.iteratorAlloc(TrackListing, allocator, .{ rule, rule, rule, rule, definition.value, rule, definition.value, rule, definition.value, rule, rule, definition.limit });
+        var rows = std.ArrayList(TrackListing){ .items = &.{}, .capacity = 0 };
+        defer rows.deinit(allocator);
+        while (try iter.nextAlloc(allocator, .{})) |row| try rows.append(allocator, row);
+        return rows.toOwnedSlice(allocator);
     }
 
     pub fn createPlaylistWithDescription(self: *Database, name: []const u8, description: []const u8) !i64 {
@@ -663,9 +804,10 @@ pub const Database = struct {
     pub fn getPlaylistsWithAllocator(self: *Database, allocator: std.mem.Allocator) ![]PlaylistListing {
         var stmt = try self.raw.prepareDynamic(
             "SELECT p.id AS id, p.name AS name, COALESCE(p.desc, '') AS description, " ++
-                "COUNT(ps.song_id) AS song_count " ++
+                "CASE WHEN p.smart_rule IS NULL THEN COUNT(ps.song_id) ELSE 0 END AS song_count, " ++
+                "(p.smart_rule IS NOT NULL) AS is_smart, COALESCE(p.smart_rule, 0) AS smart_rule " ++
                 "FROM playlists p LEFT JOIN playlist_songs ps ON ps.playlist_id=p.id " ++
-                "GROUP BY p.id, p.name, p.desc ORDER BY p.name COLLATE NOCASE;",
+                "GROUP BY p.id, p.name, p.desc, p.smart_rule ORDER BY p.name COLLATE NOCASE;",
         );
         defer stmt.deinit();
         const Row = PlaylistListing;
@@ -691,6 +833,21 @@ pub const Database = struct {
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |row| try list.append(allocator, row);
         return list.toOwnedSlice(allocator);
+    }
+
+    pub fn getTrackListingsByPlaylistWithAllocator(self: *Database, allocator: std.mem.Allocator, playlist_id: i64) ![]TrackListing {
+        return self.getTrackListingsWithQuery(allocator, "SELECT songs.id AS id, COALESCE(songs.title, '') AS title, " ++
+            "COALESCE(GROUP_CONCAT(sa_artist.name, '; '), album_artist.name, '') AS artist, " ++
+            "COALESCE(songs.track, 0) AS track, COALESCE(songs.disc_number, 1) AS disc_number, " ++
+            "COALESCE(songs.duration, 0) AS duration " ++
+            "FROM songs JOIN playlist_songs ps ON ps.song_id=songs.id " ++
+            "JOIN albums ON albums.id=songs.album_id " ++
+            "JOIN artists album_artist ON album_artist.id=albums.artist_id " ++
+            "LEFT JOIN song_artists sa ON sa.song_id=songs.id " ++
+            "LEFT JOIN artists sa_artist ON sa_artist.id=sa.artist_id " ++
+            "WHERE ps.playlist_id=? " ++
+            "GROUP BY songs.id, songs.title, songs.track, songs.disc_number, songs.duration, album_artist.name, ps.position " ++
+            "ORDER BY ps.position;", playlist_id);
     }
 
     pub fn clearPlaylist(self: *Database, playlist_id: i64) !void {
@@ -802,6 +959,36 @@ pub const Database = struct {
         return list.toOwnedSlice(allocator);
     }
 
+    pub const ReplayGain = @import("loudness.zig").Measurement;
+
+    pub fn setSongReplayGain(self: *Database, id: i64, values: ReplayGain) !void {
+        try self.raw.exec(
+            "UPDATE songs SET replaygain_track_gain=?, replaygain_track_peak=?, replaygain_album_gain=?, replaygain_album_peak=? WHERE id=?;",
+            .{},
+            .{ values.track_gain_db, values.track_peak, values.album_gain_db, values.album_peak, id },
+        );
+    }
+
+    pub fn getSongReplayGain(self: *Database, id: i64) !?ReplayGain {
+        const Row = struct {
+            track_gain_db: ?f64,
+            track_peak: ?f64,
+            album_gain_db: ?f64,
+            album_peak: ?f64,
+        };
+        var stmt = try self.raw.prepareDynamic(
+            "SELECT replaygain_track_gain AS track_gain_db, replaygain_track_peak AS track_peak, replaygain_album_gain AS album_gain_db, replaygain_album_peak AS album_peak FROM songs WHERE id=?;",
+        );
+        defer stmt.deinit();
+        const row = try stmt.one(Row, .{}, .{id}) orelse return null;
+        return .{
+            .track_gain_db = row.track_gain_db,
+            .track_peak = row.track_peak,
+            .album_gain_db = row.album_gain_db,
+            .album_peak = row.album_peak,
+        };
+    }
+
     pub fn getSongById(self: *Database, id: i64) !?entity.Song {
         var stmt = try self.raw.prepareDynamic(song_cols ++ " WHERE id = ?;");
         defer stmt.deinit();
@@ -821,6 +1008,18 @@ pub const Database = struct {
         title: []const u8,
         artist: []const u8,
         album: []const u8,
+    };
+
+    /// A detail-row projection. Unlike entity.Song, this includes the resolved
+    /// display artist, allowing detail screens to load all rows with one query
+    /// instead of issuing one context query per song.
+    pub const TrackListing = struct {
+        id: i64,
+        title: []const u8,
+        artist: []const u8,
+        track: i64,
+        disc_number: i64,
+        duration: i64,
     };
 
     /// Fetch display metadata for every song in one grouped query. This is used
@@ -913,6 +1112,10 @@ pub const Database = struct {
         defer stmt.deinit();
         const row = (try stmt.one(Row, .{}, .{name})) orelse return error.ArtistNotFound;
         return row.id;
+    }
+
+    pub fn setAlbumYear(self: *Database, album_id: i64, year: i64) !void {
+        try self.raw.exec("UPDATE albums SET year=? WHERE id=?;", .{}, .{ year, album_id });
     }
 
     pub fn getOrCreateAlbum(self: *Database, title: []const u8, artist_id: i64, year: ?i64) !i64 {
@@ -1061,6 +1264,35 @@ test "database: migrates album uniqueness to include folder identity" {
     try std.testing.expect(first != second);
 }
 
+test "database: old songs table migrates additively and ReplayGain round-trips" {
+    var raw = try sqlite.Db.init(.{ .mode = .{ .Memory = {} }, .open_flags = .{ .write = true, .create = true } });
+    for (schema) |ddl| {
+        if (std.mem.indexOf(u8, ddl, "CREATE TABLE IF NOT EXISTS songs") != null) continue;
+        try raw.execDynamic(ddl, .{}, .{});
+    }
+    try raw.exec(
+        \\CREATE TABLE songs(id INTEGER PRIMARY KEY AUTOINCREMENT, song_path TEXT NOT NULL UNIQUE, title TEXT, album_id INTEGER, track INTEGER, comment TEXT, duration INTEGER);
+    , .{}, .{});
+    try raw.exec("INSERT INTO songs(song_path, title) VALUES('/old.flac', 'Old');", .{}, .{});
+    var db = Database{ .allocator = std.testing.allocator, .raw = raw };
+    defer db.deinit();
+    try db.migrate();
+    var song_stmt = try db.raw.prepareDynamic("SELECT id FROM songs WHERE song_path=?;");
+    defer song_stmt.deinit();
+    const old_song = (try song_stmt.one(struct { id: i64 }, .{}, .{"/old.flac"})) orelse return error.TestExpectedEqual;
+    const id = old_song.id;
+    const before = try db.getSongReplayGain(id);
+    try std.testing.expect(before != null);
+    try std.testing.expectEqual(@as(?f64, null), before.?.track_gain_db);
+    const expected = Database.ReplayGain{ .track_gain_db = -7.25, .track_peak = 0.87, .album_gain_db = 1.5, .album_peak = 0.99 };
+    try db.setSongReplayGain(id, expected);
+    const after = (try db.getSongReplayGain(id)).?;
+    try std.testing.expectApproxEqAbs(@as(f64, -7.25), after.track_gain_db.?, 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.87), after.track_peak.?, 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), after.album_gain_db.?, 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.99), after.album_peak.?, 0.00001);
+}
+
 test "database: schema, insert, and query round-trip (in-memory)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1135,6 +1367,42 @@ test "database: player-state updates (markPlayed, setFavorite)" {
     try std.testing.expectEqual(@as(i64, 2), row.play_count);
     try std.testing.expectEqual(@as(i64, 2000), row.last_played);
     try std.testing.expectEqual(@as(i64, 1), row.favorite);
+}
+
+test "database: persisted smart playlists evaluate closed rules with bounded deterministic results" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var db = try Database.open(arena.allocator(), null);
+    defer db.deinit();
+    const artist = try db.addArtist("Smart Artist");
+    const genre = try db.addGenre("Ambient");
+    const album = try db.addAlbum("Smart Album", artist, 2024);
+    const one = try db.addSong("/smart-a.ogg", "Alpha", album, 1, 100, 1);
+    const two = try db.addSong("/smart-b.ogg", "Beta", album, 2, 900, 1);
+    try db.addSongArtist(one, artist);
+    try db.addSongArtist(two, artist);
+    try db.addSongGenre(one, genre);
+    try db.setFavorite(one, 1);
+    try db.markPlayed(two, 500);
+
+    const favorites = try db.createSmartPlaylist("Favorites smart", .favorites, "", 20_000);
+    try std.testing.expect(db.isSmartPlaylist(favorites));
+    const selected = try db.getTrackListingsBySmartPlaylistWithAllocator(arena.allocator(), favorites);
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expectEqual(one, selected[0].id);
+    const short = try db.createSmartPlaylist("Short tracks", .short_tracks, "300", 10);
+    const short_rows = try db.getTrackListingsBySmartPlaylistWithAllocator(arena.allocator(), short);
+    try std.testing.expectEqual(@as(usize, 1), short_rows.len);
+    try std.testing.expectEqual(one, short_rows[0].id);
+    const artist_list = try db.createSmartPlaylist("By artist", .artist, "Smart Artist", 10);
+    try std.testing.expectEqual(@as(usize, 2), (try db.getTrackListingsBySmartPlaylistWithAllocator(arena.allocator(), artist_list)).len);
+    const listings = try db.getPlaylistsWithAllocator(arena.allocator());
+    var found_smart = false;
+    for (listings) |row| if (row.id == favorites) {
+        found_smart = row.is_smart;
+        break;
+    };
+    try std.testing.expect(found_smart);
 }
 
 test "database: rollback discards pending inserts" {
@@ -1220,12 +1488,27 @@ test "database: artist genre and playlist detail queries" {
     const by_genre = try db.getSongsByGenreWithAllocator(arena.allocator(), genre);
     try std.testing.expectEqual(@as(usize, 1), by_genre.len);
 
+    // Detail projections resolve artist text in the same query as the tracks;
+    // frontends should not need one context query per returned song.
+    const album_tracks = try db.getTrackListingsByAlbumWithAllocator(arena.allocator(), album);
+    try std.testing.expectEqual(@as(usize, 1), album_tracks.len);
+    try std.testing.expectEqualStrings("Query Song", album_tracks[0].title);
+    try std.testing.expect(std.mem.indexOf(u8, album_tracks[0].artist, "Guest Artist") != null);
+    try std.testing.expectEqual(@as(i64, 1), album_tracks[0].track);
+    const artist_tracks = try db.getTrackListingsByArtistWithAllocator(arena.allocator(), guest);
+    try std.testing.expectEqual(@as(usize, 1), artist_tracks.len);
+    const genre_tracks = try db.getTrackListingsByGenreWithAllocator(arena.allocator(), genre);
+    try std.testing.expectEqual(@as(usize, 1), genre_tracks.len);
+
     const playlist = try db.createPlaylistWithDescription("Ordered", "A test list");
     try db.addSongToPlaylist(playlist, song);
     const info = (try db.getPlaylistsWithAllocator(arena.allocator()))[0];
     try std.testing.expectEqualStrings("A test list", info.description);
     const tracks = try db.getPlaylistTracksWithAllocator(arena.allocator(), playlist);
     try std.testing.expectEqual(@as(usize, 1), tracks.len);
+    const playlist_tracks = try db.getTrackListingsByPlaylistWithAllocator(arena.allocator(), playlist);
+    try std.testing.expectEqual(@as(usize, 1), playlist_tracks.len);
+    try std.testing.expectEqualStrings("Query Song", playlist_tracks[0].title);
     try db.reorderPlaylist(playlist, &.{song});
     try db.clearPlaylist(playlist);
     try std.testing.expectEqual(@as(usize, 0), (try db.getPlaylistSongIdsWithAllocator(arena.allocator(), playlist)).len);
