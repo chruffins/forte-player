@@ -111,7 +111,7 @@ fn computeTestTargets(isNative: bool, ci: ?bool) ?[]const TestTarget {
 
 // This creates a SQLite static library from the SQLite dependency code.
 fn makeSQLiteLib(b: *std.Build, dep: *std.Build.Dependency, c_flags: []const []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, sqlite_c: enum { with, without }) *std.Build.Step.Compile {
-    const mod = b.addModule("lib-sqlite", .{
+    const mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -146,8 +146,6 @@ pub fn build(b: *std.Build) !void {
     const query = b.standardTargetOptionsQueryOnly(.{});
     const target = b.resolveTargetQuery(query);
     const optimize = b.standardOptimizeOption(.{});
-    var threaded = Io.Threaded.init_single_threaded;
-    const io = threaded.io();
 
     // Upstream dependency
     const sqlite_dep = b.dependency("sqlite", .{
@@ -161,12 +159,13 @@ pub fn build(b: *std.Build) !void {
     defer flags.deinit(b.allocator);
     try flags.append(b.allocator, "-std=c99");
 
-    inline for (std.meta.fields(EnableOptions)) |field| {
-        const opt = b.option(bool, field.name, "Enable " ++ field.name) orelse field.defaultValue().?;
+    const options_info = @typeInfo(EnableOptions).@"struct";
+    inline for (options_info.field_names, options_info.field_types, options_info.field_attrs) |field_name, field_type, field_attrs| {
+        const opt = b.option(bool, field_name, "Enable " ++ field_name) orelse field_attrs.defaultValue(field_type).?;
 
         if (opt) {
-            var buf: [field.name.len]u8 = undefined;
-            const name = std.ascii.upperString(&buf, field.name);
+            var buf: [field_name.len]u8 = undefined;
+            const name = std.ascii.upperString(&buf, field_name);
             const flag = try std.fmt.allocPrint(b.allocator, "-DSQLITE_ENABLE_{s}", .{name});
 
             try flags.append(b.allocator, flag);
@@ -179,6 +178,23 @@ pub fn build(b: *std.Build) !void {
     // Main library and module
     //
 
+    const sqlite_c_translate = b.addTranslateC(.{
+        .root_source_file = b.path("c/sqlite_main.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sqlite_c_translate.addIncludePath(b.path("c"));
+    sqlite_c_translate.addIncludePath(sqlite_dep.path("."));
+    const sqlite_c = sqlite_c_translate.createModule();
+
+    const sqlite_loadable_translate = b.addTranslateC(.{
+        .root_source_file = b.path("c/sqlite_loadable.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    sqlite_loadable_translate.addIncludePath(b.path("c"));
+    const sqlite_loadable_c = sqlite_loadable_translate.createModule();
+
     // const sqlite_lib, const sqlite_mod = blk: {
     const sqlite_lib, _ = blk: {
         const lib = makeSQLiteLib(b, sqlite_dep, c_flags, target, optimize, .with);
@@ -189,6 +205,8 @@ pub fn build(b: *std.Build) !void {
         });
         mod.addIncludePath(b.path("c"));
         mod.addIncludePath(sqlite_dep.path("."));
+        mod.addImport("sqlite_c", sqlite_c);
+        mod.addImport("sqlite_loadable_c", sqlite_loadable_c);
         mod.linkLibrary(lib);
 
         break :blk .{ lib, mod };
@@ -271,7 +289,8 @@ pub fn build(b: *std.Build) !void {
     // Tools
     //
 
-    addPreprocessStep(b, io, sqlite_dep);
+    // Header preprocessing is a maintainer-only helper and uses custom build
+    // steps that are no longer available in Zig 0.17.
 }
 
 fn addPreprocessStep(b: *std.Build, io: Io, sqlite_dep: *std.Build.Dependency) void {

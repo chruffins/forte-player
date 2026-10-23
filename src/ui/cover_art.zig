@@ -8,12 +8,7 @@
 const std = @import("std");
 const U = @import("ui_state.zig");
 
-const c = @cImport({
-    @cInclude("allegro5/allegro.h");
-    @cInclude("allegro5/allegro_image.h");
-    @cInclude("allegro5/allegro_memfile.h");
-    @cInclude("stdio.h");
-});
+const c = @import("forte_c");
 
 /// Downsample `bytes` (a JPEG/PNG) into a `w x h` grid of `out` cells.
 /// Returns false on any failure (undecodable data, no image addon, ...).

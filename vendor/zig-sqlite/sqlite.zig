@@ -1080,13 +1080,13 @@ pub fn Iterator(comptime Type: type) type {
 
                     if (@typeInfo(Type.BaseType) == .int) {
                         const inner_value = try self.readField(Type.BaseType, options, 0);
-                        return @enumFromInt(@as(TI.tag_type, @intCast(inner_value)));
+                        return @fromBackingInt(@intCast(@as(TI.tag_type, @intCast(inner_value))));
                     }
 
                     @compileError("enum column " ++ @typeName(Type) ++ " must have a BaseType of either string or int");
                 },
                 .@"struct" => {
-                    std.debug.assert(columns == TypeInfo.@"struct".fields.len);
+                    std.debug.assert(columns == TypeInfo.@"struct".field_names.len);
                     return try self.readStruct(options);
                 },
                 else => @compileError("cannot read into type " ++ @typeName(Type) ++ " ; if dynamic memory allocation is required use nextAlloc or oneAlloc"),
@@ -1164,12 +1164,12 @@ pub fn Iterator(comptime Type: type) type {
                         return std.meta.stringToEnum(Type, inner_value) orelse unreachable;
                     }
                     if (@typeInfo(Type.BaseType) == .int) {
-                        return @enumFromInt(@as(TI.tag_type, @intCast(inner_value)));
+                        return @fromBackingInt(@intCast(@as(TI.tag_type, @intCast(inner_value))));
                     }
                     @compileError("enum column " ++ @typeName(Type) ++ " must have a BaseType of either string or int");
                 },
                 .@"struct" => {
-                    std.debug.assert(columns == TypeInfo.@"struct".fields.len);
+                    std.debug.assert(columns == TypeInfo.@"struct".field_names.len);
                     return try self.readStruct(.{
                         .allocator = allocator,
                     });
@@ -1399,12 +1399,12 @@ pub fn Iterator(comptime Type: type) type {
 
             var value: Type = undefined;
 
-            inline for (@typeInfo(Type).@"struct".fields, 0..) |field, _i| {
+            inline for (@typeInfo(Type).@"struct".field_names, @typeInfo(Type).@"struct".field_types, 0..) |field_name, field_type, _i| {
                 const i = @as(usize, _i);
 
-                const ret = try self.readField(field.type, options, i);
+                const ret = try self.readField(field_type, options, i);
 
-                @field(value, field.name) = ret;
+                @field(value, field_name) = ret;
             }
 
             return value;
@@ -1448,7 +1448,7 @@ pub fn Iterator(comptime Type: type) type {
                             return std.meta.stringToEnum(FieldType, inner_value) orelse FieldType.default;
                         }
                         if (@typeInfo(FieldType.BaseType) == .int) {
-                            return @enumFromInt(@as(TI.tag_type, @intCast(inner_value)));
+                            return @fromBackingInt(@intCast(@as(TI.tag_type, @intCast(inner_value))));
                         }
                         @compileError("enum column " ++ @typeName(FieldType) ++ " must have a BaseType of either string or int");
                     },
@@ -1665,7 +1665,7 @@ pub const DynamicStatement = struct {
                     if (comptime isZigString(FieldType.BaseType)) {
                         try self.bindField(FieldType.BaseType, options, field_name, i, @tagName(field));
                     } else if (@typeInfo(FieldType.BaseType) == .int) {
-                        try self.bindField(FieldType.BaseType, options, field_name, i, @intFromEnum(field));
+                        try self.bindField(FieldType.BaseType, options, field_name, i, @backingInt(field));
                     } else {
                         @compileError("enum column " ++ @typeName(FieldType) ++ " must have a BaseType of either string or int to bind");
                     }
@@ -1690,16 +1690,16 @@ pub const DynamicStatement = struct {
                         return;
                     }
                     if (info.tag_type) |UnionTagType| {
-                        inline for (info.fields) |u_field| {
+                        inline for (info.field_names, info.field_types) |union_field_name, union_field_type| {
                             // This wasn't entirely obvious when I saw code like this elsewhere, it works because of type coercion.
                             // See https://ziglang.org/documentation/master/#Type-Coercion-unions-and-enums
                             const field_tag: std.meta.Tag(FieldType) = field;
-                            const this_tag: std.meta.Tag(FieldType) = @field(UnionTagType, u_field.name);
+                            const this_tag: std.meta.Tag(FieldType) = @field(UnionTagType, union_field_name);
 
                             if (field_tag == this_tag) {
-                                const field_value = @field(field, u_field.name);
+                                const field_value = @field(field, union_field_name);
 
-                                try self.bindField(u_field.type, options, u_field.name, i, field_value);
+                                try self.bindField(union_field_type, options, union_field_name, i, field_value);
                             }
                         }
                     } else {
@@ -1747,14 +1747,14 @@ pub const DynamicStatement = struct {
 
         switch (@typeInfo(Type)) {
             .@"struct" => |StructTypeInfo| {
-                inline for (StructTypeInfo.fields, 0..) |struct_field, struct_field_i| {
-                    const field_value = @field(values, struct_field.name);
+                inline for (StructTypeInfo.field_names, StructTypeInfo.field_types, 0..) |field_name, field_type, field_i| {
+                    const field_value = @field(values, field_name);
 
-                    const i = sqlite3BindParameterIndex(self.stmt, struct_field.name);
+                    const i = sqlite3BindParameterIndex(self.stmt, field_name);
                     if (i >= 0) {
-                        try self.bindField(struct_field.type, options, struct_field.name, i, field_value);
+                        try self.bindField(field_type, options, field_name, i, field_value);
                     } else {
-                        try self.bindField(struct_field.type, options, struct_field.name, struct_field_i, field_value);
+                        try self.bindField(field_type, options, field_name, field_i, field_value);
                     }
                 }
             },
@@ -2045,8 +2045,8 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: anytype) type 
             const StructTypeInfo = @typeInfo(StructType).@"struct";
 
             comptime marker_len_check: {
-                if (query.bind_markers.len != StructTypeInfo.fields.len) {
-                    if (query.bind_markers.len > StructTypeInfo.fields.len) {
+                if (query.bind_markers.len != StructTypeInfo.field_names.len) {
+                    if (query.bind_markers.len > StructTypeInfo.field_names.len) {
                         var found_markers = 0;
                         for (query.bind_markers) |bind_marker| {
                             if (bind_marker.name) |name| {
@@ -2061,21 +2061,21 @@ pub fn Statement(comptime opts: StatementOptions, comptime query: anytype) type 
                     }
                     @compileError(std.fmt.comptimePrint("expected {d} bind parameters but got {d}", .{
                         query.bind_markers.len,
-                        StructTypeInfo.fields.len,
+                        StructTypeInfo.field_names.len,
                     }));
                 }
             }
 
-            inline for (StructTypeInfo.fields, 0..) |struct_field, _i| {
+            inline for (StructTypeInfo.field_names, StructTypeInfo.field_types, 0..) |_, field_type, _i| {
                 const bind_marker = query.bind_markers[_i];
                 if (bind_marker.typed) |typ| {
-                    const FieldTypeInfo = @typeInfo(struct_field.type);
+                    const FieldTypeInfo = @typeInfo(field_type);
                     switch (FieldTypeInfo) {
                         .@"struct", .@"enum", .@"union" => comptime assertMarkerType(
-                            if (@hasDecl(struct_field.type, "BaseType")) struct_field.type.BaseType else struct_field.type,
+                            if (@hasDecl(field_type, "BaseType")) field_type.BaseType else field_type,
                             typ,
                         ),
-                        else => comptime assertMarkerType(struct_field.type, typ),
+                        else => comptime assertMarkerType(field_type, typ),
                     }
                 }
             }
@@ -3109,7 +3109,10 @@ test "sqlite: blob open, reopen" {
 
         const data = try blob.read_from_db(&read_buff);
 
-        try testing.expectEqualSlices(u8, blob_data1 ** 2, data);
+        var expected: [blob_data1.len * 2]u8 = undefined;
+        @memcpy(expected[0..blob_data1.len], blob_data1);
+        @memcpy(expected[blob_data1.len..], blob_data1);
+        try testing.expectEqualSlices(u8, &expected, data);
     }
 
     // Reopen the blob in the second row
@@ -3126,7 +3129,10 @@ test "sqlite: blob open, reopen" {
 
         const data = try blob.read_from_db(&read_buff);
 
-        try testing.expectEqualSlices(u8, blob_data2 ** 2, data);
+        var expected: [blob_data2.len * 2]u8 = undefined;
+        @memcpy(expected[0..blob_data2.len], blob_data2);
+        @memcpy(expected[blob_data2.len..], blob_data2);
+        try testing.expectEqualSlices(u8, &expected, data);
     }
 
     try blob.close();
@@ -3377,7 +3383,7 @@ const MyData = struct {
     pub fn readField(alloc: mem.Allocator, value: BaseType) !MyData {
         _ = alloc;
 
-        var result = [_]u8{0} ** 16;
+        var result: [16]u8 = @splat(0);
         var i: usize = 0;
         while (i < result.len) : (i += 1) {
             const j = i * 2;

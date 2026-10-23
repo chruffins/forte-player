@@ -3,9 +3,7 @@
 const std = @import("std");
 const config = @import("../core/config.zig");
 const model = @import("model.zig");
-const c = @cImport({
-    @cInclude("bridge.h");
-});
+const c = @import("forte_c");
 
 fn resolvePaths(comptime count: usize, allocator: std.mem.Allocator, relative_paths: [count][]const u8) ![count][:0]u8 {
     var paths: [count][:0]u8 = undefined;

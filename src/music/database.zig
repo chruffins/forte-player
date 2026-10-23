@@ -418,7 +418,7 @@ pub const Database = struct {
         );
         defer stmt.deinit();
         var iter = try stmt.iteratorAlloc(AlbumMbid, self.allocator, .{});
-        var list = std.ArrayList(AlbumMbid){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(AlbumMbid).empty;
         defer list.deinit(self.allocator);
         while (try iter.nextAlloc(self.allocator, .{})) |row| {
             try list.append(self.allocator, row);
@@ -449,7 +449,7 @@ pub const Database = struct {
         var stmt = try self.raw.prepareDynamic("SELECT id FROM albums WHERE cover_art_block IS NULL OR length(cover_art_block)=0 ORDER BY id;");
         defer stmt.deinit();
         var iter = try stmt.iteratorAlloc(i64, allocator, .{});
-        var list = std.ArrayList(i64){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(i64).empty;
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |id| try list.append(allocator, id);
         return list.toOwnedSlice(allocator);
@@ -524,7 +524,7 @@ pub const Database = struct {
         );
         defer stmt.deinit();
         var iter = try stmt.iteratorAlloc(ArtistListing, allocator, .{});
-        var list = std.ArrayList(ArtistListing){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(ArtistListing).empty;
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |row| try list.append(allocator, row);
         return list.toOwnedSlice(allocator);
@@ -538,7 +538,7 @@ pub const Database = struct {
         );
         defer stmt.deinit();
         var iter = try stmt.iteratorAlloc(GenreListing, allocator, .{});
-        var list = std.ArrayList(GenreListing){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(GenreListing).empty;
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |row| try list.append(allocator, row);
         return list.toOwnedSlice(allocator);
@@ -553,7 +553,7 @@ pub const Database = struct {
             "ORDER BY disc_number, track, id;");
         defer stmt.deinit();
         var iter = try stmt.iteratorAlloc(entity.Song, allocator, .{artist_id});
-        var list = std.ArrayList(entity.Song){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(entity.Song).empty;
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |row| try list.append(allocator, row);
         return list.toOwnedSlice(allocator);
@@ -565,7 +565,7 @@ pub const Database = struct {
             "ORDER BY disc_number, track, id;");
         defer stmt.deinit();
         var iter = try stmt.iteratorAlloc(entity.Song, allocator, .{genre_id});
-        var list = std.ArrayList(entity.Song){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(entity.Song).empty;
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |row| try list.append(allocator, row);
         return list.toOwnedSlice(allocator);
@@ -623,7 +623,7 @@ pub const Database = struct {
         defer stmt.deinit();
         const Row = struct { id: i64, name: []const u8, artist: []const u8, year: i64, track_count: i64, has_cover: i64 };
         var iter = try stmt.iteratorAlloc(Row, allocator, .{});
-        var list = std.ArrayList(AlbumListing){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(AlbumListing).empty;
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |row| {
             try list.append(allocator, .{
@@ -648,7 +648,7 @@ pub const Database = struct {
         var stmt = try self.raw.prepareDynamic(song_cols ++ " WHERE album_id = ? ORDER BY disc_number, track, id;");
         defer stmt.deinit();
         var iter = try stmt.iteratorAlloc(entity.Song, allocator, .{album_id});
-        var list = std.ArrayList(entity.Song){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(entity.Song).empty;
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |row| {
             try list.append(allocator, row);
@@ -660,7 +660,7 @@ pub const Database = struct {
         var stmt = try self.raw.prepareDynamic(query);
         defer stmt.deinit();
         var iter = try stmt.iteratorAlloc(TrackListing, allocator, .{id});
-        var list = std.ArrayList(TrackListing){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(TrackListing).empty;
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |row| try list.append(allocator, row);
         return list.toOwnedSlice(allocator);
@@ -738,7 +738,7 @@ pub const Database = struct {
     /// values are always bound as SQL parameters; limit is clamped to 1..500.
     pub fn createSmartPlaylist(self: *Database, name: []const u8, rule: SmartRule, value: []const u8, limit: i64) !i64 {
         const bounded_limit = @max(1, @min(limit, 500));
-        try self.raw.exec("INSERT INTO playlists(name, desc, created_at, smart_rule, smart_value, smart_limit) VALUES(?, 'Smart playlist', strftime('%s','now'), ?, ?, ?);", .{}, .{ name, @intFromEnum(rule), value, bounded_limit });
+        try self.raw.exec("INSERT INTO playlists(name, desc, created_at, smart_rule, smart_value, smart_limit) VALUES(?, 'Smart playlist', strftime('%s','now'), ?, ?, ?);", .{}, .{ name, @backingInt(rule), value, bounded_limit });
         return self.lastId();
     }
 
@@ -778,7 +778,7 @@ pub const Database = struct {
         var stmt = try self.raw.prepareDynamic(query);
         defer stmt.deinit();
         var iter = try stmt.iteratorAlloc(TrackListing, allocator, .{ rule, rule, rule, rule, definition.value, rule, definition.value, rule, definition.value, rule, rule, definition.limit });
-        var rows = std.ArrayList(TrackListing){ .items = &.{}, .capacity = 0 };
+        var rows = std.ArrayList(TrackListing).empty;
         defer rows.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |row| try rows.append(allocator, row);
         return rows.toOwnedSlice(allocator);
@@ -812,7 +812,7 @@ pub const Database = struct {
         defer stmt.deinit();
         const Row = PlaylistListing;
         var iter = try stmt.iteratorAlloc(Row, allocator, .{});
-        var list = std.ArrayList(PlaylistListing){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(PlaylistListing).empty;
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |row| try list.append(allocator, row);
         return list.toOwnedSlice(allocator);
@@ -829,7 +829,7 @@ pub const Database = struct {
             "ORDER BY ps.position;");
         defer stmt.deinit();
         var iter = try stmt.iteratorAlloc(entity.Song, allocator, .{playlist_id});
-        var list = std.ArrayList(entity.Song){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(entity.Song).empty;
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |row| try list.append(allocator, row);
         return list.toOwnedSlice(allocator);
@@ -906,7 +906,7 @@ pub const Database = struct {
         var stmt = try self.raw.prepareDynamic("SELECT song_id FROM playlist_songs WHERE playlist_id=? ORDER BY position;");
         defer stmt.deinit();
         var iter = try stmt.iteratorAlloc(i64, allocator, .{playlist_id});
-        var list = std.ArrayList(i64){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(i64).empty;
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |id| try list.append(allocator, id);
         return list.toOwnedSlice(allocator);
@@ -934,7 +934,7 @@ pub const Database = struct {
         var stmt = try self.raw.prepareDynamic("SELECT id, song_path AS path FROM songs ORDER BY id;");
         defer stmt.deinit();
         var iter = try stmt.iteratorAlloc(SongPath, allocator, .{});
-        var list = std.ArrayList(SongPath){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(SongPath).empty;
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |row| try list.append(allocator, row);
         return list.toOwnedSlice(allocator);
@@ -951,7 +951,7 @@ pub const Database = struct {
         var stmt = try self.raw.prepareDynamic(song_cols ++ ";");
         defer stmt.deinit();
         var iter = try stmt.iteratorAlloc(entity.Song, allocator, .{});
-        var list = std.ArrayList(entity.Song){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(entity.Song).empty;
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |row| {
             try list.append(allocator, row);
@@ -1037,7 +1037,7 @@ pub const Database = struct {
         );
         defer stmt.deinit();
         var iter = try stmt.iteratorAlloc(SongDisplay, allocator, .{});
-        var list = std.ArrayList(SongDisplay){ .items = &.{}, .capacity = 0 };
+        var list = std.ArrayList(SongDisplay).empty;
         defer list.deinit(allocator);
         while (try iter.nextAlloc(allocator, .{})) |row| try list.append(allocator, row);
         return list.toOwnedSlice(allocator);

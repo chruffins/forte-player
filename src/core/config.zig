@@ -73,6 +73,9 @@ const exe_asset_roots = [_][]const u8{
     "../share/audiovis/assets",
     "../assets",
     "assets",
+    // Zig's cached test/run executables live under .zig-cache/o/<hash>; the
+    // repository assets are three levels above that executable directory.
+    "../../../assets",
 };
 
 /// The first existing asset root, or `<exe_dir>/../assets` as a fallback.
@@ -459,16 +462,33 @@ fn fileExists(path: []const u8) bool {
 fn ensureDirs(full: []const u8) void {
     var buf: [path_buf_size:0]u8 = undefined;
     var len: usize = 0;
+    var it = std.mem.splitScalar(u8, full, '/');
 
-    if (full.len >= 1 and full[0] == '/') {
+    // Preserve a Windows drive prefix (for example `C:`) rather than treating
+    // it as a POSIX path component. Allegro standard paths are normalized to
+    // forward slashes before reaching this helper.
+    if (full.len >= 2 and std.ascii.isAlphabetic(full[0]) and full[1] == ':') {
+        buf[0] = full[0];
+        buf[1] = ':';
+        len = 2;
+        _ = it.next(); // drive component
+    } else if (std.mem.startsWith(u8, full, "//")) {
+        buf[0] = '/';
+        buf[1] = '/';
+        len = 2;
+    } else if (std.mem.startsWith(u8, full, "/")) {
         buf[0] = '/';
         len = 1;
     }
-    var it = std.mem.splitScalar(u8, full, '/');
+
     while (it.next()) |part| {
-        if (part.len == 0 or len + 1 + part.len >= buf.len) continue;
-        buf[len] = '/';
-        len += 1;
+        if (part.len == 0) continue;
+        const separator: usize = if (len > 0 and buf[len - 1] != '/') 1 else 0;
+        if (len + separator + part.len >= buf.len) continue;
+        if (separator != 0) {
+            buf[len] = '/';
+            len += 1;
+        }
         @memcpy(buf[len .. len + part.len], part);
         len += part.len;
         buf[len] = 0;

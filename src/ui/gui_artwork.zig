@@ -4,9 +4,7 @@
 const std = @import("std");
 const al = @import("allegro");
 const Database = @import("../music/database.zig").Database;
-const c = @cImport({
-    @cInclude("allegro5/allegro.h");
-});
+const c = @import("forte_c");
 
 pub const capacity = 48;
 pub const thumbnail_size = 512;

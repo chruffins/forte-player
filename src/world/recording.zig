@@ -6,10 +6,7 @@ const spectrum = @import("../dsp/spectrum.zig");
 const vocal_presence = @import("../dsp/vocal_presence.zig");
 const model = @import("model.zig");
 const native = @import("template.zig");
-const c = @cImport({
-    @cInclude("allegro5/allegro.h");
-    @cInclude("allegro5/allegro_opengl.h");
-});
+const c = @import("forte_c");
 
 pub fn invoke(init: std.process.Init, executable: []const u8, args: anytype) !void {
     const owned_system = !al.system.isInstalled();

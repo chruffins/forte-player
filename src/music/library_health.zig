@@ -16,7 +16,7 @@ pub const Finding = union(enum) {
 };
 pub const Report = struct {
     allocator: std.mem.Allocator,
-    findings: std.ArrayList(Finding) = .{ .items = &.{}, .capacity = 0 },
+    findings: std.ArrayList(Finding) = .empty,
     scanned: usize = 0,
     pub fn deinit(self: *Report) void {
         for (self.findings.items) |finding| switch (finding) {
@@ -41,7 +41,7 @@ pub fn generate(allocator: std.mem.Allocator, root: []const u8, known_paths: []c
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var files: std.ArrayList(FileInfo) = .{ .items = &.{}, .capacity = 0 };
+    var files: std.ArrayList(FileInfo) = .empty;
     try walk(a, root, &files, &report, options);
 
     var seen = std.StringHashMap(void).init(a);
@@ -58,7 +58,7 @@ pub fn generate(allocator: std.mem.Allocator, root: []const u8, known_paths: []c
             break;
         };
         if (already_grouped) continue;
-        var matches: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
+        var matches: std.ArrayList([]const u8) = .empty;
         try matches.append(a, files.items[i].path);
         var j = i + 1;
         while (j < files.items.len) : (j += 1) {

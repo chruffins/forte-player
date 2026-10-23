@@ -22,6 +22,7 @@ const lyrics_mod = @import("music/lyrics.zig");
 const U = @import("ui/ui_state.zig");
 const gui_layout = @import("ui/gui_layout.zig");
 const gui_visualizer = @import("ui/gui_visualizer.zig");
+const player_control = @import("integrations/player_control.zig");
 
 const ScanJob = gui_jobs.ScanJob;
 const AuthJob = gui_jobs.AuthJob;
@@ -29,6 +30,7 @@ const AuthOp = gui_jobs.AuthOp;
 
 const Demo = struct {
     app: *app_mod.App,
+    control: ?*player_control.Server = null,
     scan: ScanJob,
     health: gui_jobs.HealthJob,
     auth: AuthJob,
@@ -49,30 +51,30 @@ const Demo = struct {
     detail_arena: std.heap.ArenaAllocator,
     queue_arena: std.heap.ArenaAllocator,
     current_arena: std.heap.ArenaAllocator,
-    library_rows: std.ArrayList(gui_render.TrackRow) = .{ .items = &.{}, .capacity = 0 },
-    filtered_library_rows: std.ArrayList(gui_render.TrackRow) = .{ .items = &.{}, .capacity = 0 },
-    library_titles: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 },
-    filtered_library_titles: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 },
-    filtered_library_indices: std.ArrayList(usize) = .{ .items = &.{}, .capacity = 0 },
-    filtered_albums: std.ArrayList(U.AlbumRow) = .{ .items = &.{}, .capacity = 0 },
-    filtered_artists: std.ArrayList(U.ArtistRow) = .{ .items = &.{}, .capacity = 0 },
-    filtered_genres: std.ArrayList(U.GenreRow) = .{ .items = &.{}, .capacity = 0 },
-    filtered_playlists: std.ArrayList(U.PlaylistRow) = .{ .items = &.{}, .capacity = 0 },
+    library_rows: std.ArrayList(gui_render.TrackRow) = .empty,
+    filtered_library_rows: std.ArrayList(gui_render.TrackRow) = .empty,
+    library_titles: std.ArrayList([]const u8) = .empty,
+    filtered_library_titles: std.ArrayList([]const u8) = .empty,
+    filtered_library_indices: std.ArrayList(usize) = .empty,
+    filtered_albums: std.ArrayList(U.AlbumRow) = .empty,
+    filtered_artists: std.ArrayList(U.ArtistRow) = .empty,
+    filtered_genres: std.ArrayList(U.GenreRow) = .empty,
+    filtered_playlists: std.ArrayList(U.PlaylistRow) = .empty,
     search_input: gui_framework.TextInput = .{},
     search_active: bool = false,
     search_screen: U.Screen = .library,
     ignore_search_trigger_char: bool = false,
     ignore_text_trigger: ?u32 = null,
-    albums: std.ArrayList(U.AlbumRow) = .{ .items = &.{}, .capacity = 0 },
+    albums: std.ArrayList(U.AlbumRow) = .empty,
     album_sort: db_mod.Database.AlbumSort = .by_name,
-    album_tracks: std.ArrayList(U.AlbumTrackRow) = .{ .items = &.{}, .capacity = 0 },
-    artists: std.ArrayList(U.ArtistRow) = .{ .items = &.{}, .capacity = 0 },
-    genres: std.ArrayList(U.GenreRow) = .{ .items = &.{}, .capacity = 0 },
-    playlists: std.ArrayList(U.PlaylistRow) = .{ .items = &.{}, .capacity = 0 },
-    artist_tracks: std.ArrayList(U.AlbumTrackRow) = .{ .items = &.{}, .capacity = 0 },
-    genre_tracks: std.ArrayList(U.AlbumTrackRow) = .{ .items = &.{}, .capacity = 0 },
-    playlist_tracks: std.ArrayList(U.AlbumTrackRow) = .{ .items = &.{}, .capacity = 0 },
-    queue_rows: std.ArrayList(U.QueueRow) = .{ .items = &.{}, .capacity = 0 },
+    album_tracks: std.ArrayList(U.AlbumTrackRow) = .empty,
+    artists: std.ArrayList(U.ArtistRow) = .empty,
+    genres: std.ArrayList(U.GenreRow) = .empty,
+    playlists: std.ArrayList(U.PlaylistRow) = .empty,
+    artist_tracks: std.ArrayList(U.AlbumTrackRow) = .empty,
+    genre_tracks: std.ArrayList(U.AlbumTrackRow) = .empty,
+    playlist_tracks: std.ArrayList(U.AlbumTrackRow) = .empty,
+    queue_rows: std.ArrayList(U.QueueRow) = .empty,
     queue_generation: u64 = std.math.maxInt(u64),
     current_song_id: i64 = -1,
     current_artist: []const u8 = "",
@@ -153,7 +155,7 @@ fn guiSearchQuery(demo: *const Demo, screen: U.Screen) []const u8 {
 }
 
 fn guiSearchMatches(text: []const u8, query: []const u8) bool {
-    return query.len == 0 or std.ascii.indexOfIgnoreCase(text, query) != null;
+    return query.len == 0 or std.ascii.findIgnoreCase(text, query) != null;
 }
 
 fn rebuildGuiFilters(demo: *Demo) void {
@@ -616,6 +618,7 @@ fn updateAlbumPlaying(demo: *Demo, state: *U.State) void {
 
 fn onTick(ctx: *anyopaque) void {
     const demo: *Demo = @ptrCast(@alignCast(ctx));
+    if (demo.control) |server| server.poll(demo.app);
     demo.app.engine.update();
     pollAuth(demo);
     pollHealth(demo);
@@ -786,7 +789,7 @@ fn loadPlaylistTracks(demo: *Demo, playlist_id: i64) void {
 
 fn playSongSet(demo: *Demo, tracks: []const U.AlbumTrackRow, context: PlaybackContextType, context_id: i64, start: usize) bool {
     if (tracks.len == 0 or start >= tracks.len) return false;
-    var ids = std.ArrayList(i64){ .items = &.{}, .capacity = 0 };
+    var ids = std.ArrayList(i64).empty;
     defer ids.deinit(demo.app.allocator);
     for (tracks) |track| ids.append(demo.app.allocator, track.song_id) catch return false;
     return demo.app.playSongIdsInContext(ids.items, context, context_id, start) != null;
@@ -1249,7 +1252,7 @@ fn enqueueTracks(demo: *Demo, tracks: []const U.AlbumTrackRow, next: bool) void 
         enqueueSong(demo, tracks[0].song_id, true);
         return;
     }
-    var ids = std.ArrayList(i32){ .items = &.{}, .capacity = 0 };
+    var ids = std.ArrayList(i32).empty;
     defer ids.deinit(demo.app.allocator);
     for (tracks) |track| {
         if (track.song_id < std.math.minInt(i32) or track.song_id > std.math.maxInt(i32)) continue;
@@ -1767,7 +1770,7 @@ fn createGuiSmartPlaylist(demo: *Demo, name: []const u8, rule: db_mod.Database.S
     var found: ?i64 = null;
     for (demo.playlists.items) |playlist| {
         if (std.mem.eql(u8, playlist.name, name)) {
-            if (!playlist.is_smart or playlist.smart_rule != @intFromEnum(rule)) {
+            if (!playlist.is_smart or playlist.smart_rule != @backingInt(rule)) {
                 std.log.err("cannot create smart playlist '{s}': a playlist with that name already exists", .{name});
                 return;
             }
@@ -2146,7 +2149,7 @@ fn shouldQuit(ctx: *anyopaque) bool {
 
 fn cycleVisualizer(demo: *Demo) void {
     demo.visualizer_mode = demo.visualizer_mode.next();
-    demo.app.config.setInt("visualizer", "mode", @intFromEnum(demo.visualizer_mode));
+    demo.app.config.setInt("visualizer", "mode", @backingInt(demo.visualizer_mode));
     demo.app.saveConfig();
 }
 
@@ -2207,6 +2210,8 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
     var app = try app_mod.App.createDeferred(allocator, null, null);
     defer app.destroy();
+    var control_server = player_control.Server.init();
+    defer if (control_server) |*server| server.deinit();
 
     var queue = try al.EventQueue.create();
     defer {
@@ -2219,6 +2224,7 @@ pub fn main() !void {
 
     var demo = Demo{
         .app = app,
+        .control = if (control_server) |*server| server else null,
         .scan = .{ .app = app, .allocator = allocator },
         .health = .{ .allocator = allocator },
         .auth = .{ .allocator = allocator },

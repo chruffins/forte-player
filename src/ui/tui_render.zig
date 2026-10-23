@@ -10,12 +10,7 @@ const view = @import("ui_view.zig");
 const theme = @import("theme.zig");
 const U = @import("ui_state.zig");
 
-const cterm = @cImport({
-    @cInclude("termios.h");
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-    @cInclude("sys/ioctl.h");
-});
+const vaxis = @import("vaxis");
 
 pub const Style = view.Style;
 pub const Size = struct { w: u16, h: u16 };
@@ -54,9 +49,10 @@ var g_h: usize = 0;
 var g_cur: []Cell = &.{};
 var g_prev: []Cell = &.{};
 var g_cursor_hidden = false;
-var g_old_tio: cterm.struct_termios = undefined;
-var g_old_flags: c_int = 0;
-var g_raw_enabled = false;
+var g_tty_buffer: [4096]u8 = undefined;
+var g_tty: ?vaxis.Tty = null;
+var g_vaxis: ?vaxis.Vaxis = null;
+var g_loop: ?vaxis.Loop(vaxis.Event) = null;
 
 // Terminal output is assembled in one reusable buffer per frame. This avoids
 // a syscall for every glyph/style transition while retaining partial-write
@@ -70,39 +66,32 @@ var g_force_redraw = true;
 // Raw terminal
 // ---------------------------------------------------------------------------
 
-/// Whether stdin/stdout are attached to a terminal. This lets `zig build
-/// run-tui` fail gracefully when invoked by a build harness or CI runner.
-pub fn hasTerminal() bool {
-    return cterm.isatty(0) != 0 and cterm.isatty(1) != 0;
+/// Initialize Vaxis's platform-specific TTY and asynchronous input loop.
+/// Vaxis uses termios on POSIX and the native Windows Console API on Windows.
+pub fn init(process: std.process.Init) !bool {
+    g_tty = vaxis.Tty.init(process.io, &g_tty_buffer) catch return false;
+    errdefer deinit();
+    g_vaxis = vaxis.init(process.io, std.heap.page_allocator, process.environ_map, .{}) catch {
+        deinit();
+        return false;
+    };
+    g_loop = .init(process.io, &g_tty.?, &g_vaxis.?);
+    try g_loop.?.start();
+    return true;
 }
 
-pub fn enableRaw() void {
-    if (g_raw_enabled) return;
-    if (cterm.tcgetattr(0, &g_old_tio) != 0) return;
-    const flags = cterm.fcntl(0, cterm.F_GETFL, @as(c_int, 0));
-    if (flags < 0) return;
-    g_old_flags = flags;
-    var raw = g_old_tio;
-    raw.c_lflag &= ~(@as(cterm.tcflag_t, cterm.ICANON) | @as(cterm.tcflag_t, cterm.ECHO));
-    raw.c_cc[cterm.VMIN] = 0;
-    raw.c_cc[cterm.VTIME] = 0;
-    if (cterm.tcsetattr(0, cterm.TCSANOW, &raw) != 0) return;
-    if (cterm.fcntl(0, cterm.F_SETFL, flags | cterm.O_NONBLOCK) != 0) {
-        _ = cterm.tcsetattr(0, cterm.TCSANOW, &g_old_tio);
-        return;
-    }
-    g_raw_enabled = true;
+pub fn deinit() void {
+    if (g_loop) |*loop| loop.stop();
+    if (g_vaxis) |*vx| if (g_tty) |*tty| vx.deinit(std.heap.page_allocator, tty.writer());
+    if (g_tty) |tty| tty.deinit();
+    g_loop = null;
+    g_vaxis = null;
+    g_tty = null;
 }
 
 pub fn restoreRaw() void {
-    if (!g_raw_enabled) return;
     termWrite("\x1b[?25h\x1b[0m\x1b[2J\x1b[H");
     _ = flushOutput();
-    // Restoring termios alone leaves O_NONBLOCK set on stdin. Shells and
-    // readline-like programs then see EAGAIN instead of waiting for input.
-    _ = cterm.tcsetattr(0, cterm.TCSANOW, &g_old_tio);
-    _ = cterm.fcntl(0, cterm.F_SETFL, g_old_flags);
-    g_raw_enabled = false;
 }
 
 /// Translate common ANSI cursor keys to the existing vi-style vertical bindings.
@@ -120,44 +109,29 @@ fn decodeInput(bytes: []const u8) ?u8 {
 }
 
 pub fn pollKey() ?u8 {
-    if (!g_raw_enabled) return null;
-    var bytes: [16]u8 = undefined;
-    const first = cterm.read(0, &bytes[0], 1);
-    if (first <= 0) return null;
-    if (bytes[0] != 0x1b) return bytes[0];
-
-    // ESC is also a standalone cancel key. Give a terminal a short window to
-    // finish sending an escape sequence before treating it as Escape itself.
-    var len: usize = 1;
-    var tries: usize = 0;
-    while (tries < 20 and len < bytes.len) : (tries += 1) {
-        const n = cterm.read(0, &bytes[len], 1);
-        if (n > 0) {
-            len += @intCast(n);
-            if (len >= 3 and bytes[len - 1] >= 0x40 and bytes[len - 1] <= 0x7e) break;
-        } else {
-            _ = cterm.usleep(1000);
-        }
-    }
-    if (decodeInput(bytes[0..len])) |key| return key;
-    return if (len == 1) 0x1b else null;
+    const loop = if (g_loop) |*l| l else return null;
+    while (loop.tryEvent() catch null) |event| switch (event) {
+        .key_press => |key| {
+            if (key.mods.ctrl) return null;
+            if (key.codepoint == vaxis.Key.escape) return 0x1b;
+            if (key.codepoint == vaxis.Key.enter) return '\n';
+            if (key.codepoint == vaxis.Key.up) return 'k';
+            if (key.codepoint == vaxis.Key.down) return 'j';
+            if (key.codepoint == vaxis.Key.left or key.codepoint == vaxis.Key.right) return null;
+            if (key.codepoint >= 32 and key.codepoint < 127) return @intCast(key.codepoint);
+            return null;
+        },
+        else => {},
+    };
+    return null;
 }
 
 fn flushOutput() bool {
-    var written: usize = 0;
-    while (written < g_out_len) {
-        const n = cterm.write(1, g_out[written..g_out_len].ptr, g_out_len - written);
-        if (n <= 0) {
-            // Retain unwritten bytes so a later frame can retry instead of
-            // silently dropping a partial terminal update.
-            if (written > 0) {
-                @memmove(g_out[0 .. g_out_len - written], g_out[written..g_out_len]);
-                g_out_len -= written;
-            }
-            return false;
-        }
-        written += @intCast(n);
-    }
+    if (g_out_len == 0) return true;
+    const tty = if (g_tty) |*t| t else return false;
+    const writer = tty.writer();
+    writer.writeAll(g_out[0..g_out_len]) catch return false;
+    writer.flush() catch return false;
     g_out_len = 0;
     return true;
 }
@@ -200,30 +174,14 @@ pub fn setPalette(scheme: theme.Scheme) void {
 }
 
 pub fn detectScheme(override: theme.Scheme, auto: bool) theme.Scheme {
-    if (!auto or !g_raw_enabled) return override;
-    termWrite("\x1b]11;?\x1b\\");
-    _ = flushOutput();
-    var resp: [256]u8 = undefined;
-    var n: usize = 0;
-    var tries: usize = 0;
-    while (tries < 80 and n < resp.len) : (tries += 1) {
-        var b: [1]u8 = undefined;
-        if (cterm.read(0, &b, 1) == 1) {
-            resp[n] = b[0];
-            n += 1;
-            if (b[0] == 0x07) break;
-            if (n >= 2 and b[0] == 0x5c and resp[n - 2] == 0x1b) break;
-        }
-        _ = cterm.usleep(1000);
-    }
-    const rgb = theme.parseRgb(resp[0..n]) orelse return .dark;
-    return if (theme.luminanceIsLight(rgb.r, rgb.g, rgb.b)) .light else .dark;
+    // Vaxis owns terminal input parsing, so avoid consuming terminal replies
+    // outside its event loop. Auto mode safely defaults to the dark palette.
+    return if (auto) .dark else override;
 }
 
 pub fn size() Size {
-    var ws: cterm.struct_winsize = undefined;
-    if (cterm.ioctl(0, @as(c_ulong, cterm.TIOCGWINSZ), &ws) == 0 and ws.ws_col > 0) {
-        return .{ .w = ws.ws_col, .h = ws.ws_row };
+    if (g_tty) |*tty| {
+        if (tty.getWinsize()) |ws| return .{ .w = ws.cols, .h = ws.rows } else |_| {}
     }
     return .{ .w = 80, .h = 24 };
 }

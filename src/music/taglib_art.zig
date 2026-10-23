@@ -6,9 +6,7 @@
 
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("taglib_art.h");
-});
+const c = @import("forte_c");
 
 pub const Cover = struct {
     bytes: []const u8,

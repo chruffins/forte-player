@@ -4,12 +4,9 @@ Working name for a music player, being rewritten in Zig from
 `audio-visualizer-cpp` as a real-world exercise for the
 [allegro5-zig](https://github.com/chruffins/allegro5-zig) wrapper.
 
-> **Toolchain:** pinned to **Zig 0.16.0** (see `.zigversion`), matching the
-> allegro5-zig wrapper. The Zig std API churns a lot between versions (0.17-dev
-> removed/renamed things like `ArrayList`, `std.fs`, `std.time`, etc.), and
-> third-party Zig packages (e.g. `zig-sqlite`) target 0.16 — so pinning keeps
-> everything buildable. Use `zigt`/`zvm`/`zigup` (or the official tarball) to
-> install 0.16.0 if your `zig` isn't that version.
+> **Toolchain:** pinned to **Zig 0.17.0** (see `.zigversion`). Use this exact
+> version when building locally or in CI; dependencies and source must stay
+> compatible with the pinned stable compiler.
 
 Currently ported:
 - `core/music_engine.zig` — audio engine, generic over a duck-typed driver (+ `FakeDriver` for headless tests)
@@ -24,8 +21,11 @@ Currently ported:
   `integrations/cover_resolver.zig` — MusicBrainz / Cover Art Archive covers,
   `integrations/lastfm.zig` — Last.fm scrobbling
 - `ui/` — shared semantic `ui_state.zig`, native pixel-space GUI layout/rendering,
-  and separate terminal-cell `ui_view.zig`/`tui_render.zig`. GUI rendering and hit
-  testing use identical geometry; see `ui/DESIGN.md` and `ui/GUI_PLAN.md`.
+  and separate terminal-cell `ui_view.zig`/`tui_render.zig`. The TUI uses the
+  pinned Vaxis TTY/input backend for POSIX and native Windows console support;
+  the existing semantic view and framebuffer renderer remain shared. GUI
+  rendering and hit testing use identical geometry; see `ui/DESIGN.md` and
+  `ui/GUI_PLAN.md`.
 - TUI artist/genre browsers with track detail views and context-aware playback,
   playlist detail editing, queue editing, asynchronous settings rescan/theme controls, and TagLib-backed
   metadata editing
@@ -33,9 +33,10 @@ Currently ported:
 ## Build / run / test
 
 ```sh
-zig build            # compile gallery, TUI, and visualizer-world frontends
+zig build            # compile GUI, TUI, MCP bridge, and visualizer-world frontends
 zig build run        # GUI frontend (audio + optional display)
 zig build run-tui    # TUI frontend (terminal; press 1-8 for screens, q to quit)
+zig-out/bin/forte-mcp # configure as an MCP stdio server in your local agent
 zig build run-world  # separate 3D firefly-world frontend
 zig build test       # run headless unit tests + compile-checks
 zig build test --summary all   # verbose
@@ -80,6 +81,32 @@ whole detail lists with `a`, and adding the selected item as next with `A`; the
 queue, cursor, shuffle, and repeat mode are restored on the next launch. Shuffle
 uses play history and favorites while reducing consecutive tracks from the same
 artist or album; the current track stays first.
+
+## Local MCP control
+
+`forte-player` and `forte-tui` expose the currently running instance over a
+user-local IPC endpoint. Configure your MCP client to launch `forte-mcp` using
+its standard stdio transport; keep the GUI or TUI open while using the tools.
+The bridge does not start a second player. It provides `player_status`,
+`search_library`, `play_track`, `pause`, `resume`, `next`, `previous`, `seek`,
+and `set_volume`. Search returns song IDs for `play_track`.
+
+For example, an MCP client configuration can launch the packaged Windows bridge
+with:
+
+```json
+{
+  "mcpServers": {
+    "forte-player": {
+      "command": "C:/forte/forte-mcp.exe"
+    }
+  }
+}
+```
+
+On Linux/macOS, use the installed `forte-mcp` path. The IPC endpoint is
+restricted to the current user (Unix socket permissions or a user-scoped Windows
+named pipe); if the player is not running, tools return a clear error.
 
 ## Visualizer-first world
 

@@ -20,10 +20,10 @@ pub const ShuffleMetadata = struct {
 
 pub const PlayQueue = struct {
     allocator: std.mem.Allocator,
-    song_ids: std.ArrayList(i32) = .{ .items = &.{}, .capacity = 0 },
+    song_ids: std.ArrayList(i32) = .empty,
     /// Stack of indices actually played, for reverse navigation.
-    played_indices: std.ArrayList(usize) = .{ .items = &.{}, .capacity = 0 },
-    shuffle_order: std.ArrayList(usize) = .{ .items = &.{}, .capacity = 0 },
+    played_indices: std.ArrayList(usize) = .empty,
+    shuffle_order: std.ArrayList(usize) = .empty,
     shuffle_metadata: std.AutoHashMap(i32, ShuffleMetadata),
 
     current_index: usize = 0,
@@ -51,9 +51,9 @@ pub const PlayQueue = struct {
     /// need more than the lightweight navigation cursor to restore safely.
     pub const Snapshot = struct {
         allocator: std.mem.Allocator,
-        song_ids: std.ArrayList(i32) = .{ .items = &.{}, .capacity = 0 },
-        played_indices: std.ArrayList(usize) = .{ .items = &.{}, .capacity = 0 },
-        shuffle_order: std.ArrayList(usize) = .{ .items = &.{}, .capacity = 0 },
+        song_ids: std.ArrayList(i32) = .empty,
+        played_indices: std.ArrayList(usize) = .empty,
+        shuffle_order: std.ArrayList(usize) = .empty,
         current_index: usize,
         shuffle_pos: usize,
         is_shuffled: bool,
@@ -143,9 +143,9 @@ pub const PlayQueue = struct {
         self.song_ids = saved.song_ids;
         self.played_indices = saved.played_indices;
         self.shuffle_order = saved.shuffle_order;
-        saved.song_ids = .{ .items = &.{}, .capacity = 0 };
-        saved.played_indices = .{ .items = &.{}, .capacity = 0 };
-        saved.shuffle_order = .{ .items = &.{}, .capacity = 0 };
+        saved.song_ids = .empty;
+        saved.played_indices = .empty;
+        saved.shuffle_order = .empty;
         self.current_index = saved.current_index;
         self.shuffle_pos = saved.shuffle_pos;
         self.is_shuffled = saved.is_shuffled;
@@ -276,7 +276,7 @@ pub const PlayQueue = struct {
             if (self.shuffle_metadata.get(id)) |metadata| latest_played = @max(latest_played, metadata.last_played);
         }
 
-        var remaining: std.ArrayList(usize) = .{ .items = &.{}, .capacity = 0 };
+        var remaining: std.ArrayList(usize) = .empty;
         defer remaining.deinit(self.allocator);
         for (0..n) |i| {
             if (i != self.current_index) try remaining.append(self.allocator, i);
@@ -356,7 +356,7 @@ pub const PlayQueue = struct {
     pub fn replace(self: *PlayQueue, ids: []const i32, context_type: PlaybackContextType, context_id: i32) !void {
         // Build the replacement first so an allocation failure leaves the
         // existing queue and its cursor untouched.
-        var replacement: std.ArrayList(i32) = .{ .items = &.{}, .capacity = 0 };
+        var replacement: std.ArrayList(i32) = .empty;
         errdefer replacement.deinit(self.allocator);
         try replacement.appendSlice(self.allocator, ids);
         self.song_ids.deinit(self.allocator);

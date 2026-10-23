@@ -32,6 +32,7 @@ zig build -Doptimize=ReleaseFast -Dtarget="${ZIG_TARGET:-$DEFAULT_TARGET}" \
     -Dallegro_prefix="$ALLEGRO" -Dtaglib_prefix="$TAGLIB" -Dcxx="${CXX:-clang++}"
 install -m755 "$ROOT/zig-out/bin/forte-player" "$APP/Contents/MacOS/"
 install -m755 "$ROOT/zig-out/bin/forte-tui" "$APP/Contents/MacOS/"
+install -m755 "$ROOT/zig-out/bin/forte-mcp" "$APP/Contents/MacOS/"
 mkdir -p "$APP/Contents/Resources"
 cp -a "$ROOT/zig-out/share/forte-player/." "$APP/Contents/Resources/"
 install -m644 "$ROOT/packaging/macos/Info.plist" "$APP/Contents/"

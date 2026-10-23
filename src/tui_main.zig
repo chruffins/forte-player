@@ -23,6 +23,7 @@ const taglib_meta = @import("music/taglib_meta.zig");
 const gui_jobs = @import("ui/gui_jobs.zig");
 const metadata_edit = @import("music/metadata_edit.zig");
 const PlaybackContextType = @import("music/play_queue.zig").PlaybackContextType;
+const player_control = @import("integrations/player_control.zig");
 
 const U = @import("ui/ui_state.zig");
 const view = @import("ui/ui_view.zig");
@@ -329,7 +330,7 @@ fn rebuildLibraryView(all_titles: []const []const u8, out_titles: *std.ArrayList
     out_titles.clearRetainingCapacity();
     out_indices.clearRetainingCapacity();
     for (all_titles, 0..) |title, index| {
-        if (filter.len > 0 and std.ascii.indexOfIgnoreCase(title, filter) == null) continue;
+        if (filter.len > 0 and std.ascii.findIgnoreCase(title, filter) == null) continue;
         out_titles.append(allocator, title) catch break;
         out_indices.append(allocator, index) catch break;
     }
@@ -367,7 +368,7 @@ fn rebuildArtistRows(app: *app_mod.App, rows: *std.ArrayList(U.ArtistRow), alloc
     defer arena.deinit();
     const all = app.db.getArtistsWithAllocator(arena.allocator()) catch return;
     for (all) |a| {
-        if (filter.len > 0 and std.ascii.indexOfIgnoreCase(a.name, filter) == null) continue;
+        if (filter.len > 0 and std.ascii.findIgnoreCase(a.name, filter) == null) continue;
         const name = allocator.dupe(u8, a.name) catch break;
         rows.append(allocator, .{ .id = a.id, .name = name, .song_count = a.song_count, .album_count = a.album_count }) catch {
             allocator.free(name);
@@ -382,7 +383,7 @@ fn rebuildGenreRows(app: *app_mod.App, rows: *std.ArrayList(U.GenreRow), allocat
     defer arena.deinit();
     const all = app.db.getGenresWithAllocator(arena.allocator()) catch return;
     for (all) |g| {
-        if (filter.len > 0 and std.ascii.indexOfIgnoreCase(g.name, filter) == null) continue;
+        if (filter.len > 0 and std.ascii.findIgnoreCase(g.name, filter) == null) continue;
         const name = allocator.dupe(u8, g.name) catch break;
         rows.append(allocator, .{ .id = g.id, .name = name, .song_count = g.song_count }) catch {
             allocator.free(name);
@@ -394,7 +395,7 @@ fn rebuildGenreRows(app: *app_mod.App, rows: *std.ArrayList(U.GenreRow), allocat
 fn filterAlbumRows(source: []const U.AlbumRow, rows: *std.ArrayList(U.AlbumRow), allocator: std.mem.Allocator, filter: []const u8) void {
     clearAlbumRows(rows, allocator);
     for (source) |a| {
-        if (filter.len > 0 and std.ascii.indexOfIgnoreCase(a.title, filter) == null and std.ascii.indexOfIgnoreCase(a.artist, filter) == null) continue;
+        if (filter.len > 0 and std.ascii.findIgnoreCase(a.title, filter) == null and std.ascii.findIgnoreCase(a.artist, filter) == null) continue;
         const title = allocator.dupe(u8, a.title) catch break;
         const artist = allocator.dupe(u8, a.artist) catch {
             allocator.free(title);
@@ -411,7 +412,7 @@ fn filterAlbumRows(source: []const U.AlbumRow, rows: *std.ArrayList(U.AlbumRow),
 fn filterArtistRows(source: []const U.ArtistRow, rows: *std.ArrayList(U.ArtistRow), allocator: std.mem.Allocator, filter: []const u8) void {
     clearArtistRows(rows, allocator);
     for (source) |a| {
-        if (filter.len > 0 and std.ascii.indexOfIgnoreCase(a.name, filter) == null) continue;
+        if (filter.len > 0 and std.ascii.findIgnoreCase(a.name, filter) == null) continue;
         const name = allocator.dupe(u8, a.name) catch break;
         rows.append(allocator, .{ .id = a.id, .name = name, .song_count = a.song_count, .album_count = a.album_count }) catch {
             allocator.free(name);
@@ -423,7 +424,7 @@ fn filterArtistRows(source: []const U.ArtistRow, rows: *std.ArrayList(U.ArtistRo
 fn filterGenreRows(source: []const U.GenreRow, rows: *std.ArrayList(U.GenreRow), allocator: std.mem.Allocator, filter: []const u8) void {
     clearGenreRows(rows, allocator);
     for (source) |g| {
-        if (filter.len > 0 and std.ascii.indexOfIgnoreCase(g.name, filter) == null) continue;
+        if (filter.len > 0 and std.ascii.findIgnoreCase(g.name, filter) == null) continue;
         const name = allocator.dupe(u8, g.name) catch break;
         rows.append(allocator, .{ .id = g.id, .name = name, .song_count = g.song_count }) catch {
             allocator.free(name);
@@ -465,7 +466,7 @@ fn rebuildAlbumRows(app: *app_mod.App, rows: *std.ArrayList(U.AlbumRow), allocat
     defer query_arena.deinit();
     const albums = app.db.getAlbumsWithAllocator(query_arena.allocator(), sort) catch return;
     for (albums) |a| {
-        if (filter.len > 0 and std.ascii.indexOfIgnoreCase(a.name, filter) == null and std.ascii.indexOfIgnoreCase(a.artist, filter) == null) continue;
+        if (filter.len > 0 and std.ascii.findIgnoreCase(a.name, filter) == null and std.ascii.findIgnoreCase(a.artist, filter) == null) continue;
         const title = allocator.dupe(u8, a.name) catch break;
         const artist = allocator.dupe(u8, a.artist) catch {
             allocator.free(title);
@@ -654,7 +655,7 @@ fn addQueueSong(app: *app_mod.App, id: i64, next: bool) bool {
 fn addQueueTracks(app: *app_mod.App, tracks: []const U.AlbumTrackRow, next: bool) bool {
     if (tracks.len == 0) return false;
     if (next) return addQueueSong(app, tracks[0].song_id, true);
-    var ids = std.ArrayList(i32){ .items = &.{}, .capacity = 0 };
+    var ids = std.ArrayList(i32).empty;
     defer ids.deinit(app.allocator);
     for (tracks) |track| {
         if (track.song_id < std.math.minInt(i32) or track.song_id > std.math.maxInt(i32)) continue;
@@ -666,7 +667,7 @@ fn addQueueTracks(app: *app_mod.App, tracks: []const U.AlbumTrackRow, next: bool
 
 fn playTrackRows(app: *app_mod.App, tracks: []const U.AlbumTrackRow, start_index: usize, context_type: PlaybackContextType, context_id: i64) bool {
     if (start_index >= tracks.len) return false;
-    var ids = std.ArrayList(i64){ .items = &.{}, .capacity = 0 };
+    var ids = std.ArrayList(i64).empty;
     defer ids.deinit(app.allocator);
     for (tracks) |track| ids.append(app.allocator, track.song_id) catch return false;
     return playSongSet(app, ids.items, context_type, context_id, start_index);
@@ -676,7 +677,7 @@ fn playArtist(app: *app_mod.App, artist_id: i64) bool {
     var arena = std.heap.ArenaAllocator.init(app.allocator);
     defer arena.deinit();
     const songs = app.db.getSongsByArtistWithAllocator(arena.allocator(), artist_id) catch return false;
-    var ids = std.ArrayList(i64){ .items = &.{}, .capacity = 0 };
+    var ids = std.ArrayList(i64).empty;
     defer ids.deinit(app.allocator);
     for (songs) |s| ids.append(app.allocator, s.id) catch return false;
     return playSongSet(app, ids.items, .Artist, artist_id, 0);
@@ -686,7 +687,7 @@ fn playGenre(app: *app_mod.App, genre_id: i64) bool {
     var arena = std.heap.ArenaAllocator.init(app.allocator);
     defer arena.deinit();
     const songs = app.db.getSongsByGenreWithAllocator(arena.allocator(), genre_id) catch return false;
-    var ids = std.ArrayList(i64){ .items = &.{}, .capacity = 0 };
+    var ids = std.ArrayList(i64).empty;
     defer ids.deinit(app.allocator);
     for (songs) |s| ids.append(app.allocator, s.id) catch return false;
     return playSongSet(app, ids.items, .Genre, genre_id, 0);
@@ -979,16 +980,18 @@ fn sortLabel(s: AlbumSort) []const u8 {
     };
 }
 
-pub fn main() !void {
-    // A TUI needs a real terminal. Exit cleanly when launched from a
-    // non-interactive build/CI environment instead of initializing Allegro
-    // and trapping while trying to use terminal input/output.
-    if (!render.hasTerminal()) return;
+pub fn main(process: std.process.Init) !void {
+    // Vaxis initializes the platform TTY (POSIX termios or Windows Console)
+    // and its asynchronous input loop. Non-interactive launches exit cleanly.
+    if (!try render.init(process)) return;
+    defer render.deinit();
 
     const allocator = std.heap.page_allocator;
 
     var app = try app_mod.App.createTui(allocator, null, null);
     defer app.destroy();
+    var control_server = player_control.Server.init();
+    defer if (control_server) |*server| server.deinit();
     // Live audio capture for the TUI spectrum (ring fed by the mixer callback).
     app.engine.setSampleBufferCapacity(8192) catch |e| std.log.warn("sample capture resize failed: {}", .{e});
 
@@ -1037,28 +1040,28 @@ pub fn main() !void {
     // featured tracks and compilations understandable without opening detail.
     var title_arena = std.heap.ArenaAllocator.init(allocator);
     defer title_arena.deinit();
-    var titles = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
+    var titles = std.ArrayList([]const u8).empty;
     defer titles.deinit(allocator);
     rebuildTitles(app, &titles, &title_arena);
 
     var library_search = SearchBuffer{};
     var playlist_editor = SearchBuffer{};
     var playlist_edit_id: i64 = -1;
-    var library_view_titles = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 };
+    var library_view_titles = std.ArrayList([]const u8).empty;
     defer library_view_titles.deinit(allocator);
-    var library_view_indices = std.ArrayList(usize){ .items = &.{}, .capacity = 0 };
+    var library_view_indices = std.ArrayList(usize).empty;
     defer library_view_indices.deinit(allocator);
     rebuildLibraryView(titles.items, &library_view_titles, &library_view_indices, allocator, "");
 
     // Album browser rows (parallel to the DB's album listing) + sort state.
     var album_sort: AlbumSort = .by_name;
     var album_search = SearchBuffer{};
-    var album_rows = std.ArrayList(U.AlbumRow){ .items = &.{}, .capacity = 0 };
+    var album_rows = std.ArrayList(U.AlbumRow).empty;
     defer {
         clearAlbumRows(&album_rows, allocator);
         album_rows.deinit(allocator);
     }
-    var all_album_rows = std.ArrayList(U.AlbumRow){ .items = &.{}, .capacity = 0 };
+    var all_album_rows = std.ArrayList(U.AlbumRow).empty;
     defer {
         clearAlbumRows(&all_album_rows, allocator);
         all_album_rows.deinit(allocator);
@@ -1067,22 +1070,22 @@ pub fn main() !void {
     filterAlbumRows(all_album_rows.items, &album_rows, allocator, "");
     var artist_search = SearchBuffer{};
     var genre_search = SearchBuffer{};
-    var artist_rows = std.ArrayList(U.ArtistRow){ .items = &.{}, .capacity = 0 };
+    var artist_rows = std.ArrayList(U.ArtistRow).empty;
     defer {
         clearArtistRows(&artist_rows, allocator);
         artist_rows.deinit(allocator);
     }
-    var all_artist_rows = std.ArrayList(U.ArtistRow){ .items = &.{}, .capacity = 0 };
+    var all_artist_rows = std.ArrayList(U.ArtistRow).empty;
     defer {
         clearArtistRows(&all_artist_rows, allocator);
         all_artist_rows.deinit(allocator);
     }
-    var genre_rows = std.ArrayList(U.GenreRow){ .items = &.{}, .capacity = 0 };
+    var genre_rows = std.ArrayList(U.GenreRow).empty;
     defer {
         clearGenreRows(&genre_rows, allocator);
         genre_rows.deinit(allocator);
     }
-    var all_genre_rows = std.ArrayList(U.GenreRow){ .items = &.{}, .capacity = 0 };
+    var all_genre_rows = std.ArrayList(U.GenreRow).empty;
     defer {
         clearGenreRows(&all_genre_rows, allocator);
         all_genre_rows.deinit(allocator);
@@ -1091,35 +1094,35 @@ pub fn main() !void {
     rebuildGenreRows(app, &all_genre_rows, allocator, "");
     filterArtistRows(all_artist_rows.items, &artist_rows, allocator, "");
     filterGenreRows(all_genre_rows.items, &genre_rows, allocator, "");
-    var playlist_rows = std.ArrayList(U.PlaylistRow){ .items = &.{}, .capacity = 0 };
+    var playlist_rows = std.ArrayList(U.PlaylistRow).empty;
     defer {
         clearPlaylistRows(&playlist_rows, allocator);
         playlist_rows.deinit(allocator);
     }
     rebuildPlaylistRows(app, &playlist_rows, allocator);
-    var queue_rows = std.ArrayList(U.QueueRow){ .items = &.{}, .capacity = 0 };
+    var queue_rows = std.ArrayList(U.QueueRow).empty;
     defer {
         clearQueueRows(&queue_rows, allocator);
         queue_rows.deinit(allocator);
     }
     var queue_revision: u64 = std.math.maxInt(u64);
     // Tracks of the album currently open in the detail view.
-    var album_tracks = std.ArrayList(U.AlbumTrackRow){ .items = &.{}, .capacity = 0 };
+    var album_tracks = std.ArrayList(U.AlbumTrackRow).empty;
     defer {
         clearAlbumTracks(&album_tracks, allocator);
         album_tracks.deinit(allocator);
     }
-    var artist_detail_tracks = std.ArrayList(U.AlbumTrackRow){ .items = &.{}, .capacity = 0 };
+    var artist_detail_tracks = std.ArrayList(U.AlbumTrackRow).empty;
     defer {
         clearAlbumTracks(&artist_detail_tracks, allocator);
         artist_detail_tracks.deinit(allocator);
     }
-    var genre_detail_tracks = std.ArrayList(U.AlbumTrackRow){ .items = &.{}, .capacity = 0 };
+    var genre_detail_tracks = std.ArrayList(U.AlbumTrackRow).empty;
     defer {
         clearAlbumTracks(&genre_detail_tracks, allocator);
         genre_detail_tracks.deinit(allocator);
     }
-    var playlist_tracks = std.ArrayList(U.AlbumTrackRow){ .items = &.{}, .capacity = 0 };
+    var playlist_tracks = std.ArrayList(U.AlbumTrackRow).empty;
     defer {
         clearAlbumTracks(&playlist_tracks, allocator);
         playlist_tracks.deinit(allocator);
@@ -1130,7 +1133,6 @@ pub fn main() !void {
     defer if (auth_ticket) |*ticket| ticket.deinit();
     var auth_status: []const u8 = "";
 
-    render.enableRaw();
     defer render.restoreRaw();
 
     // theme: config override or auto-detect (dark vs light terminal)
@@ -1195,6 +1197,7 @@ pub fn main() !void {
     var quitting = false;
     var jump_pending = false;
     while (!quitting) {
+        if (control_server) |*server| server.poll(app);
         // Wait for a timer tick, or the poll timeout so we can service stdin.
         if (tqueue.waitForEventTimed(&ev, input_poll_secs)) {
             if (al.eventType(ev) == .timer) frame_due = true;
@@ -1410,7 +1413,7 @@ pub fn main() !void {
                 const from = st.selection;
                 const to = if (k == '<') from -| 1 else @min(from + 1, playlist_tracks.items.len - 1);
                 if (from != to) {
-                    var ids = std.ArrayList(i64){ .items = &.{}, .capacity = 0 };
+                    var ids = std.ArrayList(i64).empty;
                     defer ids.deinit(allocator);
                     for (playlist_tracks.items) |t| ids.append(allocator, t.song_id) catch break;
                     if (ids.items.len == playlist_tracks.items.len) {

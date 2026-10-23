@@ -4,12 +4,7 @@ const std = @import("std");
 const al = @import("allegro");
 const native = @import("world/template.zig");
 const model = @import("world/model.zig");
-const c = @cImport({
-    @cInclude("allegro5/allegro.h");
-    @cInclude("allegro5/allegro_opengl.h");
-    @cInclude("allegro5/allegro_image.h");
-    @cInclude("stdlib.h");
-});
+const c = @import("forte_c");
 const width = 640;
 const height = 360;
 fn expect(value: bool) !void {

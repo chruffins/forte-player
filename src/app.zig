@@ -67,7 +67,7 @@ fn resolveSong(id: i32, ctx: *anyopaque) ?[:0]const u8 {
 fn restoreSavedQueue(queue: *PlayQueue, lib: *lib_mod.Library, config: *const config_mod.Config, allocator: std.mem.Allocator) void {
     const encoded = config.getStr("queue", "ids", "");
     if (encoded.len == 0) return;
-    var ids = std.ArrayList(i32){ .items = &.{}, .capacity = 0 };
+    var ids = std.ArrayList(i32).empty;
     defer ids.deinit(allocator);
     var parts = std.mem.splitScalar(u8, encoded, ',');
     while (parts.next()) |part| {
@@ -248,9 +248,9 @@ pub const App = struct {
         encoded[len] = 0;
         self.config.setStr("queue", "ids", encoded[0..len :0]);
         self.config.setInt("queue", "current_index", @intCast(self.play_queue.currentIndex()));
-        self.config.setInt("queue", "repeat", @intCast(@intFromEnum(self.play_queue.getRepeatMode())));
+        self.config.setInt("queue", "repeat", @intCast(@backingInt(self.play_queue.getRepeatMode())));
         self.config.setInt("queue", "shuffle", @intFromBool(self.play_queue.isShuffled()));
-        self.config.setInt("queue", "context_type", @intCast(@intFromEnum(self.play_queue.context_type)));
+        self.config.setInt("queue", "context_type", @intCast(@backingInt(self.play_queue.context_type)));
         self.config.setInt("queue", "context_id", self.play_queue.context_id);
     }
 
@@ -409,7 +409,7 @@ pub const App = struct {
     pub fn playSongIdsInContext(self: *App, song_ids: []const i64, context: PlaybackContextType, context_id: i64, start_index: usize) ?[:0]const u8 {
         if (song_ids.len == 0 or start_index >= song_ids.len) return null;
         const path = self.lib.songPath(song_ids[start_index]) orelse return null;
-        var queue_ids = std.ArrayList(i32){ .items = &.{}, .capacity = 0 };
+        var queue_ids = std.ArrayList(i32).empty;
         defer queue_ids.deinit(self.allocator);
         for (song_ids) |id| {
             if (id < std.math.minInt(i32) or id > std.math.maxInt(i32)) return null;
@@ -435,7 +435,7 @@ pub const App = struct {
         var query_arena = std.heap.ArenaAllocator.init(self.allocator);
         defer query_arena.deinit();
         const songs = self.db.getSongsByAlbumWithAllocator(query_arena.allocator(), album_id) catch return null;
-        var ids = std.ArrayList(i64){ .items = &.{}, .capacity = 0 };
+        var ids = std.ArrayList(i64).empty;
         defer ids.deinit(self.allocator);
         for (songs) |song| ids.append(self.allocator, song.id) catch return null;
         return self.playSongIdsInContext(ids.items, .Album, album_id, start_index);

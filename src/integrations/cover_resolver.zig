@@ -45,15 +45,15 @@ pub const CoverResolver = struct {
     cache: std.AutoHashMapUnmanaged(i64, Entry) = .{},
     image_cache: std.AutoHashMapUnmanaged(i64, []const u8) = .{},
     /// FIFO eviction keeps downloaded artwork bounded for large libraries.
-    image_order: std.ArrayList(i64) = .{ .items = &.{}, .capacity = 0 },
+    image_order: std.ArrayList(i64) = .empty,
     image_cache_bytes: usize = 0,
     image_pending: std.AutoHashMapUnmanaged(i64, void) = .{},
     last_failure: ?Failure = null,
 
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
-    jobs: std.ArrayList(Job) = .{ .items = &.{}, .capacity = 0 },
-    results: std.ArrayList(Result) = .{ .items = &.{}, .capacity = 0 },
+    jobs: std.ArrayList(Job) = .empty,
+    results: std.ArrayList(Result) = .empty,
     worker: ?std.Thread = null,
     stopping: bool = false,
 

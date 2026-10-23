@@ -27,7 +27,7 @@ pub const Weighting = enum { none, a_weight };
 /// the peak up), decay is slow, and the whole spectrum is normalized against a
 /// slowly-releasing global peak so quiet and loud tracks both read well.
 pub const Smoother = struct {
-    levels: [n_bands]f32 = [_]f32{0} ** n_bands,
+    levels: [n_bands]f32 = @splat(0),
     /// Smoothed global peak (AGC reference).
     peak: f32 = 0.001,
     /// Exponential decay factor applied per frame when the signal falls.
@@ -100,8 +100,8 @@ pub const Analyzer = struct {
     }
 
     pub fn compute(self: *const Analyzer, samples: []const f32, bands: *[n_bands]f32) void {
-        var re: [n_samples]f32 = [_]f32{0} ** n_samples;
-        var im: [n_samples]f32 = [_]f32{0} ** n_samples;
+        var re: [n_samples]f32 = @splat(0);
+        var im: [n_samples]f32 = @splat(0);
         const n = @min(samples.len, n_samples);
         for (0..n) |i| re[i] = samples[i] * self.hann[i];
         fft_mod.fftWithCache(&re, &im, &self.twiddles);
@@ -140,7 +140,7 @@ fn aWeightGain(freq: f32) f32 {
 }
 
 test "computeBands: silence yields silence" {
-    var samples: [n_samples]f32 = [_]f32{0} ** n_samples;
+    var samples: [n_samples]f32 = @splat(0);
     var bands: [n_bands]f32 = undefined;
     computeBands(&samples, &bands);
     for (bands) |b| try std.testing.expect(b == 0.0);
@@ -172,7 +172,7 @@ test "computeBands: a mid-frequency tone lights the mid bands, not the edges" {
 
 test "smoother: AGC normalizes loudness with fast attack, slow decay" {
     var sm = Smoother{};
-    var raw: [n_bands]f32 = [_]f32{0} ** n_bands;
+    var raw: [n_bands]f32 = @splat(0);
 
     // silence -> silence
     sm.update(&raw);
@@ -185,7 +185,7 @@ test "smoother: AGC normalizes loudness with fast attack, slow decay" {
 
     // a much quieter signal converges to a similar displayed level (AGC)
     var sm2 = Smoother{};
-    var raw2: [n_bands]f32 = [_]f32{0} ** n_bands;
+    var raw2: [n_bands]f32 = @splat(0);
     var f: usize = 0;
     while (f < 20) : (f += 1) {
         raw2[3] = 0.1;

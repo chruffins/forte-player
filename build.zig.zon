@@ -1,7 +1,7 @@
 .{
     .name = .forte_player,
     .version = "0.0.1",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .paths = .{""},
     .dependencies = .{
         .allegro = .{
@@ -13,6 +13,10 @@
         },
         .sqlite = .{
             .path = "vendor/zig-sqlite",
+        },
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis#0a1f55da77dcf99d638cf409b0c439e1542996d5",
+            .hash = "vaxis-0.6.0-BWNV_K4WDQC9AopHvrPY98uwQwG2kATn91rbbjvTX-XR",
         },
     },
     .fingerprint = 0x44284642471ff880,

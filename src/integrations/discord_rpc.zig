@@ -25,9 +25,7 @@ const os_tag = builtin.os.tag;
 
 /// Cross-platform C imports (provided on Windows too via mingw headers).
 /// Only `stdlib.h` (getenv) is needed here; wall-clock time uses std.Io.Clock.
-const c = @cImport({
-    @cInclude("stdlib.h");
-});
+const c = @import("forte_c");
 
 /// Print IPC traffic + handshake results when `DISCORD_IPC_DEBUG` is set.
 fn dbg(comptime fmt: []const u8, args: anytype) void {
@@ -80,13 +78,7 @@ pub fn encodeHeader(op: u32, len: u32) [8]u8 {
 // ---------------------------------------------------------------------------
 // POSIX transport: unix-domain socket
 // ---------------------------------------------------------------------------
-const posix_socket = if (os_tag != .windows) @cImport({
-    @cInclude("sys/socket.h");
-    @cInclude("sys/un.h");
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-    @cInclude("poll.h");
-}) else @TypeOf(null);
+const posix_socket = if (os_tag != .windows) @import("forte_c") else @TypeOf(null);
 
 const PosixTransport = if (os_tag != .windows) struct {
     fd: c_int = -1,
@@ -396,7 +388,7 @@ pub const Client = struct {
     fn writeFrame(self: *Client, op: Opcode, payload: []const u8) bool {
         if (payload.len > 4096) return false;
         var frame: [8 + 4096]u8 = undefined;
-        frame[0..8].* = encodeHeader(@intFromEnum(op), @intCast(payload.len));
+        frame[0..8].* = encodeHeader(@backingInt(op), @intCast(payload.len));
         @memcpy(frame[8 .. 8 + payload.len], payload);
         return self.transport.writeAll(frame[0 .. 8 + payload.len]);
     }
@@ -609,8 +601,9 @@ test "buildActivityPayload emits valid, escaped JSON (round-trips)" {
 }
 
 test "buildActivityPayload clips long text and omits unset fields" {
+    const long_details: [200]u8 = @splat('a');
     const p = Presence{
-        .details = "a" ** 200,
+        .details = &long_details,
         .state = "",
     };
     var buf: [4096]u8 = undefined;

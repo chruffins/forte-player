@@ -82,7 +82,7 @@ pub const Scrobbler = struct {
     threaded: std.Io.Threaded,
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
-    jobs: std.ArrayList(Job) = .{ .items = &.{}, .capacity = 0 },
+    jobs: std.ArrayList(Job) = .empty,
     worker: ?std.Thread = null,
     stopping: bool = false,
 

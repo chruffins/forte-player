@@ -30,7 +30,38 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace {
+
+#ifdef _WIN32
+std::wstring utf8ToWide(const char *path) {
+    if (!path)
+        return {};
+    const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, nullptr, 0);
+    if (length <= 0)
+        return {};
+    std::wstring result(static_cast<size_t>(length), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, result.data(), length) <= 0)
+        return {};
+    result.resize(static_cast<size_t>(length - 1));
+    return result;
+}
+#endif
+
+struct Utf8FileRef {
+#ifdef _WIN32
+    std::wstring wide_path;
+    TagLib::FileRef file;
+    explicit Utf8FileRef(const char *path)
+        : wide_path(utf8ToWide(path)), file(wide_path.c_str()) {}
+#else
+    TagLib::FileRef file;
+    explicit Utf8FileRef(const char *path) : file(path) {}
+#endif
+};
 
 struct CoverData {
     std::vector<unsigned char> bytes;
@@ -117,7 +148,11 @@ bool folderCover(const std::string &path, CoverData &out) {
     const std::vector<std::string> names = {"cover", "folder", "front", "album", "albumart", "albumartsmall"};
     const std::vector<std::string> exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif"};
 
+#ifdef _WIN32
+    std::filesystem::path dir = std::filesystem::u8path(path).parent_path();
+#else
     std::filesystem::path dir = std::filesystem::path(path).parent_path();
+#endif
     std::vector<std::filesystem::path> dirs;
     dirs.push_back(dir);
     if (!dir.parent_path().empty())
@@ -225,8 +260,8 @@ int forte_extract_cover(const char *path,
     CoverData cover;
     bool found = false;
     {
-        TagLib::FileRef f(path);
-        found = embeddedCover(f, cover);
+        Utf8FileRef f(path);
+        found = embeddedCover(f.file, cover);
     }
     if (!found)
         found = folderCover(path, cover);
@@ -256,10 +291,10 @@ void forte_free_cover(unsigned char *data, char *mime) {
 char *forte_extract_album_artist(const char *path) {
     if (!path)
         return nullptr;
-    TagLib::FileRef f(path);
-    if (f.isNull() || !f.file())
+    Utf8FileRef f(path);
+    if (f.file.isNull() || !f.file.file())
         return nullptr;
-    const TagLib::PropertyMap properties = f.file()->properties();
+    const TagLib::PropertyMap properties = f.file.file()->properties();
     const TagLib::StringList values = properties[TagLib::String("ALBUMARTIST")];
     if (values.isEmpty() || values.front().isEmpty())
         return nullptr;
@@ -274,9 +309,9 @@ int forte_extract_replaygain(const char *path, double *track_gain, int *has_trac
         !album_gain || !has_album_gain || !album_peak || !has_album_peak)
         return 0;
     *has_track_gain = *has_track_peak = *has_album_gain = *has_album_peak = 0;
-    TagLib::FileRef f(path);
-    if (f.isNull() || !f.file()) return 0;
-    const TagLib::PropertyMap properties = f.file()->properties();
+    Utf8FileRef f(path);
+    if (f.file.isNull() || !f.file.file()) return 0;
+    const TagLib::PropertyMap properties = f.file.file()->properties();
     *has_track_gain = propertyNumber(properties, "REPLAYGAINTRACKGAIN", *track_gain);
     *has_track_peak = propertyNumber(properties, "REPLAYGAINTRACKPEAK", *track_peak);
     *has_album_gain = propertyNumber(properties, "REPLAYGAINALBUMGAIN", *album_gain);
@@ -287,10 +322,10 @@ int forte_extract_replaygain(const char *path, double *track_gain, int *has_trac
 unsigned int forte_extract_disc_number(const char *path) {
     if (!path)
         return 1;
-    TagLib::FileRef f(path);
-    if (f.isNull() || !f.file())
+    Utf8FileRef f(path);
+    if (f.file.isNull() || !f.file.file())
         return 1;
-    const TagLib::PropertyMap properties = f.file()->properties();
+    const TagLib::PropertyMap properties = f.file.file()->properties();
     const TagLib::StringList values = properties[TagLib::String("DISCNUMBER")];
     if (values.isEmpty() || values.front().isEmpty())
         return 1;
@@ -320,12 +355,12 @@ int forte_write_metadata(const char *path,
         return 0;
     }
 
-    TagLib::FileRef f(path);
-    if (f.isNull() || !f.file() || !f.tag()) {
+    Utf8FileRef f(path);
+    if (f.file.isNull() || !f.file.file() || !f.file.tag()) {
         report("TagLib could not open the audio file");
         return 0;
     }
-    auto *tag = f.tag();
+    auto *tag = f.file.tag();
     tag->setTitle(TagLib::String(title ? title : "", TagLib::String::UTF8));
     tag->setArtist(TagLib::String(artist ? artist : "", TagLib::String::UTF8));
     tag->setAlbum(TagLib::String(album ? album : "", TagLib::String::UTF8));
@@ -339,12 +374,12 @@ int forte_write_metadata(const char *path,
     // ID3 backends); failure to expose it must not prevent the common fields
     // from being saved.
     if (disc > 0) {
-        TagLib::PropertyMap properties = f.file()->properties();
+        TagLib::PropertyMap properties = f.file.file()->properties();
         properties.replace("DISCNUMBER", TagLib::StringList(TagLib::String::number(disc)));
-        f.file()->setProperties(properties);
+        f.file.file()->setProperties(properties);
     }
 
-    if (!f.save()) {
+    if (!f.file.save()) {
         report("TagLib failed to save the audio file");
         return 0;
     }

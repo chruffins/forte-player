@@ -9,7 +9,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const system_include = if (target.result.os.tag == .macos) "/opt/homebrew/include" else "/usr/include";
+    const system_include = b.option([]const u8, "include_path", "Allegro include directory") orelse switch (target.result.os.tag) {
+        .macos => "/opt/homebrew/include",
+        .windows => "C:/msys64/mingw64/include",
+        else => "/usr/include",
+    };
     al_translate_c.addSystemIncludePath(.{ .cwd_relative = system_include });
 
     const allegro = b.addModule("allegro", .{

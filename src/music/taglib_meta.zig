@@ -5,14 +5,22 @@
 //! via `libtag_c`. `@cInclude` needs `/usr/include/taglib` on the search path.
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("tag_c.h");
-});
+const builtin = @import("builtin");
+const c = @import("forte_c");
 const scanner = @import("scanner.zig");
 const taglib_art = @import("taglib_art.zig");
 
 pub const extractor = scanner.Extractor{ .extract = extract };
 pub const RawTagSignals = struct { title: bool = false, artist: bool = false, album: bool = false };
+
+fn openTaglibFile(path: [:0]const u8) ?[*c]c.TagLib_File {
+    if (builtin.os.tag == .windows) {
+        const wide = std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, path) catch return null;
+        defer std.heap.page_allocator.free(wide);
+        return c.taglib_file_new_wchar(@ptrCast(wide.ptr));
+    }
+    return c.taglib_file_new(path.ptr);
+}
 
 /// Return raw source tag presence without applying the user-facing fallbacks.
 pub fn rawTagSignals(path: []const u8) ?RawTagSignals {
@@ -20,7 +28,7 @@ pub fn rawTagSignals(path: []const u8) ?RawTagSignals {
     if (path.len + 1 > pathbuf.len) return null;
     @memcpy(pathbuf[0..path.len], path);
     pathbuf[path.len] = 0;
-    const file = c.taglib_file_new(pathbuf[0..path.len :0].ptr) orelse return null;
+    const file = openTaglibFile(pathbuf[0..path.len :0]) orelse return null;
     defer c.taglib_file_free(file);
     const tag = c.taglib_file_tag(file) orelse return null;
     const title = cstr(c.taglib_tag_title(tag));
@@ -56,7 +64,7 @@ fn extract(a: std.mem.Allocator, path: []const u8) ?scanner.Metadata {
     @memcpy(pathbuf[0..path.len], path);
     pathbuf[path.len] = 0;
 
-    const file = c.taglib_file_new(pathbuf[0..path.len :0].ptr) orelse return null;
+    const file = openTaglibFile(pathbuf[0..path.len :0]) orelse return null;
     defer c.taglib_file_free(file);
 
     const tag = c.taglib_file_tag(file) orelse return null;

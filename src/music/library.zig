@@ -60,7 +60,7 @@ pub const Library = struct {
         self.songs_by_id = std.AutoHashMap(i64, entity.Song).init(alloc);
         self.paths_by_id = std.AutoHashMap(i64, [:0]const u8).init(alloc);
         self.path_to_id = std.StringHashMap(i64).init(alloc);
-        self.order = std.ArrayList(i64){ .items = &.{}, .capacity = 0 };
+        self.order = std.ArrayList(i64).empty;
         self.index_by_id = std.AutoHashMap(i64, usize).init(alloc);
         return self;
     }
@@ -81,7 +81,7 @@ pub const Library = struct {
         self.songs_by_id = std.AutoHashMap(i64, entity.Song).init(alloc);
         self.paths_by_id = std.AutoHashMap(i64, [:0]const u8).init(alloc);
         self.path_to_id = std.StringHashMap(i64).init(alloc);
-        self.order = std.ArrayList(i64){ .items = &.{}, .capacity = 0 };
+        self.order = std.ArrayList(i64).empty;
         self.index_by_id = std.AutoHashMap(i64, usize).init(alloc);
 
         var stmt = try db.raw.prepareDynamic(library_song_query);
@@ -89,7 +89,8 @@ pub const Library = struct {
         var iter = try stmt.iteratorAlloc(entity.Song, alloc, .{});
         while (try iter.nextAlloc(alloc, .{})) |s| {
             try self.songs_by_id.put(s.id, s);
-            const path_z = try alloc.dupeZ(u8, s.path);
+            const path_z = try alloc.allocSentinel(u8, s.path.len, 0);
+            @memcpy(path_z, s.path);
             try self.paths_by_id.put(s.id, path_z);
             try self.path_to_id.put(s.path, s.id);
             const index = self.order.items.len;

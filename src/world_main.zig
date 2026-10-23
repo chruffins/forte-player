@@ -15,10 +15,7 @@ const model = @import("world/model.zig");
 const native = @import("world/template.zig");
 const recording = @import("world/recording.zig");
 const config_mod = @import("core/config.zig");
-const c = @cImport({
-    @cInclude("allegro5/allegro.h");
-    @cInclude("stdlib.h");
-});
+const c = @import("forte_c");
 
 const Frontend = struct {
     app: *app_mod.App,
@@ -104,10 +101,10 @@ const Frontend = struct {
     }
     fn saveView(self: *Frontend) void {
         var section_buf: [64]u8 = undefined;
-        const section = std.fmt.bufPrintZ(&section_buf, "world_view_{s}", .{self.view_name}) catch return;
+        const section = std.fmt.bufPrintSentinel(&section_buf, "world_view_{s}", .{self.view_name}, 0) catch return;
         inline for (.{ "x", "y", "z", "yaw", "pitch" }) |field| {
             var value_buf: [48]u8 = undefined;
-            const value = std.fmt.bufPrintZ(&value_buf, "{d:.8}", .{@field(self.pose, field)}) catch return;
+            const value = std.fmt.bufPrintSentinel(&value_buf, "{d:.8}", .{@field(self.pose, field)}, 0) catch return;
             self.app.config.setStr(section, field, value);
         }
         if (self.display) |display| {
@@ -121,7 +118,7 @@ const Frontend = struct {
     }
     fn recordTrack(self: *Frontend, path: []const u8) void {
         var section_buf: [64]u8 = undefined;
-        const section = std.fmt.bufPrintZ(&section_buf, "world_view_{s}", .{self.view_name}) catch return;
+        const section = std.fmt.bufPrintSentinel(&section_buf, "world_view_{s}", .{self.view_name}, 0) catch return;
         if (self.app.config.getStr(section, "x", "").len == 0) {
             self.picker_status = "Save a shot with V before recording.";
             self.notice = self.picker_status;
@@ -566,7 +563,7 @@ fn runInteractive(init: std.process.Init, view_name: []const u8, executable: []c
     defer f.scan.deinit();
     defer if (f.record_path) |path| allocator.free(path);
     var section_buf: [64]u8 = undefined;
-    const view_section = try std.fmt.bufPrintZ(&section_buf, "world_view_{s}", .{view_name});
+    const view_section = try std.fmt.bufPrintSentinel(&section_buf, "world_view_{s}", .{view_name}, 0);
     f.pose = loadSavedPose(&app.config, view_section);
     defer f.current_arena.deinit();
     defer f.picker_arena.deinit();

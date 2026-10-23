@@ -253,8 +253,8 @@ test "fft of a pure sine peaks at the expected bin" {
 
 test "fft of silence is silence" {
     const n: usize = 64;
-    var re: [n]f32 = [_]f32{0} ** n;
-    var im: [n]f32 = [_]f32{0} ** n;
+    var re: [n]f32 = @splat(0);
+    var im: [n]f32 = @splat(0);
     fft(&re, &im);
     for (re, im) |r, i| {
         try std.testing.expect(r == 0.0 and i == 0.0);
@@ -293,10 +293,10 @@ test "SIMD path matches the scalar reference across sizes" {
     const rng = prng.random();
     const sizes = [_]usize{ 2, 4, 8, 16, 64, 128, 512, 1024 };
     for (sizes) |n| {
-        var re: [1024]f32 = [_]f32{0} ** 1024;
-        var im: [1024]f32 = [_]f32{0} ** 1024;
-        var ref_re: [1024]f32 = [_]f32{0} ** 1024;
-        var ref_im: [1024]f32 = [_]f32{0} ** 1024;
+        var re: [1024]f32 = @splat(0);
+        var im: [1024]f32 = @splat(0);
+        var ref_re: [1024]f32 = @splat(0);
+        var ref_im: [1024]f32 = @splat(0);
         for (0..n) |i| {
             const v = rng.floatNorm(f32);
             re[i] = v;

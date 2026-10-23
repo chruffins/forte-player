@@ -931,15 +931,15 @@ pub fn VirtualTable(
             switch (@typeInfo(ColumnType)) {
                 .@"union" => |info| {
                     if (info.tag_type) |UnionTagType| {
-                        inline for (info.fields) |u_field| {
+                        inline for (info.field_names, info.field_types) |field_name, _| {
 
                             // This wasn't entirely obvious when I saw code like this elsewhere, it works because of type coercion.
                             // See https://ziglang.org/documentation/master/#Type-Coercion-unions-and-enums
                             const column_tag: std.meta.Tag(ColumnType) = column;
-                            const this_tag: std.meta.Tag(ColumnType) = @field(UnionTagType, u_field.name);
+                            const this_tag: std.meta.Tag(ColumnType) = @field(UnionTagType, field_name);
 
                             if (column_tag == this_tag) {
-                                const column_value = @field(column, u_field.name);
+                                const column_value = @field(column, field_name);
 
                                 helpers.setResult(ctx, column_value);
                             }

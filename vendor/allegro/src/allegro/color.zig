@@ -10,79 +10,80 @@ pub const Color = extern struct {
     // -- Construction from 8-bit channels --
 
     pub fn fromPremul(r: u8, g: u8, b: u8, a: u8) Color {
-        return @bitCast(c.al_premul_rgba(r, g, b, a));
+        return fromCColor(c.al_premul_rgba(r, g, b, a));
     }
 
     pub fn fromPremulFloat(r: f32, g: f32, b: f32, a: f32) Color {
-        return @bitCast(c.al_premul_rgba_f(r, g, b, a));
+        return fromCColor(c.al_premul_rgba_f(r, g, b, a));
     }
 
     pub fn fromRgb(r: u8, g: u8, b: u8) Color {
-        return @bitCast(c.al_map_rgb(r, g, b));
+        const color = c.al_map_rgb(r, g, b);
+        return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
     }
 
     pub fn fromRgba(r: u8, g: u8, b: u8, a: u8) Color {
-        return @bitCast(c.al_map_rgba(r, g, b, a));
+        return fromCColor(c.al_map_rgba(r, g, b, a));
     }
 
     pub fn fromRgbaFloat(r: f32, g: f32, b: f32, a: f32) Color {
-        return @bitCast(c.al_map_rgba_f(r, g, b, a));
+        return fromCColor(c.al_map_rgba_f(r, g, b, a));
     }
 
     pub fn fromRgbFloat(r: f32, g: f32, b: f32) Color {
-        return @bitCast(c.al_map_rgb_f(r, g, b));
+        return fromCColor(c.al_map_rgb_f(r, g, b));
     }
 
     // -- Color-addon colour spaces --
 
     pub fn fromCmyk(cyan: f32, magenta: f32, yellow: f32, key: f32) Color {
-        return @bitCast(c.al_color_cmyk(cyan, magenta, yellow, key));
+        return fromCColor(c.al_color_cmyk(cyan, magenta, yellow, key));
     }
 
     pub fn fromHsl(h: f32, s: f32, l: f32) Color {
-        return @bitCast(c.al_color_hsl(h, s, l));
+        return fromCColor(c.al_color_hsl(h, s, l));
     }
 
     pub fn fromHsv(h: f32, s: f32, v: f32) Color {
-        return @bitCast(c.al_color_hsv(h, s, v));
+        return fromCColor(c.al_color_hsv(h, s, v));
     }
 
     /// Parse an HTML/CSS colour string such as "#ff0077".
     pub fn fromHtml(html: [:0]const u8) Color {
-        return @bitCast(c.al_color_html(html.ptr));
+        return fromCColor(c.al_color_html(html.ptr));
     }
 
     pub fn fromLab(l: f32, a: f32, b: f32) Color {
-        return @bitCast(c.al_color_lab(l, a, b));
+        return fromCColor(c.al_color_lab(l, a, b));
     }
 
     pub fn fromLch(l: f32, chroma: f32, hue: f32) Color {
-        return @bitCast(c.al_color_lch(l, chroma, hue));
+        return fromCColor(c.al_color_lch(l, chroma, hue));
     }
 
     pub fn fromLinear(r: f32, g: f32, b: f32) Color {
-        return @bitCast(c.al_color_linear(r, g, b));
+        return fromCColor(c.al_color_linear(r, g, b));
     }
 
     /// Look up a colour by CSS colour name (e.g. "red").
     pub fn fromName(name: [:0]const u8) Color {
-        return @bitCast(c.al_color_name(name.ptr));
+        return fromCColor(c.al_color_name(name.ptr));
     }
 
     pub fn fromOklab(l: f32, a: f32, b: f32) Color {
-        return @bitCast(c.al_color_oklab(l, a, b));
+        return fromCColor(c.al_color_oklab(l, a, b));
     }
 
     pub fn fromXyy(x: f32, y: f32, y2: f32) Color {
-        return @bitCast(c.al_color_xyy(x, y, y2));
+        return fromCColor(c.al_color_xyy(x, y, y2));
     }
 
     pub fn fromXyz(x: f32, y: f32, z: f32) Color {
-        return @bitCast(c.al_color_xyz(x, y, z));
+        return fromCColor(c.al_color_xyz(x, y, z));
     }
 
     pub fn fromYuv(y: f32, u: f32, v: f32) Color {
-        return @bitCast(c.al_color_yuv(y, u, v));
+        return fromCColor(c.al_color_yuv(y, u, v));
     }
 
     pub fn isValid(self: *const Color) bool {
@@ -219,7 +220,7 @@ pub const Color = extern struct {
     // -- Allegro interop --
 
     pub fn toAllegroColor(self: Color) c.ALLEGRO_COLOR {
-        return @bitCast(self);
+        return .{ .r = self.r, .g = self.g, .b = self.b, .a = self.a };
     }
 
     /// Unmap using the allegro_color addon's float decomposition.
@@ -241,9 +242,13 @@ pub const Color = extern struct {
     }
 
     pub fn fromAllegroColor(color: c.ALLEGRO_COLOR) Color {
-        return @bitCast(color);
+        return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
     }
 };
+
+fn fromCColor(color: c.ALLEGRO_COLOR) Color {
+    return .{ .r = color.r, .g = color.g, .b = color.b, .a = color.a };
+}
 
 pub const BLACK = Color.fromRgbFloat(0.0, 0.0, 0.0);
 pub const WHITE = Color.fromRgbFloat(1.0, 1.0, 1.0);

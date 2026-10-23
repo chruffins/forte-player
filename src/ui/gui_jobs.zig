@@ -101,7 +101,7 @@ pub const ScanJob = struct {
 pub const HealthJob = struct {
     allocator: std.mem.Allocator,
     root: []u8 = &.{},
-    known_paths: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 },
+    known_paths: std.ArrayList([]const u8) = .empty,
     thread: ?std.Thread = null,
     cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     status: std.atomic.Value(u8) = std.atomic.Value(u8).init(0), // idle/running/done/failed/cancelled

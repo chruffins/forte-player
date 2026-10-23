@@ -1142,7 +1142,7 @@ test "now-playing renders spectrum bars as block glyphs" {
     st.title = "T";
     st.position = 10;
     st.duration = 100;
-    var spectrum_values = [_]f32{0} ** 48;
+    var spectrum_values: [48]f32 = @splat(0);
     // full height on the left half, silence on the right half
     for (0..24) |i| spectrum_values[i] = 1.0;
     st.spectrum = &spectrum_values;
